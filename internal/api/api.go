@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -228,7 +229,7 @@ func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", f.ContentType)
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+f.Name+"\"")
-	w.Header().Set("Content-Length", string(rune(f.Size)))
+	w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
 	w.Write(f.Data)
 }
 

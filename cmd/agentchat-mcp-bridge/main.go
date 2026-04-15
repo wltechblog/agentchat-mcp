@@ -20,10 +20,17 @@ import (
 )
 
 type Bridge struct {
-	agentID   string
-	sessionID string
-	httpBase  string
+	wsURL        string
+	sessionID    string
+	psk          string
+	agentID      string
+	agentName    string
+	capabilities []string
+	httpBase     string
+
+	connMu    sync.RWMutex
 	conn      *websocket.Conn
+	connected bool
 	writeMu   sync.Mutex
 
 	pending   map[string]chan protocol.Envelope
@@ -50,18 +57,83 @@ func main() {
 		}
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	bridge := &Bridge{
+		wsURL:        wsURL,
+		sessionID:    sessionID,
+		psk:          psk,
+		agentID:      agentID,
+		agentName:    agentName,
+		capabilities: caps,
+		httpBase:     wsURLToHTTP(wsURL),
+		pending:      make(map[string]chan protocol.Envelope),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go bridge.connectLoop(ctx)
+
+	server := mcp.NewServer("agentchat-mcp-bridge", "1.0.0")
+	registerTools(server, bridge)
+
+	slog.Info("bridge started", "agent_id", agentID, "session_id", sessionID)
+	if err := server.Run(ctx); err != nil {
+		slog.Error("MCP server exited", "error", err)
+	}
+}
+
+func (b *Bridge) connectLoop(ctx context.Context) {
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		err := b.connect()
+		if err != nil {
+			slog.Error("connection failed", "error", err, "retry_in", backoff)
+			select {
+			case <-time.After(backoff):
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		backoff = time.Second
+		slog.Info("connected to server")
+
+		b.readPump()
+
+		b.disconnect()
+		slog.Warn("disconnected, will reconnect", "retry_in", backoff)
+
+		select {
+		case <-time.After(backoff):
+			backoff = min(backoff*2, maxBackoff)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (b *Bridge) connect() error {
+	conn, _, err := websocket.DefaultDialer.Dial(b.wsURL, nil)
 	if err != nil {
-		slog.Error("websocket connect failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("dial: %w", err)
 	}
 
 	authPayload, _ := json.Marshal(protocol.AuthPayload{
-		SessionID:    sessionID,
-		AgentID:      agentID,
-		AgentName:    agentName,
-		PSK:          psk,
-		Capabilities: caps,
+		SessionID:    b.sessionID,
+		AgentID:      b.agentID,
+		AgentName:    b.agentName,
+		PSK:          b.psk,
+		Capabilities: b.capabilities,
 	})
 	authMsg, _ := json.Marshal(protocol.Envelope{
 		Type:      protocol.TypeAuth,
@@ -69,47 +141,125 @@ func main() {
 		Timestamp: time.Now().UTC(),
 	})
 	if err := conn.WriteMessage(websocket.TextMessage, authMsg); err != nil {
-		slog.Error("auth write failed", "error", err)
-		os.Exit(1)
+		conn.Close()
+		return fmt.Errorf("auth write: %w", err)
 	}
 
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, resp, err := conn.ReadMessage()
 	if err != nil {
-		slog.Error("auth read failed", "error", err)
-		os.Exit(1)
+		conn.Close()
+		return fmt.Errorf("auth read: %w", err)
 	}
+
 	var authResp protocol.Envelope
 	json.Unmarshal(resp, &authResp)
 	if authResp.Type != protocol.TypeAuthOK {
-		slog.Error("auth rejected", "response", string(resp))
-		os.Exit(1)
+		conn.Close()
+		return fmt.Errorf("auth rejected: %s", string(resp))
 	}
 	conn.SetReadDeadline(time.Time{})
 
-	bridge := &Bridge{
-		agentID:   agentID,
-		sessionID: sessionID,
-		httpBase:  wsURLToHTTP(wsURL),
-		conn:      conn,
-		pending:   make(map[string]chan protocol.Envelope),
+	b.connMu.Lock()
+	b.conn = conn
+	b.connected = true
+	b.connMu.Unlock()
+
+	return nil
+}
+
+func (b *Bridge) disconnect() {
+	b.connMu.Lock()
+	b.connected = false
+	if b.conn != nil {
+		b.conn.Close()
+		b.conn = nil
+	}
+	b.connMu.Unlock()
+
+	b.pendingMu.Lock()
+	for k, ch := range b.pending {
+		close(ch)
+		delete(b.pending, k)
+	}
+	b.pendingMu.Unlock()
+}
+
+func (b *Bridge) isConnected() bool {
+	b.connMu.RLock()
+	defer b.connMu.RUnlock()
+	return b.connected
+}
+
+func (b *Bridge) readPump() {
+	for {
+		b.connMu.RLock()
+		conn := b.conn
+		b.connMu.RUnlock()
+		if conn == nil {
+			return
+		}
+
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				slog.Error("read error", "error", err)
+			}
+			return
+		}
+
+		var env protocol.Envelope
+		if err := json.Unmarshal(message, &env); err != nil {
+			continue
+		}
+
+		b.routeMessage(env)
+	}
+}
+
+func (b *Bridge) routeMessage(env protocol.Envelope) {
+	b.pendingMu.Lock()
+	ch, ok := b.pending[env.Type]
+	b.pendingMu.Unlock()
+
+	if ok {
+		select {
+		case ch <- env:
+		default:
+		}
+		return
 	}
 
-	go bridge.readPump()
+	if env.Type == protocol.TypeScratchpadUpdate || env.Type == protocol.TypeScratchpadResult {
+		b.pendingMu.Lock()
+		ch, ok = b.pending[protocol.TypeScratchpadResult]
+		b.pendingMu.Unlock()
+		if ok {
+			select {
+			case ch <- env:
+			default:
+			}
+			return
+		}
+	}
 
-	server := mcp.NewServer("agentchat-mcp-bridge", "1.0.0")
-	registerTools(server, bridge)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	slog.Info("bridge ready", "agent_id", agentID, "session_id", sessionID)
-	if err := server.Run(ctx); err != nil {
-		slog.Error("MCP server exited", "error", err)
+	if env.From != "server" || env.Type != protocol.TypeLeaderInfo {
+		b.incMu.Lock()
+		b.incoming = append(b.incoming, env)
+		b.incMu.Unlock()
 	}
 }
 
 func (b *Bridge) sendWS(env protocol.Envelope) error {
+	b.connMu.RLock()
+	conn := b.conn
+	connected := b.connected
+	b.connMu.RUnlock()
+
+	if !connected {
+		return fmt.Errorf("not connected to server")
+	}
+
 	env.SessionID = b.sessionID
 	env.From = b.agentID
 	if env.Timestamp.IsZero() {
@@ -119,28 +269,37 @@ func (b *Bridge) sendWS(env protocol.Envelope) error {
 	if err != nil {
 		return err
 	}
+
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()
-	return b.conn.WriteMessage(websocket.TextMessage, data)
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 func (b *Bridge) sendAndWait(env protocol.Envelope, responseType string, timeout time.Duration) (protocol.Envelope, error) {
+	if !b.isConnected() {
+		return protocol.Envelope{}, fmt.Errorf("not connected to server")
+	}
+
 	ch := make(chan protocol.Envelope, 1)
 	b.pendingMu.Lock()
 	b.pending[responseType] = ch
 	b.pendingMu.Unlock()
-	defer func() {
+
+	if err := b.sendWS(env); err != nil {
 		b.pendingMu.Lock()
 		delete(b.pending, responseType)
 		b.pendingMu.Unlock()
-	}()
-
-	if err := b.sendWS(env); err != nil {
 		return protocol.Envelope{}, err
 	}
 
 	select {
-	case resp := <-ch:
+	case resp, ok := <-ch:
+		b.pendingMu.Lock()
+		delete(b.pending, responseType)
+		b.pendingMu.Unlock()
+		if !ok {
+			return protocol.Envelope{}, fmt.Errorf("connection lost")
+		}
 		if resp.Type == protocol.TypeError {
 			var errData map[string]string
 			json.Unmarshal(resp.Payload, &errData)
@@ -148,53 +307,10 @@ func (b *Bridge) sendAndWait(env protocol.Envelope, responseType string, timeout
 		}
 		return resp, nil
 	case <-time.After(timeout):
-		return protocol.Envelope{}, fmt.Errorf("timeout waiting for %s response", responseType)
-	}
-}
-
-func (b *Bridge) readPump() {
-	for {
-		_, message, err := b.conn.ReadMessage()
-		if err != nil {
-			slog.Error("websocket read error", "error", err)
-			os.Exit(1)
-		}
-
-		var env protocol.Envelope
-		if err := json.Unmarshal(message, &env); err != nil {
-			continue
-		}
-
 		b.pendingMu.Lock()
-		ch, ok := b.pending[env.Type]
+		delete(b.pending, responseType)
 		b.pendingMu.Unlock()
-
-		if ok {
-			select {
-			case ch <- env:
-			default:
-			}
-			continue
-		}
-
-		if env.Type == protocol.TypeScratchpadUpdate || env.Type == protocol.TypeScratchpadResult {
-			b.pendingMu.Lock()
-			ch, ok = b.pending[protocol.TypeScratchpadResult]
-			b.pendingMu.Unlock()
-			if ok {
-				select {
-				case ch <- env:
-				default:
-				}
-				continue
-			}
-		}
-
-		if env.From != "server" || env.Type != protocol.TypeLeaderInfo {
-			b.incMu.Lock()
-			b.incoming = append(b.incoming, env)
-			b.incMu.Unlock()
-		}
+		return protocol.Envelope{}, fmt.Errorf("timeout waiting for %s response", responseType)
 	}
 }
 
@@ -600,11 +716,6 @@ func envOrDefault(key, def string) string {
 		return def
 	}
 	return v
-}
-
-func mustMarshal(v any) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
 }
 
 func wsURLToHTTP(wsURL string) string {

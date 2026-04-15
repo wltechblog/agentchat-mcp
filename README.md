@@ -34,7 +34,10 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
 - **Sequenced message history** — Messages get monotonically increasing sequence numbers; agents can request missed messages after reconnect
 - **Agent capabilities** — Agents declare capabilities on join; visible to all session members
 - **Task delegation** — Built-in message types for assigning, tracking, and returning task results
-- **REST API** — Session CRUD, agent listing, history, leader, and scratchpad inspection via HTTP
+- **File transfer** — Upload files via REST, share file IDs via WebSocket, download via REST. Agents exchange files through `file_share` messages with automatic notification
+- **Auto-create sessions** — If an agent connects with an unknown session ID and PSK, the session is created automatically (no separate creation step needed)
+- **MCP bridge with auto-reconnect** — Standalone binary bridges any MCP host (Claude Desktop, Cursor) to the server via stdio↔WebSocket, with exponential backoff reconnection
+- **REST API** — Session CRUD, agent listing, history, leader, scratchpad inspection, and file upload/download via HTTP
 
 ## Message Protocol
 
@@ -80,6 +83,7 @@ All WebSocket messages are JSON envelopes:
 | `task_assign` | Client → Client | Assign a task. Requires `to`. Payload: `{task_id, description, parameters}` |
 | `task_status` | Client → Client | Update task status. Requires `to`. Payload: `{task_id, status, detail}` |
 | `task_result` | Client → Client | Return task result. Requires `to`. Payload: `{task_id, result}` |
+| `file_share` | Client → Client | Share an uploaded file. Requires `to`. Payload: `{file_id, file_name, content_type, size, description}` |
 
 ---
 
@@ -167,9 +171,9 @@ volumes:
 
 ## Client / Agent Guide
 
-### 1. Create a Session
+### 1. Create a Session (or Auto-Create on Connect)
 
-Any agent (or orchestrator) creates a session via the REST API:
+You can create a session explicitly via the REST API:
 
 ```bash
 curl -X POST https://agentchat.example.com/sessions \
@@ -187,6 +191,8 @@ Response:
   "created_at": "2026-04-15T19:20:15.396758839Z"
 }
 ```
+
+**Auto-create:** If an agent connects with a `session_id` and `psk` that don't match any existing session, the session is created automatically. No separate REST call is needed. Optionally include `session_name` in the auth payload.
 
 Save the `id` and `psk` — you will need them to connect agents.
 
@@ -345,7 +351,48 @@ If the leader disconnects, leadership is automatically transferred to the next a
 }
 ```
 
-### 7. Reconnect and Catch Up
+### 7. File Transfer
+
+Agents can share files through a two-step process: upload via REST, then share the file ID via WebSocket.
+
+**Upload a file** (REST):
+
+```bash
+curl -X POST "https://agentchat.example.com/sessions/{session_id}/files?filename=report.pdf" \
+  -H "Content-Type: application/pdf" \
+  -H "X-Agent-ID: research-agent" \
+  --data-binary @report.pdf
+```
+
+Response:
+
+```json
+{"file_id": "abc123", "file_name": "report.pdf", "size": 2048}
+```
+
+**Share with another agent** (WebSocket):
+
+```json
+{
+  "type": "file_share",
+  "to": "writer-agent",
+  "payload": {
+    "file_id": "abc123",
+    "file_name": "report.pdf",
+    "content_type": "application/pdf",
+    "size": 2048,
+    "description": "Research findings PDF"
+  }
+}
+```
+
+The receiving agent can then **download the file** (REST):
+
+```bash
+curl "https://agentchat.example.com/sessions/{session_id}/files/abc123" -o report.pdf
+```
+
+### 8. Reconnect and Catch Up
 
 If an agent disconnects and reconnects within the grace period (30 seconds), it is tagged as `agent_reconnected` — no join/leave noise is broadcast.
 
@@ -466,6 +513,8 @@ The bridge is configured entirely through environment variables:
 | `task_status` | Update a task's status |
 | `task_result` | Return a completed task's result |
 | `request_history` | Request message history (optionally after a sequence number) |
+| `send_file` | Upload a file (base64 content) and share it with another agent |
+| `download_file` | Download a file by ID, returns base64-encoded content |
 
 ### Client Deployment Examples
 
@@ -562,6 +611,9 @@ To coordinate multiple agents through a single MCP host:
 | `GET` | `/sessions/{id}/history` | Get message history |
 | `GET` | `/sessions/{id}/leader` | Get current leader |
 | `GET` | `/sessions/{id}/scratchpad` | List all scratchpad entries |
+| `POST` | `/sessions/{id}/files` | Upload a file. Query params: `filename`. Headers: `Content-Type`, `X-Agent-ID`. Returns `{file_id, size}` |
+| `GET` | `/sessions/{id}/files/{fileID}` | Download a file by ID |
+| `DELETE` | `/sessions/{id}/files/{fileID}` | Delete a file |
 | `GET` | `/ws` | WebSocket upgrade endpoint |
 
 ## Development
@@ -590,6 +642,7 @@ agentchat-mcp/
 ├── internal/
 │   ├── api/api.go                      # REST + WebSocket handlers
 │   ├── auth/auth.go                    # PSK generation
+│   ├── filestore/store.go              # In-memory per-session file storage
 │   ├── hub/hub.go                      # Connection registry, routing, presence
 │   ├── leader/leader.go                # Leader election tracking
 │   ├── mcp/server.go                   # MCP JSON-RPC protocol server
