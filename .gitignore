@@ -1,0 +1,16 @@
+# Binaries
+bin/
+*.exe
+
+# Docker
+.docker/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
