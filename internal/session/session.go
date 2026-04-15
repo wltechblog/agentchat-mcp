@@ -82,6 +82,30 @@ func (s *Store) ValidatePSK(sessionID, psk string) (*Session, bool) {
 	return sess, true
 }
 
+func (s *Store) GetOrCreate(sessionID, psk, name string) (*Session, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if sess, ok := s.sessions[sessionID]; ok {
+		if sess.PSK != psk {
+			return nil, false, nil
+		}
+		return sess, false, nil
+	}
+
+	if name == "" {
+		name = sessionID
+	}
+	sess := &Session{
+		ID:        sessionID,
+		Name:      name,
+		PSK:       psk,
+		CreatedAt: time.Now().UTC(),
+	}
+	s.sessions[sessionID] = sess
+	return sess, true, nil
+}
+
 func generateID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)

@@ -278,11 +278,25 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, ok := h.sessionStore.ValidatePSK(authPayload.SessionID, authPayload.PSK)
-	if !ok {
-		sendWSMessage(conn, protocol.NewError(authPayload.SessionID, "invalid session or PSK"))
+	if authPayload.SessionID == "" || authPayload.PSK == "" {
+		sendWSMessage(conn, protocol.NewError("", "session_id and psk are required"))
 		conn.Close()
 		return
+	}
+
+	sess, created, err := h.sessionStore.GetOrCreate(authPayload.SessionID, authPayload.PSK, authPayload.SessionName)
+	if err != nil {
+		sendWSMessage(conn, protocol.NewError(authPayload.SessionID, "internal error"))
+		conn.Close()
+		return
+	}
+	if sess == nil {
+		sendWSMessage(conn, protocol.NewError(authPayload.SessionID, "invalid PSK"))
+		conn.Close()
+		return
+	}
+	if created {
+		slog.Info("session auto-created", "id", sess.ID, "name", sess.Name)
 	}
 
 	conn.SetReadDeadline(time.Time{})

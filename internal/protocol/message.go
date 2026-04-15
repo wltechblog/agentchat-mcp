@@ -82,6 +82,7 @@ type AuthPayload struct {
 	AgentName    string   `json:"agent_name"`
 	PSK          string   `json:"psk"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	SessionName  string   `json:"session_name,omitempty"`
 }
 
 type AgentInfo struct {
