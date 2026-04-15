@@ -414,6 +414,142 @@ asyncio.run(run())
 
 ---
 
+## MCP Bridge (agentchat-mcp-bridge)
+
+The bridge is a standalone Go binary that acts as an MCP server (stdio transport) and connects to the agentchat-server over WebSocket. This lets any MCP-compatible host (Claude Desktop, Cursor, etc.) participate in agent sessions without implementing the WebSocket protocol directly.
+
+### Architecture
+
+```
+┌───────────────────┐   MCP (stdio)   ┌──────────────────────┐   WebSocket   ┌──────────┐
+│  MCP Host         │◄───────────────►│  agentchat-mcp-bridge│◄────────────►│  agentchat│
+│  (Claude, Cursor) │                 │  (Go binary)         │              │  -server  │
+└───────────────────┘                 └──────────────────────┘              └──────────┘
+```
+
+### Build
+
+```bash
+make build-bridge
+# or
+go build -o bin/agentchat-mcp-bridge ./cmd/agentchat-mcp-bridge
+```
+
+### Configuration
+
+The bridge is configured entirely through environment variables:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AGENTCHAT_URL` | Yes | WebSocket URL of the server (e.g. `wss://agentchat.example.com/ws`) |
+| `AGENTCHAT_SESSION_ID` | Yes | Session ID to join |
+| `AGENTCHAT_PSK` | Yes | Pre-shared key for the session |
+| `AGENTCHAT_AGENT_ID` | Yes | Unique agent ID for this bridge instance |
+| `AGENTCHAT_AGENT_NAME` | No | Display name (defaults to agent ID) |
+| `AGENTCHAT_CAPABILITIES` | No | Comma-separated capability list (e.g. `"search,analyze,write"`) |
+
+### Exposed MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `send_message` | Send a direct message to another agent |
+| `broadcast` | Broadcast a message to all agents in the session |
+| `receive_messages` | Retrieve queued incoming messages since last call |
+| `list_agents` | List all connected agents and their capabilities |
+| `get_leader` | Get the current session leader |
+| `transfer_leadership` | Transfer leadership to another agent |
+| `scratchpad_set` | Set a key in the shared scratchpad |
+| `scratchpad_get` | Get a value from the scratchpad |
+| `scratchpad_delete` | Delete a key from the scratchpad |
+| `scratchpad_list` | List all scratchpad entries |
+| `task_assign` | Assign a task to another agent |
+| `task_status` | Update a task's status |
+| `task_result` | Return a completed task's result |
+| `request_history` | Request message history (optionally after a sequence number) |
+
+### Client Deployment Examples
+
+#### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "agentchat-researcher": {
+      "command": "/path/to/agentchat-mcp-bridge",
+      "env": {
+        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
+        "AGENTCHAT_SESSION_ID": "your-session-id",
+        "AGENTCHAT_PSK": "your-psk",
+        "AGENTCHAT_AGENT_ID": "researcher",
+        "AGENTCHAT_AGENT_NAME": "Research Agent",
+        "AGENTCHAT_CAPABILITIES": "web_search,summarize"
+      }
+    },
+    "agentchat-writer": {
+      "command": "/path/to/agentchat-mcp-bridge",
+      "env": {
+        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
+        "AGENTCHAT_SESSION_ID": "your-session-id",
+        "AGENTCHAT_PSK": "your-psk",
+        "AGENTCHAT_AGENT_ID": "writer",
+        "AGENTCHAT_AGENT_NAME": "Writer Agent",
+        "AGENTCHAT_CAPABILITIES": "write,edit"
+      }
+    }
+  }
+}
+```
+
+Each entry is a separate bridge process connecting to the same session. Claude can then use `send_message` to route tasks to specific agents and `receive_messages` to collect results.
+
+#### Cursor
+
+Add to `.cursor/mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "agentchat": {
+      "command": "/path/to/agentchat-mcp-bridge",
+      "env": {
+        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
+        "AGENTCHAT_SESSION_ID": "your-session-id",
+        "AGENTCHAT_PSK": "your-psk",
+        "AGENTCHAT_AGENT_ID": "cursor-agent",
+        "AGENTCHAT_CAPABILITIES": "code,debug"
+      }
+    }
+  }
+}
+```
+
+#### Generic MCP Host (stdio)
+
+The bridge reads JSON-RPC from stdin and writes to stdout. Logs go to stderr.
+
+```bash
+export AGENTCHAT_URL=wss://agentchat.example.com/ws
+export AGENTCHAT_SESSION_ID=your-session-id
+export AGENTCHAT_PSK=your-psk
+export AGENTCHAT_AGENT_ID=my-agent
+
+./agentchat-mcp-bridge
+```
+
+### Multi-Agent Orchestration Pattern
+
+To coordinate multiple agents through a single MCP host:
+
+1. Create a session: `curl -X POST .../sessions -d '{"name":"team"}'`
+2. Configure one bridge per agent in your MCP host config (each with a different `AGENTCHAT_AGENT_ID`)
+3. The host agent calls `list_agents` to discover peers and their capabilities
+4. Use `task_assign` to delegate work, `receive_messages` to collect updates
+5. Use the scratchpad to share intermediate state
+
+---
+
 ## REST API Reference
 
 | Method | Path | Description |
@@ -448,15 +584,18 @@ make docker
 
 ```
 agentchat-mcp/
-├── cmd/server/main.go          # Server entrypoint
+├── cmd/
+│   ├── server/main.go                  # Server entrypoint
+│   └── agentchat-mcp-bridge/main.go    # MCP bridge (stdio → WebSocket)
 ├── internal/
-│   ├── api/api.go              # REST + WebSocket handlers
-│   ├── auth/auth.go            # PSK generation
-│   ├── hub/hub.go              # Connection registry, routing, presence
-│   ├── leader/leader.go        # Leader election tracking
-│   ├── protocol/message.go     # Message types and envelope
-│   ├── scratchpad/scratchpad.go # Per-session key-value store
-│   └── session/session.go      # Session CRUD + PSK validation
+│   ├── api/api.go                      # REST + WebSocket handlers
+│   ├── auth/auth.go                    # PSK generation
+│   ├── hub/hub.go                      # Connection registry, routing, presence
+│   ├── leader/leader.go                # Leader election tracking
+│   ├── mcp/server.go                   # MCP JSON-RPC protocol server
+│   ├── protocol/message.go             # Message types and envelope
+│   ├── scratchpad/scratchpad.go        # Per-session key-value store
+│   └── session/session.go              # Session CRUD + PSK validation
 ├── Dockerfile
 ├── docker-compose.yml
 ├── Makefile

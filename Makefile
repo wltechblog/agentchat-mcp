@@ -1,13 +1,18 @@
-.PHONY: build run test clean docker
+.PHONY: build build-server build-bridge run test clean docker docker-up docker-down
 
-build:
+build: build-server build-bridge
+
+build-server:
 	go build -o bin/agentchat-server ./cmd/server
 
-run: build
+build-bridge:
+	go build -o bin/agentchat-mcp-bridge ./cmd/agentchat-mcp-bridge
+
+run: build-server
 	./bin/agentchat-server
 
 test:
-	go test ./...
+	go test -race ./...
 
 clean:
 	rm -rf bin/
