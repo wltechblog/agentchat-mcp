@@ -683,3 +683,41 @@ func TestRESTGetScratchpad(t *testing.T) {
 		t.Fatalf("expected 1 entry with key 'test-key', got %v", entries)
 	}
 }
+
+func TestDuplicateAgentIDRejected(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+
+	ws1 := dialWS(t, wsURL)
+	authAgent(t, ws1, sessionID, "agent-1", psk)
+
+	ws2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial ws2: %v", err)
+	}
+	defer ws2.Close()
+
+	authPayload, _ := json.Marshal(protocol.AuthPayload{
+		SessionID: sessionID,
+		AgentID:   "agent-1",
+		PSK:       psk,
+	})
+	authMsg, _ := json.Marshal(protocol.Envelope{
+		Type:      protocol.TypeAuth,
+		Payload:   authPayload,
+		Timestamp: time.Now().UTC(),
+	})
+	ws2.WriteMessage(websocket.TextMessage, authMsg)
+
+	ws2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, resp, err := ws2.ReadMessage()
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	var errResp protocol.Envelope
+	json.Unmarshal(resp, &errResp)
+	if errResp.Type != protocol.TypeError {
+		t.Fatalf("expected error for duplicate agent_id, got %s: %s", errResp.Type, string(resp))
+	}
+}

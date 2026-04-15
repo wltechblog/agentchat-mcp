@@ -2,6 +2,7 @@ package hub
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -88,11 +89,15 @@ func (h *Hub) nextSeq(sessionID string) int64 {
 	return h.seqNums[sessionID]
 }
 
-func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName string, capabilities []string) *AgentConn {
+func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName string, capabilities []string) (*AgentConn, error) {
 	key := agentKey(sessionID, agentID)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if _, exists := h.agents[key]; exists {
+		return nil, fmt.Errorf("agent_id %q is already connected to this session", agentID)
+	}
 
 	ac := &AgentConn{
 		AgentID:      agentID,
@@ -133,7 +138,7 @@ func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName strin
 	go ac.writePump()
 	go ac.readPump()
 
-	return ac
+	return ac, nil
 }
 
 func (h *Hub) Unregister(ac *AgentConn) {

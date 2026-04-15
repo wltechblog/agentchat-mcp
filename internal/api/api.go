@@ -198,8 +198,20 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	conn.SetReadDeadline(time.Time{})
 
+	agentName := authPayload.AgentName
+	if agentName == "" {
+		agentName = authPayload.AgentID
+	}
+
+	ac, err := h.hub.Register(conn, sess.ID, authPayload.AgentID, agentName, authPayload.Capabilities)
+	if err != nil {
+		sendWSMessage(conn, protocol.NewError(sess.ID, err.Error()))
+		conn.Close()
+		return
+	}
+
 	leaderID := h.hub.GetLeader(sess.ID)
-	sendWSMessage(conn, protocol.Envelope{
+	ac.Send(protocol.Envelope{
 		Type:      protocol.TypeAuthOK,
 		SessionID: sess.ID,
 		From:      "server",
@@ -209,13 +221,6 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}),
 		Timestamp: time.Now().UTC(),
 	})
-
-	agentName := authPayload.AgentName
-	if agentName == "" {
-		agentName = authPayload.AgentID
-	}
-
-	h.hub.Register(conn, sess.ID, authPayload.AgentID, agentName, authPayload.Capabilities)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
