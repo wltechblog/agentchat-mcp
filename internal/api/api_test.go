@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
@@ -27,8 +29,9 @@ func setupTestServerWithGrace(t *testing.T, grace time.Duration) (*httptest.Serv
 	store := session.NewStore()
 	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
-	h := hub.New(store, lt, sp, hub.WithGracePeriod(grace))
-	handler := New(h, store, lt, sp)
+	fs := filestore.NewStore(10 << 20)
+	h := hub.New(store, lt, sp, fs, hub.WithGracePeriod(grace))
+	handler := New(h, store, lt, sp, fs)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
@@ -719,5 +722,169 @@ func TestDuplicateAgentIDRejected(t *testing.T) {
 	json.Unmarshal(resp, &errResp)
 	if errResp.Type != protocol.TypeError {
 		t.Fatalf("expected error for duplicate agent_id, got %s: %s", errResp.Type, string(resp))
+	}
+}
+
+func TestFileUploadAndDownload(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+
+	ws1 := dialWS(t, wsURL)
+	authAgent(t, ws1, sessionID, "agent-1", psk)
+
+	// Upload file
+	fileContent := []byte("hello from agent-1, this is a test file!")
+	req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=test.txt", strings.NewReader(string(fileContent)))
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("X-Agent-ID", "agent-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload file: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	var uploadResp map[string]any
+	json.NewDecoder(resp.Body).Decode(&uploadResp)
+	fileID, _ := uploadResp["file_id"].(string)
+	if fileID == "" {
+		t.Fatal("expected file_id in response")
+	}
+	if uploadResp["file_name"] != "test.txt" {
+		t.Fatalf("expected filename test.txt, got %v", uploadResp["file_name"])
+	}
+	if uploadResp["size"].(float64) != float64(len(fileContent)) {
+		t.Fatalf("expected size %d, got %v", len(fileContent), uploadResp["size"])
+	}
+
+	// Download file
+	dlResp, err := http.Get(server.URL + "/sessions/" + sessionID + "/files/" + fileID)
+	if err != nil {
+		t.Fatalf("download file: %v", err)
+	}
+	defer dlResp.Body.Close()
+	if dlResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", dlResp.StatusCode)
+	}
+	if dlResp.Header.Get("Content-Type") != "text/plain" {
+		t.Fatalf("expected text/plain, got %s", dlResp.Header.Get("Content-Type"))
+	}
+	downloaded, _ := io.ReadAll(dlResp.Body)
+	if string(downloaded) != string(fileContent) {
+		t.Fatalf("file content mismatch: got %q", string(downloaded))
+	}
+
+	// List files
+	listResp, err := http.Get(server.URL + "/sessions/" + sessionID + "/files")
+	if err != nil {
+		t.Fatalf("list files: %v", err)
+	}
+	defer listResp.Body.Close()
+	var files []map[string]any
+	json.NewDecoder(listResp.Body).Decode(&files)
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(files))
+	}
+}
+
+func TestFileShareViaWebSocket(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+
+	ws1 := dialWS(t, wsURL)
+	ws2 := dialWS(t, wsURL)
+	authAgent(t, ws1, sessionID, "agent-1", psk)
+	authAgent(t, ws2, sessionID, "agent-2", psk)
+	readEnvelope(t, ws1) // agent-2 joined
+
+	// Upload file as agent-1
+	fileContent := "shared data payload"
+	req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=report.csv", strings.NewReader(fileContent))
+	req.Header.Set("Content-Type", "text/csv")
+	req.Header.Set("X-Agent-ID", "agent-1")
+	uploadResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	defer uploadResp.Body.Close()
+	var uploadResult map[string]any
+	json.NewDecoder(uploadResp.Body).Decode(&uploadResult)
+	fileID := uploadResult["file_id"].(string)
+
+	// Share file via WebSocket
+	sharePayload, _ := json.Marshal(protocol.FileSharePayload{
+		FileID:      fileID,
+		FileName:    "report.csv",
+		ContentType: "text/csv",
+		Size:        int64(len(fileContent)),
+		Description: "Monthly report",
+	})
+	writeEnvelope(t, ws1, protocol.Envelope{
+		Type:    protocol.TypeFileShare,
+		To:      "agent-2",
+		Payload: sharePayload,
+	})
+
+	// Agent-2 receives file_share
+	received := readEnvelope(t, ws2)
+	if received.Type != protocol.TypeFileShare {
+		t.Fatalf("expected file_share, got %s", received.Type)
+	}
+	if received.From != "agent-1" {
+		t.Fatalf("expected from agent-1, got %s", received.From)
+	}
+	var shareInfo protocol.FileSharePayload
+	json.Unmarshal(received.Payload, &shareInfo)
+	if shareInfo.FileID != fileID {
+		t.Fatalf("expected file_id %s, got %s", fileID, shareInfo.FileID)
+	}
+	if shareInfo.FileName != "report.csv" {
+		t.Fatalf("expected report.csv, got %s", shareInfo.FileName)
+	}
+	if shareInfo.Description != "Monthly report" {
+		t.Fatalf("expected description 'Monthly report', got %s", shareInfo.Description)
+	}
+
+	// Agent-2 downloads the file using the file_id
+	dlResp, err := http.Get(server.URL + "/sessions/" + sessionID + "/files/" + shareInfo.FileID)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	defer dlResp.Body.Close()
+	downloaded, _ := io.ReadAll(dlResp.Body)
+	if string(downloaded) != fileContent {
+		t.Fatalf("content mismatch: got %q", string(downloaded))
+	}
+}
+
+func TestFileDelete(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, _ := createTestSession(t, server)
+
+	// Upload
+	req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=del.txt", strings.NewReader("bye"))
+	req.Header.Set("Content-Type", "text/plain")
+	resp, _ := http.DefaultClient.Do(req)
+	var upload map[string]any
+	json.NewDecoder(resp.Body).Decode(&upload)
+	resp.Body.Close()
+	fileID := upload["file_id"].(string)
+
+	// Delete
+	delReq, _ := http.NewRequest("DELETE", server.URL+"/sessions/"+sessionID+"/files/"+fileID, nil)
+	delResp, _ := http.DefaultClient.Do(delReq)
+	if delResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", delResp.StatusCode)
+	}
+
+	// Verify gone
+	goneResp, _ := http.Get(server.URL + "/sessions/" + sessionID + "/files/" + fileID)
+	if goneResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", goneResp.StatusCode)
 	}
 }

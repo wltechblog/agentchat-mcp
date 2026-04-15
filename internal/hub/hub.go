@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
@@ -30,6 +31,7 @@ type Hub struct {
 	sessionStore *session.Store
 	leader       *leader.Tracker
 	scratchpad   *scratchpad.Store
+	files        *filestore.Store
 
 	agents             map[string]*AgentConn
 	disconnectedAgents map[string]*disconnectedInfo
@@ -66,11 +68,12 @@ func WithMaxHistory(n int) Option {
 	return func(h *Hub) { h.maxHistory = n }
 }
 
-func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, opts ...Option) *Hub {
+func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *filestore.Store, opts ...Option) *Hub {
 	h := &Hub{
 		sessionStore:       store,
 		leader:             lt,
 		scratchpad:         sp,
+		files:              fs,
 		agents:             make(map[string]*AgentConn),
 		disconnectedAgents: make(map[string]*disconnectedInfo),
 		history:            make(map[string][]protocol.Envelope),
@@ -263,6 +266,9 @@ func (h *Hub) HandleMessage(ac *AgentConn, raw []byte) {
 	case protocol.TypeHistoryRequest:
 		h.handleHistoryRequest(ac, env)
 
+	case protocol.TypeFileShare:
+		h.handleFileShare(ac, env)
+
 	default:
 		ac.Send(protocol.NewError(ac.SessionID, "unknown message type: "+env.Type))
 	}
@@ -406,6 +412,50 @@ func (h *Hub) handleHistoryRequest(ac *AgentConn, env protocol.Envelope) {
 	ac.Send(resp)
 }
 
+func (h *Hub) handleFileShare(ac *AgentConn, env protocol.Envelope) {
+	if env.To == "" {
+		ac.Send(protocol.NewError(ac.SessionID, "file_share requires 'to' field"))
+		return
+	}
+
+	var payload protocol.FileSharePayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		ac.Send(protocol.NewError(ac.SessionID, "invalid file_share payload"))
+		return
+	}
+
+	if payload.FileID == "" || payload.FileName == "" {
+		ac.Send(protocol.NewError(ac.SessionID, "file_id and file_name are required"))
+		return
+	}
+
+	if _, ok := h.files.Get(ac.SessionID, payload.FileID); !ok {
+		ac.Send(protocol.NewError(ac.SessionID, "file not found: "+payload.FileID))
+		return
+	}
+
+	env.Sequence = h.nextSeq(ac.SessionID)
+	h.addToHistory(ac.SessionID, env)
+	h.sendToAgent(ac.SessionID, env.To, env)
+	slog.Info("file shared", "session", ac.SessionID, "from", ac.AgentID, "to", env.To, "file", payload.FileName, "file_id", payload.FileID)
+}
+
+func (h *Hub) GetFiles(sessionID string) []*filestore.File {
+	return h.files.List(sessionID)
+}
+
+func (h *Hub) StoreFile(sessionID, filename, contentType, uploadedBy string, data []byte) (*filestore.File, error) {
+	return h.files.Store(sessionID, filename, contentType, uploadedBy, data)
+}
+
+func (h *Hub) GetFile(sessionID, fileID string) (*filestore.File, bool) {
+	return h.files.Get(sessionID, fileID)
+}
+
+func (h *Hub) DeleteFile(sessionID, fileID string) bool {
+	return h.files.Delete(sessionID, fileID)
+}
+
 func (h *Hub) GetSessionAgents(sessionID string) []protocol.AgentInfo {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -465,6 +515,7 @@ func (h *Hub) CloseSession(sessionID string) {
 
 	h.leader.ClearSession(sessionID)
 	h.scratchpad.ClearSession(sessionID)
+	h.files.ClearSession(sessionID)
 
 	env, _ := protocol.NewEnvelope(protocol.TypeAgentLeft, sessionID, "server", "", "session closed")
 	data, _ := json.Marshal(env)
@@ -560,11 +611,6 @@ func (ac *AgentConn) readPump() {
 	}()
 
 	ac.conn.SetReadLimit(maxMessageSize)
-	ac.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	ac.conn.SetPongHandler(func(string) error {
-		ac.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
 
 	for {
 		_, message, err := ac.conn.ReadMessage()

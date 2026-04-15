@@ -33,6 +33,8 @@ const (
 
 	TypeHistoryRequest = "history_request"
 	TypeHistoryResult  = "history_result"
+
+	TypeFileShare = "file_share"
 )
 
 type Envelope struct {
@@ -128,4 +130,12 @@ type TaskStatusPayload struct {
 type TaskResultPayload struct {
 	TaskID string          `json:"task_id"`
 	Result json.RawMessage `json:"result"`
+}
+
+type FileSharePayload struct {
+	FileID      string `json:"file_id"`
+	FileName    string `json:"file_name"`
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
+	Description string `json:"description,omitempty"`
 }

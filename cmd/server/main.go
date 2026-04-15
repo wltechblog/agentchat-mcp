@@ -10,11 +10,14 @@ import (
 	"time"
 
 	"github.com/wltechblog/agentchat-mcp/internal/api"
+	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
 	"github.com/wltechblog/agentchat-mcp/internal/session"
 )
+
+const maxFileSize = 50 << 20
 
 func main() {
 	port := os.Getenv("PORT")
@@ -27,8 +30,9 @@ func main() {
 	store := session.NewStore()
 	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
-	h := hub.New(store, lt, sp)
-	handler := api.New(h, store, lt, sp)
+	fs := filestore.NewStore(maxFileSize)
+	h := hub.New(store, lt, sp, fs)
+	handler := api.New(h, store, lt, sp, fs)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)

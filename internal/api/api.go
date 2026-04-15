@@ -2,17 +2,21 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
 	"github.com/wltechblog/agentchat-mcp/internal/session"
 )
+
+const maxUploadMemory = 50 << 20
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -25,14 +29,16 @@ type Handler struct {
 	sessionStore *session.Store
 	leader       *leader.Tracker
 	scratchpad   *scratchpad.Store
+	files        *filestore.Store
 }
 
-func New(h *hub.Hub, store *session.Store, lt *leader.Tracker, sp *scratchpad.Store) *Handler {
+func New(h *hub.Hub, store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *filestore.Store) *Handler {
 	return &Handler{
 		hub:          h,
 		sessionStore: store,
 		leader:       lt,
 		scratchpad:   sp,
+		files:        fs,
 	}
 }
 
@@ -45,6 +51,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/history", h.getHistory)
 	mux.HandleFunc("GET /sessions/{id}/leader", h.getLeader)
 	mux.HandleFunc("GET /sessions/{id}/scratchpad", h.getScratchpad)
+	mux.HandleFunc("POST /sessions/{id}/files", h.uploadFile)
+	mux.HandleFunc("GET /sessions/{id}/files", h.listFiles)
+	mux.HandleFunc("GET /sessions/{id}/files/{fileID}", h.downloadFile)
+	mux.HandleFunc("DELETE /sessions/{id}/files/{fileID}", h.deleteFile)
 	mux.HandleFunc("GET /ws", h.handleWebSocket)
 }
 
@@ -152,6 +162,85 @@ func (h *Handler) getScratchpad(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := h.hub.GetScratchpad(id)
 	writeJSON(w, http.StatusOK, entries)
+}
+
+func (h *Handler) uploadFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := h.sessionStore.Get(id); !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadMemory)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "file too large or read error", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	filename := r.URL.Query().Get("filename")
+	if filename == "" {
+		filename = r.URL.Query().Get("name")
+	}
+	if filename == "" {
+		filename = "unnamed"
+	}
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	uploadedBy := r.Header.Get("X-Agent-ID")
+
+	f, err := h.hub.StoreFile(id, filename, contentType, uploadedBy, data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	slog.Info("file uploaded", "session", id, "file", f.Name, "file_id", f.ID, "size", f.Size, "agent", uploadedBy)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"file_id":      f.ID,
+		"file_name":    f.Name,
+		"content_type": f.ContentType,
+		"size":         f.Size,
+		"uploaded_by":  f.UploadedBy,
+		"uploaded_at":  f.UploadedAt,
+	})
+}
+
+func (h *Handler) listFiles(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := h.sessionStore.Get(id); !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	files := h.hub.GetFiles(id)
+	writeJSON(w, http.StatusOK, files)
+}
+
+func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	fileID := r.PathValue("fileID")
+	f, ok := h.hub.GetFile(id, fileID)
+	if !ok {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", f.ContentType)
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+f.Name+"\"")
+	w.Header().Set("Content-Length", string(rune(f.Size)))
+	w.Write(f.Data)
+}
+
+func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	fileID := r.PathValue("fileID")
+	if !h.hub.DeleteFile(id, fileID) {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	slog.Info("file deleted", "session", id, "file_id", fileID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {

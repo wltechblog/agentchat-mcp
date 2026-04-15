@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +22,7 @@ import (
 type Bridge struct {
 	agentID   string
 	sessionID string
+	httpBase  string
 	conn      *websocket.Conn
 	writeMu   sync.Mutex
 
@@ -86,6 +90,7 @@ func main() {
 	bridge := &Bridge{
 		agentID:   agentID,
 		sessionID: sessionID,
+		httpBase:  wsURLToHTTP(wsURL),
 		conn:      conn,
 		pending:   make(map[string]chan protocol.Envelope),
 	}
@@ -463,6 +468,121 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		}
 		return string(resp.Payload), nil
 	})
+
+	s.RegisterTool(mcp.Tool{
+		Name:        "send_file",
+		Description: "Upload a file and share it with another agent. The file content is provided as base64. Returns file_id and shares it via the session.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"to":             map[string]any{"type": "string", "description": "Target agent ID"},
+				"filename":       map[string]any{"type": "string", "description": "Name for the file"},
+				"content_base64": map[string]any{"type": "string", "description": "Base64-encoded file content"},
+				"content_type":   map[string]any{"type": "string", "description": "MIME type (default application/octet-stream)"},
+				"description":    map[string]any{"type": "string", "description": "Optional description of the file"},
+			},
+			"required": []string{"to", "filename", "content_base64"},
+		},
+	}, func(args map[string]any) (string, error) {
+		to, _ := args["to"].(string)
+		filename, _ := args["filename"].(string)
+		contentB64, _ := args["content_base64"].(string)
+		contentType, _ := args["content_type"].(string)
+		description, _ := args["description"].(string)
+
+		if to == "" || filename == "" || contentB64 == "" {
+			return "", fmt.Errorf("to, filename, and content_base64 are required")
+		}
+
+		data, err := base64.StdEncoding.DecodeString(contentB64)
+		if err != nil {
+			return "", fmt.Errorf("invalid base64: %w", err)
+		}
+
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+
+		uploadURL := fmt.Sprintf("%s/sessions/%s/files?filename=%s", b.httpBase, b.sessionID, filename)
+		req, _ := http.NewRequest("POST", uploadURL, bytes.NewReader(data))
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("X-Agent-ID", b.agentID)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("upload failed: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(resp.Body)
+			return "", fmt.Errorf("upload failed (%d): %s", resp.StatusCode, string(body))
+		}
+
+		var uploadResult map[string]any
+		json.NewDecoder(resp.Body).Decode(&uploadResult)
+
+		fileID, _ := uploadResult["file_id"].(string)
+		size, _ := uploadResult["size"].(float64)
+
+		sharePayload, _ := json.Marshal(protocol.FileSharePayload{
+			FileID:      fileID,
+			FileName:    filename,
+			ContentType: contentType,
+			Size:        int64(size),
+			Description: description,
+		})
+		env := protocol.Envelope{Type: protocol.TypeFileShare, To: to, Payload: sharePayload}
+		if err := b.sendWS(env); err != nil {
+			return "", fmt.Errorf("file uploaded but share message failed: %w", err)
+		}
+
+		result, _ := json.Marshal(map[string]any{
+			"file_id":   fileID,
+			"file_name": filename,
+			"size":      int64(size),
+			"shared_to": to,
+		})
+		return string(result), nil
+	})
+
+	s.RegisterTool(mcp.Tool{
+		Name:        "download_file",
+		Description: "Download a file by its file_id (obtained from a file_share message). Returns the file content as base64.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file_id": map[string]any{"type": "string", "description": "File ID from the file_share message"},
+			},
+			"required": []string{"file_id"},
+		},
+	}, func(args map[string]any) (string, error) {
+		fileID, _ := args["file_id"].(string)
+		if fileID == "" {
+			return "", fmt.Errorf("file_id is required")
+		}
+
+		dlURL := fmt.Sprintf("%s/sessions/%s/files/%s", b.httpBase, b.sessionID, fileID)
+		resp, err := http.Get(dlURL)
+		if err != nil {
+			return "", fmt.Errorf("download failed: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("download failed (%d)", resp.StatusCode)
+		}
+
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("read failed: %w", err)
+		}
+
+		result, _ := json.Marshal(map[string]any{
+			"file_id":        fileID,
+			"content_type":   resp.Header.Get("Content-Type"),
+			"size":           len(data),
+			"content_base64": base64.StdEncoding.EncodeToString(data),
+		})
+		return string(result), nil
+	})
 }
 
 func requireEnv(key string) string {
@@ -487,7 +607,11 @@ func mustMarshal(v any) json.RawMessage {
 	return b
 }
 
-func mustAtoi(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
+func wsURLToHTTP(wsURL string) string {
+	u := strings.TrimSuffix(wsURL, "/ws")
+	u = strings.TrimSuffix(u, "/")
+	if strings.HasPrefix(u, "wss://") {
+		return "https://" + strings.TrimPrefix(u, "wss://")
+	}
+	return "http://" + strings.TrimPrefix(u, "ws://")
 }
