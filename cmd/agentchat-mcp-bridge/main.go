@@ -38,6 +38,7 @@ type Bridge struct {
 
 	incoming []protocol.Envelope
 	incMu    sync.Mutex
+	notifyCh chan struct{}
 }
 
 func main() {
@@ -66,6 +67,7 @@ func main() {
 		capabilities: caps,
 		httpBase:     wsURLToHTTP(wsURL),
 		pending:      make(map[string]chan protocol.Envelope),
+		notifyCh:     make(chan struct{}, 1),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -247,6 +249,10 @@ func (b *Bridge) routeMessage(env protocol.Envelope) {
 		b.incMu.Lock()
 		b.incoming = append(b.incoming, env)
 		b.incMu.Unlock()
+		select {
+		case b.notifyCh <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -319,7 +325,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "send_message",
-		Description: "Send a direct message to another agent in the session",
+		Description: "Send a direct message to another agent in the session. The remote agent may take time to process and respond; use wait_for_message to block until a reply arrives.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -339,7 +345,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "broadcast",
-		Description: "Broadcast a message to all agents in the session",
+		Description: "Broadcast a message to all agents in the session. Remote agents may take time to respond; use wait_for_message or receive_messages to collect replies.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -354,7 +360,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "receive_messages",
-		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call. Call this periodically to process incoming agent communication.",
+		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call. Returns immediately with whatever is available. For blocking until a message arrives, use wait_for_message instead.",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
 		b.incMu.Lock()
@@ -366,6 +372,74 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		}
 		data, _ := json.Marshal(msgs)
 		return string(data), nil
+	})
+
+	s.RegisterTool(mcp.Tool{
+		Name:        "wait_for_message",
+		Description: "Block until one or more incoming messages arrive, then return them. This avoids repeated polling when waiting for a response from a remote agent which may take seconds or minutes to reply. Checks existing queued messages first, then waits up to the specified timeout.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"timeout": map[string]any{"type": "number", "description": "Maximum seconds to wait (default 120, max 600)"},
+				"from":    map[string]any{"type": "string", "description": "Only return messages from this agent ID"},
+				"type":    map[string]any{"type": "string", "description": "Only return messages of this type (e.g. message, task_status, task_result, broadcast)"},
+			},
+		},
+	}, func(args map[string]any) (string, error) {
+		timeoutSec, _ := args["timeout"].(float64)
+		if timeoutSec <= 0 {
+			timeoutSec = 120
+		}
+		if timeoutSec > 600 {
+			timeoutSec = 600
+		}
+		timeout := time.Duration(timeoutSec * float64(time.Second))
+
+		filterFrom, _ := args["from"].(string)
+		filterType, _ := args["type"].(string)
+
+		check := func() []protocol.Envelope {
+			b.incMu.Lock()
+			defer b.incMu.Unlock()
+			if filterFrom == "" && filterType == "" {
+				msgs := b.incoming
+				b.incoming = nil
+				return msgs
+			}
+			var matched, remaining []protocol.Envelope
+			for _, m := range b.incoming {
+				if (filterFrom == "" || m.From == filterFrom) && (filterType == "" || m.Type == filterType) {
+					matched = append(matched, m)
+				} else {
+					remaining = append(remaining, m)
+				}
+			}
+			b.incoming = remaining
+			return matched
+		}
+
+		if msgs := check(); len(msgs) > 0 {
+			data, _ := json.Marshal(msgs)
+			return string(data), nil
+		}
+
+		deadline := time.Now().Add(timeout)
+		for {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return "[]", nil
+			}
+
+			select {
+			case <-b.notifyCh:
+				if msgs := check(); len(msgs) > 0 {
+					data, _ := json.Marshal(msgs)
+					return string(data), nil
+				}
+			case <-time.After(remaining):
+				return "[]", nil
+			}
+		}
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -491,7 +565,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "task_assign",
-		Description: "Assign a task to another agent in the session",
+		Description: "Assign a task to another agent in the session. The remote agent may take minutes to complete the task; use wait_for_message to block until a task_status or task_result response arrives.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -519,7 +593,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "task_status",
-		Description: "Update the status of a task and notify the relevant agent",
+		Description: "Update the status of a task and notify the relevant agent. The receiving agent may take time to acknowledge.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -542,7 +616,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "task_result",
-		Description: "Return the result of a completed task to the requesting agent",
+		Description: "Return the result of a completed task to the requesting agent. The receiving agent may take time to process the result.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

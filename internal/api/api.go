@@ -307,7 +307,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		agentName = authPayload.AgentID
 	}
 
-	ac, err := h.hub.Register(conn, sess.ID, authPayload.AgentID, agentName, authPayload.Capabilities)
+	ac, pending, err := h.hub.Register(conn, sess.ID, authPayload.AgentID, agentName, authPayload.Capabilities)
 	if err != nil {
 		sendWSMessage(conn, protocol.NewError(sess.ID, err.Error()))
 		conn.Close()
@@ -325,6 +325,10 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}),
 		Timestamp: time.Now().UTC(),
 	})
+
+	for _, msg := range pending {
+		ac.SendRaw(msg)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

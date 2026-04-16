@@ -9,81 +9,35 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
 │  Agent A │◄─WS──►│                      │◄─WS──►│  Agent B │
 │ (MCP)    │       │   agentchat-server   │       │ (MCP)    │
 └──────────┘       │                      │       └──────────┘
-                   │  - Session mgmt      │
+                    │  - Session mgmt      │
 ┌──────────┐       │  - PSK auth          │       ┌──────────┐
 │  Agent C │◄─WS──►│  - Message routing   │◄─WS──►│  Agent D │
 │ (MCP)    │       │  - Shared scratchpad │       │ (MCP)    │
 └──────────┘       │  - Leader election   │       └──────────┘
-                   └──────────────────────┘
-                              ▲
-                              │ HTTP (Caddy reverse proxy)
-                              │
-                     ┌────────────────┐
-                     │  Caddy Server  │
-                     │  (TLS, routing)│
-                     └────────────────┘
+                    └──────────────────────┘
+                               ▲
+                               │ HTTP (Caddy reverse proxy)
+                               │
+                      ┌────────────────┐
+                      │  Caddy Server  │
+                      │  (TLS, routing)│
+                      └────────────────┘
 ```
 
 ## Features
 
 - **Session-based isolation** — Agents join named sessions, each with a unique PSK
 - **Real-time messaging** — Direct messages (agent-to-agent) and broadcasts (to all session members)
-- **Presence with reconnect handling** — 30-second grace period suppresses join/leave noise from flaky connections; reconnects are tagged as `agent_reconnected` instead of join+leave
+- **Presence with reconnect handling** — 30-second grace period suppresses join/leave noise from flaky connections; reconnects are tagged as `agent_reconnected`. Messages sent to a disconnected agent are buffered and delivered on reconnect.
 - **Shared scratchpad** — Key-value store per session for shared context, with real-time update broadcasts
 - **Leader election** — First agent in a session becomes leader; supports explicit transfer and auto-transfer on disconnect
 - **Sequenced message history** — Messages get monotonically increasing sequence numbers; agents can request missed messages after reconnect
 - **Agent capabilities** — Agents declare capabilities on join; visible to all session members
 - **Task delegation** — Built-in message types for assigning, tracking, and returning task results
-- **File transfer** — Upload files via REST, share file IDs via WebSocket, download via REST. Agents exchange files through `file_share` messages with automatic notification
-- **Auto-create sessions** — If an agent connects with an unknown session ID and PSK, the session is created automatically (no separate creation step needed)
-- **MCP bridge with auto-reconnect** — Standalone binary bridges any MCP host (Claude Desktop, Cursor) to the server via stdio↔WebSocket, with exponential backoff reconnection
+- **File transfer** — Upload files via REST, share file IDs via WebSocket, download via REST
+- **Auto-create sessions** — If an agent connects with an unknown session ID and PSK, the session is created automatically
+- **MCP bridge with auto-reconnect** — Standalone binary bridges any MCP host (Claude Desktop, Cursor, opencode) to the server via stdio↔WebSocket, with exponential backoff reconnection
 - **REST API** — Session CRUD, agent listing, history, leader, scratchpad inspection, and file upload/download via HTTP
-
-## Message Protocol
-
-All WebSocket messages are JSON envelopes:
-
-```json
-{
-  "type": "<message_type>",
-  "session_id": "<session_id>",
-  "from": "<agent_id>",
-  "to": "<agent_id>",
-  "payload": { ... },
-  "sequence": 1,
-  "timestamp": "2026-04-15T12:00:00Z"
-}
-```
-
-### Message Types
-
-| Type | Direction | Description |
-|------|-----------|-------------|
-| `auth` | Client → Server | First message on connect. Includes `session_id`, `agent_id`, `agent_name`, `psk`, `capabilities` |
-| `auth_ok` | Server → Client | Successful auth. Payload includes `leader_id` |
-| `error` | Server → Client | Error response |
-| `message` | Client → Client | Direct message. Requires `to` field |
-| `broadcast` | Client → Session | Broadcast to all agents in session (excluding sender) |
-| `agent_joined` | Server → Session | Notification that a new agent joined. Payload: `{agent_id, agent_name, capabilities}` |
-| `agent_left` | Server → Session | Notification that an agent left after grace period |
-| `agent_reconnected` | Server → Session | Notification that a disconnected agent reconnected |
-| `list_agents` | Client → Server | Request list of agents in session |
-| `agents_list` | Server → Client | Response with array of agent info |
-| `scratchpad_set` | Client → Server | Set a key. Payload: `{key, value}`. Other agents get `scratchpad_update` |
-| `scratchpad_get` | Client → Server | Get a key. Payload: `{key}`. Response: `scratchpad_result` |
-| `scratchpad_delete` | Client → Server | Delete a key. Other agents get `scratchpad_update` |
-| `scratchpad_list` | Client → Server | List all keys. Response: `scratchpad_result` with `{entries: [...]}` |
-| `scratchpad_result` | Server → Client | Response to get/set/delete/list operations |
-| `scratchpad_update` | Server → Session | Broadcast when a key is set or deleted |
-| `leader_query` | Client → Server | Ask who the current leader is |
-| `leader_info` | Server → Client/Session | Leader identity. Broadcast on transfer |
-| `leader_transfer` | Client → Server | Transfer leadership. Only current leader can do this. Payload: `{new_leader_id}` |
-| `history_request` | Client → Server | Request message history. Payload: `{after_sequence, limit}` |
-| `history_result` | Server → Client | Array of past messages |
-| `task_assign` | Client → Client | Assign a task. Requires `to`. Payload: `{task_id, description, parameters}` |
-| `task_status` | Client → Client | Update task status. Requires `to`. Payload: `{task_id, status, detail}` |
-| `task_result` | Client → Client | Return task result. Requires `to`. Payload: `{task_id, result}` |
-| `file_share` | Client → Client | Share an uploaded file. Requires `to`. Payload: `{file_id, file_name, content_type, size, description}` |
 
 ---
 
@@ -169,322 +123,115 @@ volumes:
 
 ---
 
-## Client / Agent Guide
+## Quick Start: Connect Your Agents
 
-### 1. Create a Session (or Auto-Create on Connect)
+Each agent runs as an MCP tool server via the `agentchat-mcp-bridge` binary. You configure it in your MCP host's config file (Claude Desktop, Cursor, opencode, etc.) with a session ID and PSK.
 
-You can create a session explicitly via the REST API:
+### Step 1: Build the bridge
+
+```bash
+go build -o bin/agentchat-mcp-bridge ./cmd/agentchat-mcp-bridge
+```
+
+Or just `make build-bridge`.
+
+### Step 2: Create a session
+
+Create a session on your server to get a session ID and PSK:
 
 ```bash
 curl -X POST https://agentchat.example.com/sessions \
   -H "Content-Type: application/json" \
-  -d '{"name": "project-alpha"}'
+  -d '{"name": "my-project"}'
 ```
 
-Response:
+This returns:
 
 ```json
 {
   "id": "ae83c8880de8ed8178e6a2820e41f170",
-  "name": "project-alpha",
+  "name": "my-project",
   "psk": "d642faa407191ab4e74ae31b044846e704c5d5cc59e18de2ed1917b98294463d",
-  "created_at": "2026-04-15T19:20:15.396758839Z"
+  "created_at": "2026-04-15T19:20:15Z"
 }
 ```
 
-**Auto-create:** If an agent connects with a `session_id` and `psk` that don't match any existing session, the session is created automatically. No separate REST call is needed. Optionally include `session_name` in the auth payload.
+Save the `id` and `psk`. You can also skip this step — if you provide a new `session_id` and `psk` in the bridge config, the session will be created automatically on first connection.
 
-Save the `id` and `psk` — you will need them to connect agents.
+### Step 3: Configure your MCP hosts
 
-### 2. Connect via WebSocket
+Each agent gets its own entry in the MCP host config, all pointing to the same session. Use a unique `AGENTCHAT_AGENT_ID` for each.
 
-Open a WebSocket to `/ws` and send an `auth` message as the first message:
-
-```json
-{
-  "type": "auth",
-  "payload": {
-    "session_id": "ae83c8880de8ed8178e6a2820e41f170",
-    "agent_id": "research-agent",
-    "agent_name": "Research Agent",
-    "psk": "d642faa407191ab4e74ae31b044846e704c5d5cc59e18de2ed1917b98294463d",
-    "capabilities": ["web_search", "summarize"]
-  },
-  "timestamp": "2026-04-15T19:21:00Z"
-}
-```
-
-On success you receive:
+**Claude Desktop** — add to `claude_desktop_config.json`:
 
 ```json
 {
-  "type": "auth_ok",
-  "session_id": "ae83c8880de8ed8178e6a2820e41f170",
-  "from": "server",
-  "to": "research-agent",
-  "payload": {"leader_id": "research-agent"},
-  "timestamp": "2026-04-15T19:21:00Z"
-}
-```
-
-If auth fails the connection is closed with an `error` message.
-
-### 3. Send Messages
-
-**Direct message** to a specific agent:
-
-```json
-{
-  "type": "message",
-  "to": "writer-agent",
-  "payload": {"text": "Please write a summary of the research findings."}
-}
-```
-
-**Broadcast** to all agents in the session:
-
-```json
-{
-  "type": "broadcast",
-  "payload": {"text": "Starting new research cycle."}
-}
-```
-
-### 4. Use the Scratchpad (Shared State)
-
-**Set** a key:
-
-```json
-{
-  "type": "scratchpad_set",
-  "payload": {"key": "research_plan", "value": ["step 1: search", "step 2: analyze", "step 3: report"]}
-}
-```
-
-Other agents in the session receive a `scratchpad_update` automatically.
-
-**Get** a key:
-
-```json
-{
-  "type": "scratchpad_get",
-  "payload": {"key": "research_plan"}
-}
-```
-
-**Delete** a key:
-
-```json
-{
-  "type": "scratchpad_delete",
-  "payload": {"key": "research_plan"}
-}
-```
-
-**List** all keys:
-
-```json
-{
-  "type": "scratchpad_list"
-}
-```
-
-### 5. Leader Election
-
-The first agent to join a session automatically becomes the leader. The leader can transfer leadership:
-
-```json
-{
-  "type": "leader_transfer",
-  "payload": {"new_leader_id": "writer-agent"}
-}
-```
-
-Any agent can query the current leader:
-
-```json
-{"type": "leader_query"}
-```
-
-If the leader disconnects, leadership is automatically transferred to the next available agent.
-
-### 6. Assign and Track Tasks
-
-**Assign a task:**
-
-```json
-{
-  "type": "task_assign",
-  "to": "research-agent",
-  "payload": {
-    "task_id": "task-001",
-    "description": "Search for recent papers on LLM agents",
-    "parameters": {"max_results": 10}
+  "mcpServers": {
+    "researcher": {
+      "command": "/path/to/agentchat-mcp-bridge",
+      "env": {
+        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
+        "AGENTCHAT_SESSION_ID": "ae83c8880de8ed8178e6a2820e41f170",
+        "AGENTCHAT_PSK": "d642faa407191ab4e74ae31b044846e704c5d5cc59e18de2ed1917b98294463d",
+        "AGENTCHAT_AGENT_ID": "researcher",
+        "AGENTCHAT_AGENT_NAME": "Research Agent",
+        "AGENTCHAT_CAPABILITIES": "web_search,summarize"
+      }
+    },
+    "writer": {
+      "command": "/path/to/agentchat-mcp-bridge",
+      "env": {
+        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
+        "AGENTCHAT_SESSION_ID": "ae83c8880de8ed8178e6a2820e41f170",
+        "AGENTCHAT_PSK": "d642faa407191ab4e74ae31b044846e704c5d5cc59e18de2ed1917b98294463d",
+        "AGENTCHAT_AGENT_ID": "writer",
+        "AGENTCHAT_AGENT_NAME": "Writer Agent",
+        "AGENTCHAT_CAPABILITIES": "write,edit"
+      }
+    }
   }
 }
 ```
 
-**Update task status:**
+**Cursor** — add to `.cursor/mcp.json`:
 
 ```json
 {
-  "type": "task_status",
-  "to": "coordinator",
-  "payload": {
-    "task_id": "task-001",
-    "status": "in_progress",
-    "detail": "Found 8 papers so far"
+  "mcpServers": {
+    "agentchat": {
+      "command": "/path/to/agentchat-mcp-bridge",
+      "env": {
+        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
+        "AGENTCHAT_SESSION_ID": "ae83c8880de8ed8178e6a2820e41f170",
+        "AGENTCHAT_PSK": "d642faa407191ab4e74ae31b044846e704c5d5cc59e18de2ed1917b98294463d",
+        "AGENTCHAT_AGENT_ID": "cursor-agent",
+        "AGENTCHAT_CAPABILITIES": "code,debug"
+      }
+    }
   }
 }
 ```
 
-**Return task result:**
+**opencode** — add to `.opencode/mcp.json`:
 
 ```json
 {
-  "type": "task_result",
-  "to": "coordinator",
-  "payload": {
-    "task_id": "task-001",
-    "result": {"papers": ["..."], "summary": "..."}
+  "mcpServers": {
+    "agentchat": {
+      "command": "/path/to/agentchat-mcp-bridge",
+      "env": {
+        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
+        "AGENTCHAT_SESSION_ID": "ae83c8880de8ed8178e6a2820e41f170",
+        "AGENTCHAT_PSK": "d642faa407191ab4e74ae31b044846e704c5d5cc59e18de2ed1917b98294463d",
+        "AGENTCHAT_AGENT_ID": "opencode-agent",
+        "AGENTCHAT_CAPABILITIES": "code,debug,review"
+      }
+    }
   }
 }
 ```
 
-### 7. File Transfer
-
-Agents can share files through a two-step process: upload via REST, then share the file ID via WebSocket.
-
-**Upload a file** (REST):
-
-```bash
-curl -X POST "https://agentchat.example.com/sessions/{session_id}/files?filename=report.pdf" \
-  -H "Content-Type: application/pdf" \
-  -H "X-Agent-ID: research-agent" \
-  --data-binary @report.pdf
-```
-
-Response:
-
-```json
-{"file_id": "abc123", "file_name": "report.pdf", "size": 2048}
-```
-
-**Share with another agent** (WebSocket):
-
-```json
-{
-  "type": "file_share",
-  "to": "writer-agent",
-  "payload": {
-    "file_id": "abc123",
-    "file_name": "report.pdf",
-    "content_type": "application/pdf",
-    "size": 2048,
-    "description": "Research findings PDF"
-  }
-}
-```
-
-The receiving agent can then **download the file** (REST):
-
-```bash
-curl "https://agentchat.example.com/sessions/{session_id}/files/abc123" -o report.pdf
-```
-
-### 8. Reconnect and Catch Up
-
-If an agent disconnects and reconnects within the grace period (30 seconds), it is tagged as `agent_reconnected` — no join/leave noise is broadcast.
-
-On reconnect, request missed messages by sequence number:
-
-```json
-{
-  "type": "history_request",
-  "payload": {"after_sequence": 42, "limit": 50}
-}
-```
-
-Response:
-
-```json
-{
-  "type": "history_result",
-  "payload": {"messages": [...], "count": 5}
-}
-```
-
-### Example: Python Client (websockets library)
-
-```python
-import json
-import asyncio
-import websockets
-
-SERVER = "wss://agentchat.example.com/ws"
-SESSION_ID = "your-session-id"
-PSK = "your-psk"
-
-async def run():
-    async with websockets.connect(SERVER) as ws:
-        # Auth
-        await ws.send(json.dumps({
-            "type": "auth",
-            "payload": {
-                "session_id": SESSION_ID,
-                "agent_id": "my-agent",
-                "agent_name": "My Agent",
-                "psk": PSK,
-                "capabilities": ["search", "analyze"]
-            },
-            "timestamp": "2026-04-15T19:21:00Z"
-        }))
-        auth_resp = json.loads(await ws.recv())
-        print("Auth:", auth_resp["type"])
-
-        # Listen for messages
-        async for raw in ws:
-            env = json.loads(raw)
-            print(f"[{env['type']}] from={env.get('from')} payload={env.get('payload')}")
-
-            if env["type"] == "message" and env["to"] == "my-agent":
-                # Handle direct message
-                reply = json.dumps({
-                    "type": "message",
-                    "to": env["from"],
-                    "payload": {"text": "Got your message!"}
-                })
-                await ws.send(reply)
-
-asyncio.run(run())
-```
-
----
-
-## MCP Bridge (agentchat-mcp-bridge)
-
-The bridge is a standalone Go binary that acts as an MCP server (stdio transport) and connects to the agentchat-server over WebSocket. This lets any MCP-compatible host (Claude Desktop, Cursor, etc.) participate in agent sessions without implementing the WebSocket protocol directly.
-
-### Architecture
-
-```
-┌───────────────────┐   MCP (stdio)   ┌──────────────────────┐   WebSocket   ┌──────────┐
-│  MCP Host         │◄───────────────►│  agentchat-mcp-bridge│◄────────────►│  agentchat│
-│  (Claude, Cursor) │                 │  (Go binary)         │              │  -server  │
-└───────────────────┘                 └──────────────────────┘              └──────────┘
-```
-
-### Build
-
-```bash
-make build-bridge
-# or
-go build -o bin/agentchat-mcp-bridge ./cmd/agentchat-mcp-bridge
-```
-
-### Configuration
-
-The bridge is configured entirely through environment variables:
+### Bridge Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -495,13 +242,27 @@ The bridge is configured entirely through environment variables:
 | `AGENTCHAT_AGENT_NAME` | No | Display name (defaults to agent ID) |
 | `AGENTCHAT_CAPABILITIES` | No | Comma-separated capability list (e.g. `"search,analyze,write"`) |
 
-### Exposed MCP Tools
+### How it works
+
+The bridge connects to the server over WebSocket and exposes MCP tools over stdio. Your MCP host calls these tools to interact with other agents in the session. The bridge auto-reconnects with exponential backoff if the connection drops.
+
+```
+┌───────────────────┐   MCP (stdio)   ┌──────────────────────┐   WebSocket   ┌──────────┐
+│  MCP Host         │◄───────────────►│  agentchat-mcp-bridge│◄────────────►│  agentchat│
+│  (Claude, Cursor) │                 │  (Go binary)         │              │  -server  │
+└───────────────────┘                 └──────────────────────┘              └──────────┘
+```
+
+### Using the tools
+
+Once configured, agents can use these MCP tools to communicate:
 
 | Tool | Description |
 |------|-------------|
-| `send_message` | Send a direct message to another agent |
+| `send_message` | Send a direct message to another agent (remote agent may take time to respond) |
 | `broadcast` | Broadcast a message to all agents in the session |
-| `receive_messages` | Retrieve queued incoming messages since last call |
+| `receive_messages` | Retrieve queued incoming messages since last call (returns immediately) |
+| `wait_for_message` | Block until a message arrives, with optional filters (`type`, `from`) and timeout. Use this instead of polling when waiting for slow remote agents. |
 | `list_agents` | List all connected agents and their capabilities |
 | `get_leader` | Get the current session leader |
 | `transfer_leadership` | Transfer leadership to another agent |
@@ -509,93 +270,68 @@ The bridge is configured entirely through environment variables:
 | `scratchpad_get` | Get a value from the scratchpad |
 | `scratchpad_delete` | Delete a key from the scratchpad |
 | `scratchpad_list` | List all scratchpad entries |
-| `task_assign` | Assign a task to another agent |
+| `task_assign` | Assign a task to another agent (remote agent may take minutes to complete) |
 | `task_status` | Update a task's status |
 | `task_result` | Return a completed task's result |
 | `request_history` | Request message history (optionally after a sequence number) |
 | `send_file` | Upload a file (base64 content) and share it with another agent |
 | `download_file` | Download a file by ID, returns base64-encoded content |
 
-### Client Deployment Examples
+**Typical workflow:**
 
-#### Claude Desktop
+1. Call `list_agents` to discover peers and their capabilities
+2. Call `task_assign` to delegate work to a specific agent
+3. Call `wait_for_message` to block until a `task_result` or `task_status` response arrives (remote agents may take minutes)
+4. Use the scratchpad to share intermediate state across all agents
+5. Use `send_file` / `download_file` to exchange files
 
-Add to `claude_desktop_config.json`:
+---
 
-```json
-{
-  "mcpServers": {
-    "agentchat-researcher": {
-      "command": "/path/to/agentchat-mcp-bridge",
-      "env": {
-        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
-        "AGENTCHAT_SESSION_ID": "your-session-id",
-        "AGENTCHAT_PSK": "your-psk",
-        "AGENTCHAT_AGENT_ID": "researcher",
-        "AGENTCHAT_AGENT_NAME": "Research Agent",
-        "AGENTCHAT_CAPABILITIES": "web_search,summarize"
-      }
-    },
-    "agentchat-writer": {
-      "command": "/path/to/agentchat-mcp-bridge",
-      "env": {
-        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
-        "AGENTCHAT_SESSION_ID": "your-session-id",
-        "AGENTCHAT_PSK": "your-psk",
-        "AGENTCHAT_AGENT_ID": "writer",
-        "AGENTCHAT_AGENT_NAME": "Writer Agent",
-        "AGENTCHAT_CAPABILITIES": "write,edit"
-      }
-    }
-  }
-}
-```
+## Message Protocol (for custom clients)
 
-Each entry is a separate bridge process connecting to the same session. Claude can then use `send_message` to route tasks to specific agents and `receive_messages` to collect results.
-
-#### Cursor
-
-Add to `.cursor/mcp.json` in your project root:
+All WebSocket messages are JSON envelopes:
 
 ```json
 {
-  "mcpServers": {
-    "agentchat": {
-      "command": "/path/to/agentchat-mcp-bridge",
-      "env": {
-        "AGENTCHAT_URL": "wss://agentchat.example.com/ws",
-        "AGENTCHAT_SESSION_ID": "your-session-id",
-        "AGENTCHAT_PSK": "your-psk",
-        "AGENTCHAT_AGENT_ID": "cursor-agent",
-        "AGENTCHAT_CAPABILITIES": "code,debug"
-      }
-    }
-  }
+  "type": "<message_type>",
+  "session_id": "<session_id>",
+  "from": "<agent_id>",
+  "to": "<agent_id>",
+  "payload": { ... },
+  "sequence": 1,
+  "timestamp": "2026-04-15T12:00:00Z"
 }
 ```
 
-#### Generic MCP Host (stdio)
+### Message Types
 
-The bridge reads JSON-RPC from stdin and writes to stdout. Logs go to stderr.
-
-```bash
-export AGENTCHAT_URL=wss://agentchat.example.com/ws
-export AGENTCHAT_SESSION_ID=your-session-id
-export AGENTCHAT_PSK=your-psk
-export AGENTCHAT_AGENT_ID=my-agent
-
-./agentchat-mcp-bridge
-```
-
-### Multi-Agent Orchestration Pattern
-
-To coordinate multiple agents through a single MCP host:
-
-1. Create a session: `curl -X POST .../sessions -d '{"name":"team"}'`
-2. Configure one bridge per agent in your MCP host config (each with a different `AGENTCHAT_AGENT_ID`)
-3. The host agent calls `list_agents` to discover peers and their capabilities
-4. Use `task_assign` to delegate work, `receive_messages` to collect updates
-5. Use the scratchpad to share intermediate state
+| Type | Direction | Description |
+|------|-----------|-------------|
+| `auth` | Client → Server | First message on connect. Includes `session_id`, `agent_id`, `agent_name`, `psk`, `capabilities` |
+| `auth_ok` | Server → Client | Successful auth. Payload includes `leader_id` |
+| `error` | Server → Client | Error response |
+| `message` | Client → Client | Direct message. Requires `to` field |
+| `broadcast` | Client → Session | Broadcast to all agents in session (excluding sender) |
+| `agent_joined` | Server → Session | Notification that a new agent joined. Payload: `{agent_id, agent_name, capabilities}` |
+| `agent_left` | Server → Session | Notification that an agent left after grace period |
+| `agent_reconnected` | Server → Session | Notification that a disconnected agent reconnected |
+| `list_agents` | Client → Server | Request list of agents in session |
+| `agents_list` | Server → Client | Response with array of agent info |
+| `scratchpad_set` | Client → Server | Set a key. Payload: `{key, value}`. Other agents get `scratchpad_update` |
+| `scratchpad_get` | Client → Server | Get a key. Payload: `{key}`. Response: `scratchpad_result` |
+| `scratchpad_delete` | Client → Server | Delete a key. Other agents get `scratchpad_update` |
+| `scratchpad_list` | Client → Server | List all keys. Response: `scratchpad_result` with `{entries: [...]}` |
+| `scratchpad_result` | Server → Client | Response to get/set/delete/list operations |
+| `scratchpad_update` | Server → Session | Broadcast when a key is set or deleted |
+| `leader_query` | Client → Server | Ask who the current leader is |
+| `leader_info` | Server → Client/Session | Leader identity. Broadcast on transfer |
+| `leader_transfer` | Client → Server | Transfer leadership. Only current leader can do this. Payload: `{new_leader_id}` |
+| `history_request` | Client → Server | Request message history. Payload: `{after_sequence, limit}` |
+| `history_result` | Server → Client | Array of past messages |
+| `task_assign` | Client → Client | Assign a task. Requires `to`. Payload: `{task_id, description, parameters}` |
+| `task_status` | Client → Client | Update task status. Requires `to`. Payload: `{task_id, status, detail}` |
+| `task_result` | Client → Client | Return task result. Requires `to`. Payload: `{task_id, result}` |
+| `file_share` | Client → Client | Share an uploaded file. Requires `to`. Payload: `{file_id, file_name, content_type, size, description}` |
 
 ---
 

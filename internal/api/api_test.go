@@ -888,3 +888,65 @@ func TestFileDelete(t *testing.T) {
 		t.Fatalf("expected 404, got %d", goneResp.StatusCode)
 	}
 }
+
+func TestMessagesBufferedDuringDisconnect(t *testing.T) {
+	server, _ := setupTestServerWithGrace(t, 5*time.Second)
+	sessionID, psk := createTestSession(t, server)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+
+	ws1 := dialWS(t, wsURL)
+	ws2 := dialWS(t, wsURL)
+	authAgent(t, ws1, sessionID, "agent-1", psk)
+	authAgent(t, ws2, sessionID, "agent-2", psk)
+	readEnvelope(t, ws1) // agent-2 joined
+
+	ws2.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	writeEnvelope(t, ws1, protocol.Envelope{
+		Type:    protocol.TypeMessage,
+		To:      "agent-2",
+		Payload: mustMarshalPayload(t, map[string]string{"text": "buffered msg 1"}),
+	})
+	writeEnvelope(t, ws1, protocol.Envelope{
+		Type:    protocol.TypeMessage,
+		To:      "agent-2",
+		Payload: mustMarshalPayload(t, map[string]string{"text": "buffered msg 2"}),
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	ws2reconn := dialWS(t, wsURL)
+	authAgent(t, ws2reconn, sessionID, "agent-2", psk)
+
+	readEnvelope(t, ws1) // agent_reconnected
+
+	msg1 := readEnvelope(t, ws2reconn)
+	if msg1.Type != protocol.TypeMessage {
+		t.Fatalf("expected message, got %s", msg1.Type)
+	}
+	var p1 map[string]string
+	json.Unmarshal(msg1.Payload, &p1)
+	if p1["text"] != "buffered msg 1" {
+		t.Fatalf("expected 'buffered msg 1', got %q", p1["text"])
+	}
+
+	msg2 := readEnvelope(t, ws2reconn)
+	if msg2.Type != protocol.TypeMessage {
+		t.Fatalf("expected message, got %s", msg2.Type)
+	}
+	var p2 map[string]string
+	json.Unmarshal(msg2.Payload, &p2)
+	if p2["text"] != "buffered msg 2" {
+		t.Fatalf("expected 'buffered msg 2', got %q", p2["text"])
+	}
+}
+
+func mustMarshalPayload(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return data
+}

@@ -20,6 +20,9 @@ const (
 	gracePeriod    = 30 * time.Second
 	sendBufSize    = 256
 	maxMessageSize = 65536
+	pongWait       = 60 * time.Second
+	pingPeriod     = 30 * time.Second
+	maxPendingMsgs = 512
 )
 
 func agentKey(sessionID, agentID string) string {
@@ -45,6 +48,7 @@ type disconnectedInfo struct {
 	agentName    string
 	capabilities []string
 	timer        *time.Timer
+	pendingMsgs  [][]byte
 }
 
 type AgentConn struct {
@@ -92,14 +96,14 @@ func (h *Hub) nextSeq(sessionID string) int64 {
 	return h.seqNums[sessionID]
 }
 
-func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName string, capabilities []string) (*AgentConn, error) {
+func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName string, capabilities []string) (*AgentConn, [][]byte, error) {
 	key := agentKey(sessionID, agentID)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if _, exists := h.agents[key]; exists {
-		return nil, fmt.Errorf("agent_id %q is already connected to this session", agentID)
+		return nil, nil, fmt.Errorf("agent_id %q is already connected to this session", agentID)
 	}
 
 	ac := &AgentConn{
@@ -115,14 +119,19 @@ func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName strin
 
 	if info, exists := h.disconnectedAgents[key]; exists {
 		info.timer.Stop()
+		pending := info.pendingMsgs
 		delete(h.disconnectedAgents, key)
 		h.agents[key] = ac
-		slog.Info("agent reconnected", "session", sessionID, "agent", agentID)
+		slog.Info("agent reconnected", "session", sessionID, "agent", agentID, "pending_msgs", len(pending))
 		go h.broadcastAfterUnlock(sessionID, protocol.TypeAgentReconnected, "server", protocol.AgentInfo{
 			AgentID:      agentID,
 			AgentName:    agentName,
 			Capabilities: capabilities,
 		}, agentID)
+
+		go ac.writePump()
+		go ac.readPump()
+		return ac, pending, nil
 	} else {
 		h.agents[key] = ac
 		slog.Info("agent joined", "session", sessionID, "agent", agentID)
@@ -141,7 +150,7 @@ func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName strin
 	go ac.writePump()
 	go ac.readPump()
 
-	return ac, nil
+	return ac, nil, nil
 }
 
 func (h *Hub) Unregister(ac *AgentConn) {
@@ -558,27 +567,41 @@ func (h *Hub) broadcastAfterUnlock(sessionID, msgType, from string, payload any,
 
 func (h *Hub) sendToAgent(sessionID, agentID string, env protocol.Envelope) {
 	key := agentKey(sessionID, agentID)
+	data, _ := json.Marshal(env)
 
 	h.mu.RLock()
 	ac, ok := h.agents[key]
 	h.mu.RUnlock()
 
-	if !ok {
-		senderKey := agentKey(sessionID, env.From)
-		h.mu.RLock()
-		sender, senderOk := h.agents[senderKey]
-		h.mu.RUnlock()
-		if senderOk {
-			sender.Send(protocol.NewError(sessionID, "agent not found: "+agentID))
+	if ok {
+		select {
+		case ac.send <- data:
+		default:
+			slog.Warn("send buffer full for agent", "agent", agentID)
 		}
 		return
 	}
 
-	data, _ := json.Marshal(env)
-	select {
-	case ac.send <- data:
-	default:
-		slog.Warn("send buffer full for agent", "agent", agentID)
+	h.mu.Lock()
+	info, disconnOk := h.disconnectedAgents[key]
+	h.mu.Unlock()
+
+	if disconnOk {
+		if len(info.pendingMsgs) < maxPendingMsgs {
+			info.pendingMsgs = append(info.pendingMsgs, data)
+			slog.Info("buffered message for disconnected agent", "agent", agentID, "pending", len(info.pendingMsgs))
+		} else {
+			slog.Warn("pending message buffer full for agent, dropping", "agent", agentID)
+		}
+		return
+	}
+
+	senderKey := agentKey(sessionID, env.From)
+	h.mu.RLock()
+	sender, senderOk := h.agents[senderKey]
+	h.mu.RUnlock()
+	if senderOk {
+		sender.Send(protocol.NewError(sessionID, "agent not found: "+agentID))
 	}
 }
 
@@ -604,6 +627,14 @@ func (ac *AgentConn) Send(env protocol.Envelope) {
 	}
 }
 
+func (ac *AgentConn) SendRaw(data []byte) {
+	select {
+	case ac.send <- data:
+	default:
+		slog.Warn("send buffer full", "agent", ac.AgentID)
+	}
+}
+
 func (ac *AgentConn) readPump() {
 	defer func() {
 		ac.hub.Unregister(ac)
@@ -611,6 +642,11 @@ func (ac *AgentConn) readPump() {
 	}()
 
 	ac.conn.SetReadLimit(maxMessageSize)
+	ac.conn.SetReadDeadline(time.Now().Add(pongWait))
+	ac.conn.SetPongHandler(func(string) error {
+		ac.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
 
 	for {
 		_, message, err := ac.conn.ReadMessage()
@@ -620,12 +656,13 @@ func (ac *AgentConn) readPump() {
 			}
 			return
 		}
+		ac.conn.SetReadDeadline(time.Now().Add(pongWait))
 		ac.hub.HandleMessage(ac, message)
 	}
 }
 
 func (ac *AgentConn) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
 		ac.conn.Close()
@@ -634,7 +671,6 @@ func (ac *AgentConn) writePump() {
 	for {
 		select {
 		case message, ok := <-ac.send:
-			ac.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
 				ac.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
@@ -644,7 +680,6 @@ func (ac *AgentConn) writePump() {
 			}
 
 		case <-ticker.C:
-			ac.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := ac.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
