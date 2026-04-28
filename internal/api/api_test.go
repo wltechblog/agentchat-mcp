@@ -687,7 +687,7 @@ func TestRESTGetScratchpad(t *testing.T) {
 	}
 }
 
-func TestDuplicateAgentIDRejected(t *testing.T) {
+func TestDuplicateAgentIDAccepted(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
@@ -720,8 +720,8 @@ func TestDuplicateAgentIDRejected(t *testing.T) {
 	}
 	var errResp protocol.Envelope
 	json.Unmarshal(resp, &errResp)
-	if errResp.Type != protocol.TypeError {
-		t.Fatalf("expected error for duplicate agent_id, got %s: %s", errResp.Type, string(resp))
+	if errResp.Type != protocol.TypeAuthOK {
+		t.Fatalf("expected auth_ok for duplicate agent_id, got %s: %s", errResp.Type, string(resp))
 	}
 }
 

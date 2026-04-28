@@ -2,7 +2,6 @@ package hub
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -36,7 +35,7 @@ type Hub struct {
 	scratchpad   *scratchpad.Store
 	files        *filestore.Store
 
-	agents             map[string]*AgentConn
+	agents             map[string][]*AgentConn
 	disconnectedAgents map[string]*disconnectedInfo
 	history            map[string][]protocol.Envelope
 	maxHistory         int
@@ -78,7 +77,7 @@ func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *fil
 		leader:             lt,
 		scratchpad:         sp,
 		files:              fs,
-		agents:             make(map[string]*AgentConn),
+		agents:             make(map[string][]*AgentConn),
 		disconnectedAgents: make(map[string]*disconnectedInfo),
 		history:            make(map[string][]protocol.Envelope),
 		maxHistory:         maxHistory,
@@ -102,10 +101,6 @@ func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName strin
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if _, exists := h.agents[key]; exists {
-		return nil, nil, fmt.Errorf("agent_id %q is already connected to this session", agentID)
-	}
-
 	ac := &AgentConn{
 		AgentID:      agentID,
 		AgentName:    agentName,
@@ -121,7 +116,7 @@ func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName strin
 		info.timer.Stop()
 		pending := info.pendingMsgs
 		delete(h.disconnectedAgents, key)
-		h.agents[key] = ac
+		h.agents[key] = append(h.agents[key], ac)
 		slog.Info("agent reconnected", "session", sessionID, "agent", agentID, "pending_msgs", len(pending))
 		go h.broadcastAfterUnlock(sessionID, protocol.TypeAgentReconnected, "server", protocol.AgentInfo{
 			AgentID:      agentID,
@@ -133,17 +128,20 @@ func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName strin
 		go ac.readPump()
 		return ac, pending, nil
 	} else {
-		h.agents[key] = ac
-		slog.Info("agent joined", "session", sessionID, "agent", agentID)
-		go h.broadcastAfterUnlock(sessionID, protocol.TypeAgentJoined, "server", protocol.AgentInfo{
-			AgentID:      agentID,
-			AgentName:    agentName,
-			Capabilities: capabilities,
-		}, agentID)
+		isNew := len(h.agents[key]) == 0
+		h.agents[key] = append(h.agents[key], ac)
+		if isNew {
+			slog.Info("agent joined", "session", sessionID, "agent", agentID)
+			go h.broadcastAfterUnlock(sessionID, protocol.TypeAgentJoined, "server", protocol.AgentInfo{
+				AgentID:      agentID,
+				AgentName:    agentName,
+				Capabilities: capabilities,
+			}, agentID)
 
-		if _, hasLeader := h.leader.GetLeader(sessionID); !hasLeader {
-			h.leader.SetInitialLeader(sessionID, agentID)
-			slog.Info("initial leader set", "session", sessionID, "leader", agentID)
+			if _, hasLeader := h.leader.GetLeader(sessionID); !hasLeader {
+				h.leader.SetInitialLeader(sessionID, agentID)
+				slog.Info("initial leader set", "session", sessionID, "leader", agentID)
+			}
 		}
 	}
 
@@ -158,10 +156,27 @@ func (h *Hub) Unregister(ac *AgentConn) {
 
 	h.mu.Lock()
 
-	if existing, ok := h.agents[key]; !ok || existing != ac {
+	conns := h.agents[key]
+	var found bool
+	var newConns []*AgentConn
+	for _, c := range conns {
+		if c == ac {
+			found = true
+		} else {
+			newConns = append(newConns, c)
+		}
+	}
+	if !found {
 		h.mu.Unlock()
 		return
 	}
+
+	if len(newConns) > 0 {
+		h.agents[key] = newConns
+		h.mu.Unlock()
+		return
+	}
+
 	delete(h.agents, key)
 
 	timer := time.AfterFunc(h.gracePeriod, func() {
@@ -181,9 +196,9 @@ func (h *Hub) Unregister(ac *AgentConn) {
 		if leaderID, ok := h.leader.GetLeader(ac.SessionID); ok && leaderID == ac.AgentID {
 			h.mu.RLock()
 			var newLeader string
-			for _, a := range h.agents {
-				if a.SessionID == ac.SessionID {
-					newLeader = a.AgentID
+			for _, conns := range h.agents {
+				if len(conns) > 0 && conns[0].SessionID == ac.SessionID {
+					newLeader = conns[0].AgentID
 					break
 				}
 			}
@@ -364,10 +379,10 @@ func (h *Hub) handleLeaderTransfer(ac *AgentConn, env protocol.Envelope) {
 
 	key := agentKey(ac.SessionID, payload.NewLeaderID)
 	h.mu.RLock()
-	_, exists := h.agents[key]
+	conns, exists := h.agents[key]
 	h.mu.RUnlock()
 
-	if !exists {
+	if !exists || len(conns) == 0 {
 		ac.Send(protocol.NewError(ac.SessionID, "agent not found in session: "+payload.NewLeaderID))
 		return
 	}
@@ -470,7 +485,11 @@ func (h *Hub) GetSessionAgents(sessionID string) []protocol.AgentInfo {
 	defer h.mu.RUnlock()
 
 	agents := make([]protocol.AgentInfo, 0)
-	for k, ac := range h.agents {
+	for k, conns := range h.agents {
+		if len(conns) == 0 {
+			continue
+		}
+		ac := conns[0]
 		if ac.SessionID == sessionID {
 			_ = k
 			agents = append(agents, protocol.AgentInfo{
@@ -505,11 +524,13 @@ func (h *Hub) CloseSession(sessionID string) {
 	h.mu.Lock()
 
 	var channels []chan []byte
-	for key, ac := range h.agents {
-		if ac.SessionID == sessionID {
-			channels = append(channels, ac.send)
-			close(ac.done)
-			ac.conn.Close()
+	for key, conns := range h.agents {
+		if len(conns) > 0 && conns[0].SessionID == sessionID {
+			for _, ac := range conns {
+				channels = append(channels, ac.send)
+				close(ac.done)
+				ac.conn.Close()
+			}
 			delete(h.agents, key)
 		}
 	}
@@ -539,9 +560,11 @@ func (h *Hub) CloseSession(sessionID string) {
 func (h *Hub) broadcastToSession(sessionID string, env protocol.Envelope, excludeAgent string) {
 	h.mu.RLock()
 	var targets []chan []byte
-	for _, ac := range h.agents {
-		if ac.SessionID == sessionID && ac.AgentID != excludeAgent {
-			targets = append(targets, ac.send)
+	for _, conns := range h.agents {
+		for _, ac := range conns {
+			if ac.SessionID == sessionID && ac.AgentID != excludeAgent {
+				targets = append(targets, ac.send)
+			}
 		}
 	}
 	h.mu.RUnlock()
@@ -570,14 +593,16 @@ func (h *Hub) sendToAgent(sessionID, agentID string, env protocol.Envelope) {
 	data, _ := json.Marshal(env)
 
 	h.mu.RLock()
-	ac, ok := h.agents[key]
+	conns, ok := h.agents[key]
 	h.mu.RUnlock()
 
-	if ok {
-		select {
-		case ac.send <- data:
-		default:
-			slog.Warn("send buffer full for agent", "agent", agentID)
+	if ok && len(conns) > 0 {
+		for _, ac := range conns {
+			select {
+			case ac.send <- data:
+			default:
+				slog.Warn("send buffer full for agent", "agent", agentID)
+			}
 		}
 		return
 	}
@@ -598,10 +623,12 @@ func (h *Hub) sendToAgent(sessionID, agentID string, env protocol.Envelope) {
 
 	senderKey := agentKey(sessionID, env.From)
 	h.mu.RLock()
-	sender, senderOk := h.agents[senderKey]
+	senderConns, senderOk := h.agents[senderKey]
 	h.mu.RUnlock()
-	if senderOk {
-		sender.Send(protocol.NewError(sessionID, "agent not found: "+agentID))
+	if senderOk && len(senderConns) > 0 {
+		for _, sender := range senderConns {
+			sender.Send(protocol.NewError(sessionID, "agent not found: "+agentID))
+		}
 	}
 }
 
