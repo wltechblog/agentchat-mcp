@@ -27,11 +27,14 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
+	debugStr := os.Getenv("AGENTCHAT_DEBUG")
+	debugLog := debugStr == "true" || debugStr == "1"
+
 	store := session.NewStore()
 	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
 	fs := filestore.NewStore(maxFileSize)
-	h := hub.New(store, lt, sp, fs)
+	h := hub.New(store, lt, sp, fs, hub.WithDebugLog(debugLog))
 	handler := api.New(h, store, lt, sp, fs)
 
 	mux := http.NewServeMux()

@@ -120,6 +120,7 @@ volumes:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | HTTP listen port |
+| `AGENTCHAT_DEBUG` | `false` | Set to `true` or `1` to enable debug logging of incoming and outgoing WebSocket messages |
 
 ---
 

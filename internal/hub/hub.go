@@ -41,6 +41,7 @@ type Hub struct {
 	maxHistory         int
 	gracePeriod        time.Duration
 	seqNums            map[string]int64
+	debugLog           bool
 }
 
 type disconnectedInfo struct {
@@ -69,6 +70,10 @@ func WithGracePeriod(d time.Duration) Option {
 
 func WithMaxHistory(n int) Option {
 	return func(h *Hub) { h.maxHistory = n }
+}
+
+func WithDebugLog(debug bool) Option {
+	return func(h *Hub) { h.debugLog = debug }
 }
 
 func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *filestore.Store, opts ...Option) *Hub {
@@ -238,6 +243,10 @@ func (h *Hub) HandleMessage(ac *AgentConn, raw []byte) {
 	env.SessionID = ac.SessionID
 	if env.Timestamp.IsZero() {
 		env.Timestamp = time.Now().UTC()
+	}
+
+	if h.debugLog {
+		slog.Info("server received message", "type", env.Type, "from", env.From, "to", env.To, "request_id", env.RequestID, "session", ac.SessionID)
 	}
 
 	switch env.Type {
@@ -571,6 +580,9 @@ func (h *Hub) CloseSession(sessionID string) {
 }
 
 func (h *Hub) broadcastToSession(sessionID string, env protocol.Envelope, excludeAgent string) {
+	if h.debugLog {
+		slog.Info("server broadcasting message", "type", env.Type, "from", env.From, "request_id", env.RequestID, "session", sessionID, "exclude", excludeAgent)
+	}
 	h.mu.RLock()
 	var targets []chan []byte
 	for _, conns := range h.agents {
@@ -602,6 +614,9 @@ func (h *Hub) broadcastAfterUnlock(sessionID, msgType, from string, payload any,
 }
 
 func (h *Hub) sendToAgent(sessionID, agentID string, env protocol.Envelope) {
+	if h.debugLog {
+		slog.Info("server routing message", "type", env.Type, "from", env.From, "to", agentID, "request_id", env.RequestID, "session", sessionID)
+	}
 	key := agentKey(sessionID, agentID)
 	data, _ := json.Marshal(env)
 
@@ -656,6 +671,9 @@ func (h *Hub) addToHistory(sessionID string, env protocol.Envelope) {
 }
 
 func (ac *AgentConn) Send(env protocol.Envelope) {
+	if ac.hub.debugLog {
+		slog.Info("server sending response", "type", env.Type, "to", ac.AgentID, "request_id", env.RequestID, "session", ac.SessionID)
+	}
 	data, err := json.Marshal(env)
 	if err != nil {
 		return
