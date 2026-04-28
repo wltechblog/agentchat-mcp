@@ -481,6 +481,71 @@ func registerTools(s *mcp.Server, b *Bridge) {
 	})
 
 	s.RegisterTool(mcp.Tool{
+		Name:        "send_and_wait",
+		Description: "Send a message to another agent and block until a reply arrives. Combines send_message + wait_for_message into a single synchronous call. Use this instead of calling send_message and wait_for_message separately.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"to":      map[string]any{"type": "string", "description": "Target agent ID"},
+				"payload": map[string]any{"type": "object", "description": "Message payload"},
+				"timeout": map[string]any{"type": "number", "description": "Maximum seconds to wait for reply (default 120, max 600)"},
+			},
+			"required": []string{"to", "payload"},
+		},
+	}, func(args map[string]any) (string, error) {
+		to, _ := args["to"].(string)
+		if to == "" {
+			return "", fmt.Errorf("to is required")
+		}
+
+		timeoutSec, _ := args["timeout"].(float64)
+		if timeoutSec <= 0 {
+			timeoutSec = 120
+		}
+		if timeoutSec > 600 {
+			timeoutSec = 600
+		}
+		timeout := time.Duration(timeoutSec * float64(time.Second))
+
+		env, _ := protocol.NewEnvelope(protocol.TypeMessage, b.sessionID, b.agentID, to, args["payload"])
+		if err := b.sendWS(env); err != nil {
+			return "", fmt.Errorf("send failed: %w", err)
+		}
+
+		deadline := time.Now().Add(timeout)
+		for {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return "[]", nil
+			}
+
+			b.incMu.Lock()
+			var matched []protocol.Envelope
+			var keep []protocol.Envelope
+			for _, m := range b.incoming {
+				if m.From == to {
+					matched = append(matched, m)
+				} else {
+					keep = append(keep, m)
+				}
+			}
+			b.incoming = keep
+			b.incMu.Unlock()
+
+			if len(matched) > 0 {
+				data, _ := json.Marshal(matched)
+				return string(data), nil
+			}
+
+			select {
+			case <-b.notifyCh:
+			case <-time.After(remaining):
+				return "[]", nil
+			}
+		}
+	})
+
+	s.RegisterTool(mcp.Tool{
 		Name:        "list_agents",
 		Description: "List all agents currently connected to the session",
 		InputSchema: empty,
@@ -536,7 +601,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"key", "value"},
 		},
 	}, func(args map[string]any) (string, error) {
-		key, _ := args["key"].(string)
+		key := stringifyArg(args["key"])
 		if key == "" {
 			return "", fmt.Errorf("key is required")
 		}
@@ -560,11 +625,14 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"key"},
 		},
 	}, func(args map[string]any) (string, error) {
-		key, _ := args["key"].(string)
+		key := stringifyArg(args["key"])
+		if key == "" {
+			return "", fmt.Errorf("key is required")
+		}
 		payload, _ := json.Marshal(map[string]string{"key": key})
 		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeScratchpadGet, Payload: payload}, protocol.TypeScratchpadResult, 5*time.Second)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("scratchpad_get(%q): %w", key, err)
 		}
 		return string(resp.Payload), nil
 	})
@@ -580,7 +648,10 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"key"},
 		},
 	}, func(args map[string]any) (string, error) {
-		key, _ := args["key"].(string)
+		key := stringifyArg(args["key"])
+		if key == "" {
+			return "", fmt.Errorf("key is required")
+		}
 		payload, _ := json.Marshal(map[string]string{"key": key})
 		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeScratchpadDelete, Payload: payload}, protocol.TypeScratchpadResult, 5*time.Second)
 		if err != nil {
@@ -811,6 +882,16 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		})
 		return string(result), nil
 	})
+}
+
+func stringifyArg(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 func requireEnv(key string) string {
