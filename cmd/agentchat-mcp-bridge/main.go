@@ -42,6 +42,8 @@ type Bridge struct {
 	incoming []protocol.Envelope
 	incMu    sync.Mutex
 	notifyCh chan struct{}
+
+	debugLog bool
 }
 
 func main() {
@@ -53,6 +55,12 @@ func main() {
 	agentID := requireEnv("AGENTCHAT_AGENT_ID")
 	agentName := envOrDefault("AGENTCHAT_AGENT_NAME", agentID)
 	capsStr := envOrDefault("AGENTCHAT_CAPABILITIES", "")
+	debugStr := envOrDefault("AGENTCHAT_DEBUG", "")
+	var debugLog bool
+	if strings.ToLower(debugStr) == "true" || debugStr == "1" {
+		debugLog = true
+	}
+
 	var caps []string
 	if capsStr != "" {
 		caps = strings.Split(capsStr, ",")
@@ -76,6 +84,7 @@ func main() {
 		notifyCh:     make(chan struct{}, 1),
 		ctx:          ctx,
 		cancel:       cancel,
+		debugLog:     debugLog,
 	}
 
 	server := mcp.NewServer("agentchat-mcp-bridge", "1.0.0")
@@ -233,6 +242,10 @@ func (b *Bridge) readPump() {
 			continue
 		}
 
+		if b.debugLog {
+			slog.Info("received message", "type", env.Type, "from", env.From, "to", env.To, "request_id", env.RequestID)
+		}
+
 		b.routeMessage(env)
 	}
 }
@@ -293,6 +306,9 @@ func (b *Bridge) sendWS(env protocol.Envelope) error {
 
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()
+	if b.debugLog {
+		slog.Info("sending message", "type", env.Type, "to", env.To, "request_id", env.RequestID)
+	}
 	return conn.WriteMessage(websocket.TextMessage, data)
 }
 

@@ -241,6 +241,7 @@ Each agent gets its own entry in the MCP host config, all pointing to the same s
 | `AGENTCHAT_AGENT_ID` | Yes | Unique agent ID for this bridge instance |
 | `AGENTCHAT_AGENT_NAME` | No | Display name (defaults to agent ID) |
 | `AGENTCHAT_CAPABILITIES` | No | Comma-separated capability list (e.g. `"search,analyze,write"`) |
+| `AGENTCHAT_DEBUG` | No | Set to `true` or `1` to enable debug logging of incoming and outgoing WebSocket messages |
 
 ### How it works
 
