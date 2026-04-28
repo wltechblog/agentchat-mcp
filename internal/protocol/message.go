@@ -39,6 +39,7 @@ const (
 
 type Envelope struct {
 	Type      string          `json:"type"`
+	RequestID string          `json:"request_id,omitempty"`
 	SessionID string          `json:"session_id,omitempty"`
 	From      string          `json:"from,omitempty"`
 	To        string          `json:"to,omitempty"`
@@ -70,6 +71,17 @@ func NewError(sessionID, errMsg string) Envelope {
 	payload, _ := json.Marshal(map[string]string{"error": errMsg})
 	return Envelope{
 		Type:      TypeError,
+		SessionID: sessionID,
+		Payload:   payload,
+		Timestamp: time.Now().UTC(),
+	}
+}
+
+func NewErrorWithID(sessionID, errMsg, requestID string) Envelope {
+	payload, _ := json.Marshal(map[string]string{"error": errMsg})
+	return Envelope{
+		Type:      TypeError,
+		RequestID: requestID,
 		SessionID: sessionID,
 		Payload:   payload,
 		Timestamp: time.Now().UTC(),

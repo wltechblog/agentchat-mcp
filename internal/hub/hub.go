@@ -243,7 +243,7 @@ func (h *Hub) HandleMessage(ac *AgentConn, raw []byte) {
 	switch env.Type {
 	case protocol.TypeMessage:
 		if env.To == "" {
-			ac.Send(protocol.NewError(ac.SessionID, "message requires 'to' field"))
+			ac.Send(protocol.NewErrorWithID(ac.SessionID, "message requires 'to' field", env.RequestID))
 			return
 		}
 		env.Sequence = h.nextSeq(ac.SessionID)
@@ -258,11 +258,12 @@ func (h *Hub) HandleMessage(ac *AgentConn, raw []byte) {
 	case protocol.TypeListAgents:
 		agents := h.GetSessionAgents(ac.SessionID)
 		resp, _ := protocol.NewEnvelope(protocol.TypeAgentsList, ac.SessionID, "server", ac.AgentID, agents)
+		resp.RequestID = env.RequestID
 		ac.Send(resp)
 
 	case protocol.TypeTaskAssign, protocol.TypeTaskStatus, protocol.TypeTaskResult:
 		if env.To == "" {
-			ac.Send(protocol.NewError(ac.SessionID, env.Type+" requires 'to' field"))
+			ac.Send(protocol.NewErrorWithID(ac.SessionID, env.Type+" requires 'to' field", env.RequestID))
 			return
 		}
 		env.Sequence = h.nextSeq(ac.SessionID)
@@ -282,6 +283,7 @@ func (h *Hub) HandleMessage(ac *AgentConn, raw []byte) {
 		leaderID, _ := h.leader.GetLeader(ac.SessionID)
 		resp, _ := protocol.NewEnvelope(protocol.TypeLeaderInfo, ac.SessionID, "server", ac.AgentID,
 			map[string]string{"leader_id": leaderID})
+		resp.RequestID = env.RequestID
 		ac.Send(resp)
 
 	case protocol.TypeLeaderTransfer:
@@ -294,23 +296,24 @@ func (h *Hub) HandleMessage(ac *AgentConn, raw []byte) {
 		h.handleFileShare(ac, env)
 
 	default:
-		ac.Send(protocol.NewError(ac.SessionID, "unknown message type: "+env.Type))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "unknown message type: "+env.Type, env.RequestID))
 	}
 }
 
 func (h *Hub) handleScratchpadSet(ac *AgentConn, env protocol.Envelope) {
 	var payload protocol.ScratchpadSetPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewError(ac.SessionID, "invalid scratchpad_set payload"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid scratchpad_set payload", env.RequestID))
 		return
 	}
 	if payload.Key == "" {
-		ac.Send(protocol.NewError(ac.SessionID, "key is required"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "key is required", env.RequestID))
 		return
 	}
 
 	entry := h.scratchpad.Set(ac.SessionID, payload.Key, payload.Value, ac.AgentID)
 	resp, _ := protocol.NewEnvelope(protocol.TypeScratchpadResult, ac.SessionID, "server", ac.AgentID, entry)
+	resp.RequestID = env.RequestID
 	ac.Send(resp)
 
 	bcast, _ := protocol.NewEnvelope(protocol.TypeScratchpadUpdate, ac.SessionID, ac.AgentID, "", entry)
@@ -323,15 +326,16 @@ func (h *Hub) handleScratchpadGet(ac *AgentConn, env protocol.Envelope) {
 		Key string `json:"key"`
 	}
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewError(ac.SessionID, "invalid scratchpad_get payload"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid scratchpad_get payload", env.RequestID))
 		return
 	}
 	entry, ok := h.scratchpad.Get(ac.SessionID, payload.Key)
 	if !ok {
-		ac.Send(protocol.NewError(ac.SessionID, "key not found: "+payload.Key))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "key not found: "+payload.Key, env.RequestID))
 		return
 	}
 	resp, _ := protocol.NewEnvelope(protocol.TypeScratchpadResult, ac.SessionID, "server", ac.AgentID, entry)
+	resp.RequestID = env.RequestID
 	ac.Send(resp)
 }
 
@@ -340,15 +344,16 @@ func (h *Hub) handleScratchpadDelete(ac *AgentConn, env protocol.Envelope) {
 		Key string `json:"key"`
 	}
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewError(ac.SessionID, "invalid scratchpad_delete payload"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid scratchpad_delete payload", env.RequestID))
 		return
 	}
 	if !h.scratchpad.Delete(ac.SessionID, payload.Key) {
-		ac.Send(protocol.NewError(ac.SessionID, "key not found: "+payload.Key))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "key not found: "+payload.Key, env.RequestID))
 		return
 	}
 	resp, _ := protocol.NewEnvelope(protocol.TypeScratchpadResult, ac.SessionID, "server", ac.AgentID,
 		map[string]string{"key": payload.Key, "deleted": "true"})
+	resp.RequestID = env.RequestID
 	ac.Send(resp)
 
 	bcast, _ := protocol.NewEnvelope(protocol.TypeScratchpadUpdate, ac.SessionID, ac.AgentID, "",
@@ -361,19 +366,20 @@ func (h *Hub) handleScratchpadList(ac *AgentConn, env protocol.Envelope) {
 	entries := h.scratchpad.List(ac.SessionID)
 	resp, _ := protocol.NewEnvelope(protocol.TypeScratchpadResult, ac.SessionID, "server", ac.AgentID,
 		protocol.ScratchpadListResult{Entries: entries})
+	resp.RequestID = env.RequestID
 	ac.Send(resp)
 }
 
 func (h *Hub) handleLeaderTransfer(ac *AgentConn, env protocol.Envelope) {
 	var payload protocol.LeaderTransferPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewError(ac.SessionID, "invalid leader_transfer payload"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid leader_transfer payload", env.RequestID))
 		return
 	}
 
 	currentLeader, _ := h.leader.GetLeader(ac.SessionID)
 	if currentLeader != ac.AgentID {
-		ac.Send(protocol.NewError(ac.SessionID, "only the current leader can transfer leadership"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "only the current leader can transfer leadership", env.RequestID))
 		return
 	}
 
@@ -383,16 +389,22 @@ func (h *Hub) handleLeaderTransfer(ac *AgentConn, env protocol.Envelope) {
 	h.mu.RUnlock()
 
 	if !exists || len(conns) == 0 {
-		ac.Send(protocol.NewError(ac.SessionID, "agent not found in session: "+payload.NewLeaderID))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "agent not found in session: "+payload.NewLeaderID, env.RequestID))
 		return
 	}
 
 	if !h.leader.Transfer(ac.SessionID, ac.AgentID, payload.NewLeaderID) {
-		ac.Send(protocol.NewError(ac.SessionID, "leadership transfer failed"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "leadership transfer failed", env.RequestID))
 		return
 	}
 
 	slog.Info("leader transferred", "session", ac.SessionID, "from", ac.AgentID, "to", payload.NewLeaderID)
+
+	resp, _ := protocol.NewEnvelope(protocol.TypeLeaderInfo, ac.SessionID, "server", ac.AgentID,
+		map[string]string{"leader_id": payload.NewLeaderID, "transferred_by": ac.AgentID})
+	resp.RequestID = env.RequestID
+	ac.Send(resp)
+
 	h.broadcastToSession(ac.SessionID, protocol.Envelope{
 		Type:      protocol.TypeLeaderInfo,
 		SessionID: ac.SessionID,
@@ -400,13 +412,13 @@ func (h *Hub) handleLeaderTransfer(ac *AgentConn, env protocol.Envelope) {
 		Payload:   mustMarshal(map[string]string{"leader_id": payload.NewLeaderID, "transferred_by": ac.AgentID}),
 		Sequence:  h.nextSeq(ac.SessionID),
 		Timestamp: time.Now().UTC(),
-	}, "")
+	}, ac.AgentID)
 }
 
 func (h *Hub) handleHistoryRequest(ac *AgentConn, env protocol.Envelope) {
 	var payload protocol.HistoryRequestPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewError(ac.SessionID, "invalid history_request payload"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid history_request payload", env.RequestID))
 		return
 	}
 
@@ -433,28 +445,29 @@ func (h *Hub) handleHistoryRequest(ac *AgentConn, env protocol.Envelope) {
 
 	resp, _ := protocol.NewEnvelope(protocol.TypeHistoryResult, ac.SessionID, "server", ac.AgentID,
 		map[string]any{"messages": filtered, "count": len(filtered)})
+	resp.RequestID = env.RequestID
 	ac.Send(resp)
 }
 
 func (h *Hub) handleFileShare(ac *AgentConn, env protocol.Envelope) {
 	if env.To == "" {
-		ac.Send(protocol.NewError(ac.SessionID, "file_share requires 'to' field"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "file_share requires 'to' field", env.RequestID))
 		return
 	}
 
 	var payload protocol.FileSharePayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewError(ac.SessionID, "invalid file_share payload"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid file_share payload", env.RequestID))
 		return
 	}
 
 	if payload.FileID == "" || payload.FileName == "" {
-		ac.Send(protocol.NewError(ac.SessionID, "file_id and file_name are required"))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "file_id and file_name are required", env.RequestID))
 		return
 	}
 
 	if _, ok := h.files.Get(ac.SessionID, payload.FileID); !ok {
-		ac.Send(protocol.NewError(ac.SessionID, "file not found: "+payload.FileID))
+		ac.Send(protocol.NewErrorWithID(ac.SessionID, "file not found: "+payload.FileID, env.RequestID))
 		return
 	}
 
@@ -627,7 +640,7 @@ func (h *Hub) sendToAgent(sessionID, agentID string, env protocol.Envelope) {
 	h.mu.RUnlock()
 	if senderOk && len(senderConns) > 0 {
 		for _, sender := range senderConns {
-			sender.Send(protocol.NewError(sessionID, "agent not found: "+agentID))
+			sender.Send(protocol.NewErrorWithID(sessionID, "agent not found: "+agentID, env.RequestID))
 		}
 	}
 }

@@ -238,22 +238,11 @@ func (b *Bridge) readPump() {
 }
 
 func (b *Bridge) routeMessage(env protocol.Envelope) {
-	b.pendingMu.Lock()
-	ch, ok := b.pending[env.Type]
-	b.pendingMu.Unlock()
-
-	if ok {
-		select {
-		case ch <- env:
-		default:
-		}
-		return
-	}
-
-	if env.Type == protocol.TypeScratchpadUpdate || env.Type == protocol.TypeScratchpadResult {
+	if env.RequestID != "" {
 		b.pendingMu.Lock()
-		ch, ok = b.pending[protocol.TypeScratchpadResult]
+		ch, ok := b.pending[env.RequestID]
 		b.pendingMu.Unlock()
+
 		if ok {
 			select {
 			case ch <- env:
@@ -261,6 +250,10 @@ func (b *Bridge) routeMessage(env protocol.Envelope) {
 			}
 			return
 		}
+
+		// If it has a RequestID but no pending channel, it means it timed out.
+		// DO NOT put it into b.incoming, drop it.
+		return
 	}
 
 	if env.From != "server" || env.Type != protocol.TypeLeaderInfo {
@@ -312,14 +305,15 @@ func (b *Bridge) sendAndWait(env protocol.Envelope, responseType string, timeout
 		return protocol.Envelope{}, fmt.Errorf("not connected to server")
 	}
 
+	env.RequestID = fmt.Sprintf("%d-%d", time.Now().UnixNano(), len(b.pending))
 	ch := make(chan protocol.Envelope, 1)
 	b.pendingMu.Lock()
-	b.pending[responseType] = ch
+	b.pending[env.RequestID] = ch
 	b.pendingMu.Unlock()
 
 	if err := b.sendWS(env); err != nil {
 		b.pendingMu.Lock()
-		delete(b.pending, responseType)
+		delete(b.pending, env.RequestID)
 		b.pendingMu.Unlock()
 		return protocol.Envelope{}, err
 	}
@@ -327,7 +321,7 @@ func (b *Bridge) sendAndWait(env protocol.Envelope, responseType string, timeout
 	select {
 	case resp, ok := <-ch:
 		b.pendingMu.Lock()
-		delete(b.pending, responseType)
+		delete(b.pending, env.RequestID)
 		b.pendingMu.Unlock()
 		if !ok {
 			return protocol.Envelope{}, fmt.Errorf("connection lost")
@@ -340,7 +334,7 @@ func (b *Bridge) sendAndWait(env protocol.Envelope, responseType string, timeout
 		return resp, nil
 	case <-time.After(timeout):
 		b.pendingMu.Lock()
-		delete(b.pending, responseType)
+		delete(b.pending, env.RequestID)
 		b.pendingMu.Unlock()
 		return protocol.Envelope{}, fmt.Errorf("timeout waiting for %s response", responseType)
 	}
