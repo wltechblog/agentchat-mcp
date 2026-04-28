@@ -28,10 +28,13 @@ type Bridge struct {
 	capabilities []string
 	httpBase     string
 
-	connMu    sync.RWMutex
-	conn      *websocket.Conn
-	connected bool
-	writeMu   sync.Mutex
+	connMu      sync.RWMutex
+	conn        *websocket.Conn
+	connected   bool
+	writeMu     sync.Mutex
+	connectOnce sync.Once
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	pending   map[string]chan protocol.Envelope
 	pendingMu sync.Mutex
@@ -58,6 +61,9 @@ func main() {
 		}
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	bridge := &Bridge{
 		wsURL:        wsURL,
 		sessionID:    sessionID,
@@ -68,12 +74,9 @@ func main() {
 		httpBase:     wsURLToHTTP(wsURL),
 		pending:      make(map[string]chan protocol.Envelope),
 		notifyCh:     make(chan struct{}, 1),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go bridge.connectLoop(ctx)
 
 	server := mcp.NewServer("agentchat-mcp-bridge", "1.0.0")
 	registerTools(server, bridge)
@@ -193,6 +196,21 @@ func (b *Bridge) isConnected() bool {
 	return b.connected
 }
 
+func (b *Bridge) ensureConnected() error {
+	b.connectOnce.Do(func() {
+		go b.connectLoop(b.ctx)
+	})
+
+	deadline := time.Now().Add(10 * time.Second)
+	for !b.isConnected() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for connection to server")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil
+}
+
 func (b *Bridge) readPump() {
 	for {
 		b.connMu.RLock()
@@ -257,6 +275,10 @@ func (b *Bridge) routeMessage(env protocol.Envelope) {
 }
 
 func (b *Bridge) sendWS(env protocol.Envelope) error {
+	if err := b.ensureConnected(); err != nil {
+		return err
+	}
+
 	b.connMu.RLock()
 	conn := b.conn
 	connected := b.connected
@@ -282,6 +304,10 @@ func (b *Bridge) sendWS(env protocol.Envelope) error {
 }
 
 func (b *Bridge) sendAndWait(env protocol.Envelope, responseType string, timeout time.Duration) (protocol.Envelope, error) {
+	if err := b.ensureConnected(); err != nil {
+		return protocol.Envelope{}, err
+	}
+
 	if !b.isConnected() {
 		return protocol.Envelope{}, fmt.Errorf("not connected to server")
 	}
@@ -363,6 +389,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call. Returns immediately with whatever is available. For blocking until a message arrives, use wait_for_message instead.",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
+		b.ensureConnected()
 		b.incMu.Lock()
 		msgs := b.incoming
 		b.incoming = nil
@@ -386,6 +413,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			},
 		},
 	}, func(args map[string]any) (string, error) {
+		b.ensureConnected()
 		timeoutSec, _ := args["timeout"].(float64)
 		if timeoutSec <= 0 {
 			timeoutSec = 120
