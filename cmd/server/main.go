@@ -13,11 +13,17 @@ import (
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
+	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
+	"github.com/wltechblog/agentchat-mcp/internal/presence"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
 	"github.com/wltechblog/agentchat-mcp/internal/session"
 )
 
-const maxFileSize = 50 << 20
+const (
+	maxFileSize   = 50 << 20
+	presenceTTL   = 60 * time.Second
+	mailboxMax    = 1000
+)
 
 func main() {
 	port := os.Getenv("PORT")
@@ -34,8 +40,10 @@ func main() {
 	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
 	fs := filestore.NewStore(maxFileSize)
-	h := hub.New(store, lt, sp, fs, hub.WithDebugLog(debugLog))
-	handler := api.New(h, store, lt, sp, fs)
+	pt := presence.NewTracker(presenceTTL)
+	mb := mailbox.NewStore(mailboxMax)
+	h := hub.New(store, lt, sp, fs, pt, mb, hub.WithDebugLog(debugLog))
+	handler := api.New(h, store)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
@@ -51,6 +59,7 @@ func main() {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		slog.Info("shutting down...")
+		pt.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		srv.Shutdown(ctx)

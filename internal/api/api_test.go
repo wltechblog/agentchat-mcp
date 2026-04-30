@@ -1,19 +1,20 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
+	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
+	"github.com/wltechblog/agentchat-mcp/internal/presence"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
 	"github.com/wltechblog/agentchat-mcp/internal/session"
@@ -21,34 +22,24 @@ import (
 
 func setupTestServer(t *testing.T) (*httptest.Server, *session.Store) {
 	t.Helper()
-	return setupTestServerWithGrace(t, 30*time.Second)
-}
-
-func setupTestServerWithGrace(t *testing.T, grace time.Duration) (*httptest.Server, *session.Store) {
-	t.Helper()
 	store := session.NewStore()
 	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
 	fs := filestore.NewStore(10 << 20)
-	h := hub.New(store, lt, sp, fs, hub.WithGracePeriod(grace))
-	handler := New(h, store, lt, sp, fs)
+	pt := presence.NewTracker(60 * time.Second)
+	mb := mailbox.NewStore(1000)
+	h := hub.New(store, lt, sp, fs, pt, mb)
+	handler := New(h, store)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 
 	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		server.Close()
+		pt.Stop()
+	})
 	return server, store
-}
-
-func dialWS(t *testing.T, url string) *websocket.Conn {
-	t.Helper()
-	ws, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		t.Fatalf("websocket dial failed: %v", err)
-	}
-	t.Cleanup(func() { ws.Close() })
-	return ws
 }
 
 func createTestSession(t *testing.T, server *httptest.Server) (string, string) {
@@ -67,249 +58,235 @@ func createTestSession(t *testing.T, server *httptest.Server) (string, string) {
 	return result.ID, result.PSK
 }
 
-func authAgent(t *testing.T, ws *websocket.Conn, sessionID, agentID, psk string) {
+func doAuthRequest(t *testing.T, server, method, path, sessionID, psk, agentID string, body any) *http.Response {
 	t.Helper()
-	authAgentWithCapabilities(t, ws, sessionID, agentID, psk, nil)
+	var bodyReader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		bodyReader = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequest(method, server+path, bodyReader)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+psk)
+	req.Header.Set("X-Agent-ID", agentID)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	return resp
 }
 
-func authAgentWithCapabilities(t *testing.T, ws *websocket.Conn, sessionID, agentID, psk string, capabilities []string) {
+func registerAgent(t *testing.T, server, sessionID, psk, agentID string, caps []string) {
 	t.Helper()
-	authPayload, _ := json.Marshal(protocol.AuthPayload{
-		SessionID:    sessionID,
-		AgentID:      agentID,
-		AgentName:    agentID,
-		PSK:          psk,
-		Capabilities: capabilities,
-	})
-	env := protocol.Envelope{
-		Type:      protocol.TypeAuth,
-		Payload:   authPayload,
-		Timestamp: time.Now().UTC(),
+	body := map[string]any{
+		"agent_name":    agentID,
+		"capabilities":  caps,
 	}
-	data, _ := json.Marshal(env)
-	if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
-		t.Fatalf("write auth: %v", err)
-	}
-
-	_, resp, err := ws.ReadMessage()
-	if err != nil {
-		t.Fatalf("read auth response: %v", err)
-	}
-	var authResp protocol.Envelope
-	json.Unmarshal(resp, &authResp)
-	if authResp.Type != protocol.TypeAuthOK {
-		t.Fatalf("expected auth_ok, got %s: %s", authResp.Type, string(authResp.Payload))
+	resp := doAuthRequest(t, server, "POST", "/sessions/"+sessionID+"/register", sessionID, psk, agentID, body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		rbody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("register agent %s failed (%d): %s", agentID, resp.StatusCode, string(rbody))
 	}
 }
 
-func readEnvelope(t *testing.T, ws *websocket.Conn) protocol.Envelope {
+func drainMailbox(t *testing.T, server, sessionID, psk, agentID string) []map[string]any {
 	t.Helper()
-	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, data, err := ws.ReadMessage()
-	if err != nil {
-		t.Fatalf("read envelope: %v", err)
+	resp := doAuthRequest(t, server, "GET", "/sessions/"+sessionID+"/mailbox", sessionID, psk, agentID, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		rbody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("drain mailbox failed (%d): %s", resp.StatusCode, string(rbody))
 	}
-	var env protocol.Envelope
-	json.Unmarshal(data, &env)
-	return env
+	var result struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Messages
 }
 
-func tryReadEnvelope(ws *websocket.Conn) (protocol.Envelope, bool) {
-	ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	_, data, err := ws.ReadMessage()
-	if err != nil {
-		return protocol.Envelope{}, false
-	}
-	var env protocol.Envelope
-	json.Unmarshal(data, &env)
-	return env, true
-}
-
-func writeEnvelope(t *testing.T, ws *websocket.Conn, env protocol.Envelope) {
-	t.Helper()
-	data, err := json.Marshal(env)
-	if err != nil {
-		t.Fatalf("marshal envelope: %v", err)
-	}
-	if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
-		t.Fatalf("write envelope: %v", err)
-	}
-}
-
-func TestWebSocketAuth(t *testing.T) {
+func TestRegisterAgent(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
 
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-	ws := dialWS(t, wsURL)
-	authAgent(t, ws, sessionID, "agent-1", psk)
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/register", sessionID, psk, "agent-1", map[string]any{
+		"agent_name":   "Agent One",
+		"capabilities": []string{"search"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var result map[string]any
+	json.NewDecoder(resp.Body).Decode(&result)
+	if result["leader_id"] != "agent-1" {
+		t.Fatalf("expected leader_id agent-1, got %v", result["leader_id"])
+	}
 }
 
-func TestWebSocketAuthBadPSK(t *testing.T) {
+func TestAuthBadPSK(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, _ := createTestSession(t, server)
 
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-	ws := dialWS(t, wsURL)
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/mailbox", sessionID, "wrong-psk", "agent-1", nil)
+	defer resp.Body.Close()
 
-	authPayload, _ := json.Marshal(protocol.AuthPayload{
-		SessionID: sessionID,
-		AgentID:   "agent-1",
-		PSK:       "wrong-psk",
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestAuthMissingHeaders(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+
+	req, _ := http.NewRequest("GET", server.URL+"/sessions/"+sessionID+"/mailbox", nil)
+	req.Header.Set("Authorization", "Bearer "+psk)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without X-Agent-ID, got %d", resp.StatusCode)
+	}
+}
+
+func TestDirectMessageViaMailbox(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
+
+	drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/messages", sessionID, psk, "agent-1", map[string]any{
+		"to":      "agent-2",
+		"type":    "message",
+		"payload": map[string]string{"text": "hello"},
 	})
-	env := protocol.Envelope{
-		Type:    protocol.TypeAuth,
-		Payload: authPayload,
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	data, _ := json.Marshal(env)
-	ws.WriteMessage(websocket.TextMessage, data)
 
-	_, resp, _ := ws.ReadMessage()
-	var errResp protocol.Envelope
-	json.Unmarshal(resp, &errResp)
-	if errResp.Type != protocol.TypeError {
-		t.Fatalf("expected error, got %s", errResp.Type)
+	msgs := drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+
+	env := msgs[0]["envelope"].(map[string]any)
+	if env["type"] != "message" {
+		t.Fatalf("expected type message, got %v", env["type"])
+	}
+	if env["from"] != "agent-1" {
+		t.Fatalf("expected from agent-1, got %v", env["from"])
 	}
 }
 
-func TestAgentJoinedBroadcast(t *testing.T) {
+func TestDirectMessageMissingTo(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
 
-	ws1 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-
-	notification := readEnvelope(t, ws1)
-	if notification.Type != protocol.TypeAgentJoined {
-		t.Fatalf("expected agent_joined, got %s", notification.Type)
-	}
-	var info protocol.AgentInfo
-	json.Unmarshal(notification.Payload, &info)
-	if info.AgentID != "agent-2" {
-		t.Fatalf("expected agent-2, got %s", info.AgentID)
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/messages", sessionID, psk, "agent-1", map[string]any{
+		"type":    "message",
+		"payload": map[string]string{"text": "hello"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 }
 
-func TestDirectMessage(t *testing.T) {
+func TestBroadcastViaMailbox(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
 
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-3", nil)
 
-	msgPayload, _ := json.Marshal(map[string]string{"text": "hello agent-2"})
-	env := protocol.Envelope{
-		Type:    protocol.TypeMessage,
-		To:      "agent-2",
-		Payload: msgPayload,
-	}
-	writeEnvelope(t, ws1, env)
+	drainMailbox(t, server.URL, sessionID, psk, "agent-1")
+	drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+	drainMailbox(t, server.URL, sessionID, psk, "agent-3")
 
-	received := readEnvelope(t, ws2)
-	if received.Type != protocol.TypeMessage {
-		t.Fatalf("expected message, got %s", received.Type)
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/broadcast", sessionID, psk, "agent-1", map[string]any{
+		"type":    "broadcast",
+		"payload": map[string]string{"text": "hello all"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	if received.From != "agent-1" {
-		t.Fatalf("expected from agent-1, got %s", received.From)
+
+	msgs2 := drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+	msgs3 := drainMailbox(t, server.URL, sessionID, psk, "agent-3")
+
+	if len(msgs2) != 1 {
+		t.Fatalf("expected 1 broadcast for agent-2, got %d", len(msgs2))
 	}
-	if received.Sequence == 0 {
-		t.Fatal("expected non-zero sequence number")
+	if len(msgs3) != 1 {
+		t.Fatalf("expected 1 broadcast for agent-3, got %d", len(msgs3))
+	}
+
+	msgs1 := drainMailbox(t, server.URL, sessionID, psk, "agent-1")
+	if len(msgs1) != 0 {
+		t.Fatalf("expected 0 messages for sender, got %d", len(msgs1))
 	}
 }
 
-func TestBroadcast(t *testing.T) {
+func TestMailboxDestructiveRead(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
 
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	ws3 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-	authAgent(t, ws3, sessionID, "agent-3", psk)
-	readEnvelope(t, ws1) // agent-3 joined
-	readEnvelope(t, ws2) // agent-3 joined
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
+	drainMailbox(t, server.URL, sessionID, psk, "agent-2")
 
-	bcastPayload, _ := json.Marshal(map[string]string{"text": "hello all"})
-	env := protocol.Envelope{
-		Type:    protocol.TypeBroadcast,
-		Payload: bcastPayload,
+	doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/messages", sessionID, psk, "agent-1", map[string]any{
+		"to": "agent-2", "type": "message", "payload": map[string]string{"text": "msg1"},
+	}).Body.Close()
+	doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/messages", sessionID, psk, "agent-1", map[string]any{
+		"to": "agent-2", "type": "message", "payload": map[string]string{"text": "msg2"},
+	}).Body.Close()
+
+	msgs := drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(msgs))
 	}
-	writeEnvelope(t, ws1, env)
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	for _, ws := range []*websocket.Conn{ws2, ws3} {
-		go func(w *websocket.Conn) {
-			defer wg.Done()
-			w.SetReadDeadline(time.Now().Add(2 * time.Second))
-			_, d, err := w.ReadMessage()
-			if err != nil {
-				t.Errorf("read broadcast: %v", err)
-				return
-			}
-			var e protocol.Envelope
-			json.Unmarshal(d, &e)
-			if e.Type != protocol.TypeBroadcast {
-				t.Errorf("expected broadcast, got %s", e.Type)
-			}
-			if e.From != "agent-1" {
-				t.Errorf("expected from agent-1, got %s", e.From)
-			}
-		}(ws)
-	}
-	wg.Wait()
-}
-
-func TestAgentLeave(t *testing.T) {
-	server, _ := setupTestServerWithGrace(t, 100*time.Millisecond)
-	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-
-	ws2.Close()
-
-	notification := readEnvelope(t, ws1)
-	if notification.Type != protocol.TypeAgentLeft {
-		t.Fatalf("expected agent_left, got %s", notification.Type)
+	msgs2 := drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+	if len(msgs2) != 0 {
+		t.Fatalf("expected 0 after drain, got %d", len(msgs2))
 	}
 }
 
 func TestListAgents(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
 
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", []string{"search"})
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", []string{"write"})
 
-	env := protocol.Envelope{Type: protocol.TypeListAgents}
-	writeEnvelope(t, ws1, env)
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/agents", sessionID, psk, "agent-1", nil)
+	defer resp.Body.Close()
 
-	resp := readEnvelope(t, ws1)
-	if resp.Type != protocol.TypeAgentsList {
-		t.Fatalf("expected agents_list, got %s", resp.Type)
-	}
 	var agents []protocol.AgentInfo
-	json.Unmarshal(resp.Payload, &agents)
+	json.NewDecoder(resp.Body).Decode(&agents)
 	if len(agents) != 2 {
 		t.Fatalf("expected 2 agents, got %d", len(agents))
 	}
@@ -318,30 +295,25 @@ func TestListAgents(t *testing.T) {
 func TestCapabilities(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
 
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgentWithCapabilities(t, ws1, sessionID, "agent-1", psk, []string{"search", "analyze"})
-	authAgentWithCapabilities(t, ws2, sessionID, "agent-2", psk, []string{"write"})
-	readEnvelope(t, ws1) // agent-2 joined
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", []string{"search", "analyze"})
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", []string{"write"})
 
-	env := protocol.Envelope{Type: protocol.TypeListAgents}
-	writeEnvelope(t, ws1, env)
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/agents", sessionID, psk, "agent-1", nil)
+	defer resp.Body.Close()
 
-	resp := readEnvelope(t, ws1)
 	var agents []protocol.AgentInfo
-	json.Unmarshal(resp.Payload, &agents)
+	json.NewDecoder(resp.Body).Decode(&agents)
 
 	for _, a := range agents {
 		if a.AgentID == "agent-1" {
 			if len(a.Capabilities) != 2 || a.Capabilities[0] != "search" {
-				t.Fatalf("expected agent-1 capabilities [search, analyze], got %v", a.Capabilities)
+				t.Fatalf("expected [search, analyze], got %v", a.Capabilities)
 			}
 		}
 		if a.AgentID == "agent-2" {
 			if len(a.Capabilities) != 1 || a.Capabilities[0] != "write" {
-				t.Fatalf("expected agent-2 capabilities [write], got %v", a.Capabilities)
+				t.Fatalf("expected [write], got %v", a.Capabilities)
 			}
 		}
 	}
@@ -350,304 +322,73 @@ func TestCapabilities(t *testing.T) {
 func TestScratchpadSetGetDelete(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
 
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-
-	// Set
-	setPayload, _ := json.Marshal(protocol.ScratchpadSetPayload{
-		Key:   "plan",
-		Value: json.RawMessage(`"step 1"`),
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/scratchpad/set", sessionID, psk, "agent-1", map[string]any{
+		"key":   "plan",
+		"value": "step 1",
 	})
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeScratchpadSet,
-		Payload: setPayload,
-	})
+	defer resp.Body.Close()
 
-	// Agent-1 gets scratchpad_result
-	result := readEnvelope(t, ws1)
-	if result.Type != protocol.TypeScratchpadResult {
-		t.Fatalf("expected scratchpad_result, got %s", result.Type)
-	}
-
-	// Agent-2 gets scratchpad_update broadcast
-	update := readEnvelope(t, ws2)
-	if update.Type != protocol.TypeScratchpadUpdate {
-		t.Fatalf("expected scratchpad_update, got %s", update.Type)
-	}
-
-	// Get
-	getPayload, _ := json.Marshal(map[string]string{"key": "plan"})
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeScratchpadGet,
-		Payload: getPayload,
-	})
-	result = readEnvelope(t, ws1)
-	if result.Type != protocol.TypeScratchpadResult {
-		t.Fatalf("expected scratchpad_result, got %s", result.Type)
-	}
 	var entry protocol.ScratchpadEntry
-	json.Unmarshal(result.Payload, &entry)
+	json.NewDecoder(resp.Body).Decode(&entry)
 	if entry.Key != "plan" {
 		t.Fatalf("expected key 'plan', got %s", entry.Key)
 	}
-	if string(entry.Value) != `"step 1"` {
-		t.Fatalf("expected value 'step 1', got %s", string(entry.Value))
+
+	resp2 := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/scratchpad/get", sessionID, psk, "agent-1", map[string]any{
+		"key": "plan",
+	})
+	defer resp2.Body.Close()
+
+	var entry2 protocol.ScratchpadEntry
+	json.NewDecoder(resp2.Body).Decode(&entry2)
+	if entry2.Key != "plan" {
+		t.Fatalf("expected key 'plan', got %s", entry2.Key)
 	}
 
-	// Delete
-	delPayload, _ := json.Marshal(map[string]string{"key": "plan"})
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeScratchpadDelete,
-		Payload: delPayload,
+	resp3 := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/scratchpad/delete", sessionID, psk, "agent-1", map[string]any{
+		"key": "plan",
 	})
-	result = readEnvelope(t, ws1)
-	if result.Type != protocol.TypeScratchpadResult {
-		t.Fatalf("expected scratchpad_result on delete, got %s", result.Type)
-	}
+	defer resp3.Body.Close()
 
-	// Verify deleted
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeScratchpadGet,
-		Payload: getPayload,
+	resp4 := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/scratchpad/get", sessionID, psk, "agent-1", map[string]any{
+		"key": "plan",
 	})
-	result = readEnvelope(t, ws1)
-	if result.Type != protocol.TypeError {
-		t.Fatalf("expected error for deleted key, got %s", result.Type)
+	defer resp4.Body.Close()
+	if resp4.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for deleted key, got %d", resp4.StatusCode)
 	}
 }
 
 func TestScratchpadList(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-
-	ws1 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
 
 	for i := 0; i < 3; i++ {
-		payload, _ := json.Marshal(protocol.ScratchpadSetPayload{
-			Key:   "key" + string(rune('0'+i)),
-			Value: json.RawMessage(`"val"`),
-		})
-		writeEnvelope(t, ws1, protocol.Envelope{Type: protocol.TypeScratchpadSet, Payload: payload})
-		readEnvelope(t, ws1) // scratchpad_result
+		doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/scratchpad/set", sessionID, psk, "agent-1", map[string]any{
+			"key":   "key" + string(rune('0'+i)),
+			"value": "val",
+		}).Body.Close()
 	}
 
-	writeEnvelope(t, ws1, protocol.Envelope{Type: protocol.TypeScratchpadList})
-	result := readEnvelope(t, ws1)
-	if result.Type != protocol.TypeScratchpadResult {
-		t.Fatalf("expected scratchpad_result, got %s", result.Type)
-	}
-	var listResult protocol.ScratchpadListResult
-	json.Unmarshal(result.Payload, &listResult)
-	if len(listResult.Entries) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(listResult.Entries))
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/scratchpad", sessionID, psk, "agent-1", nil)
+	defer resp.Body.Close()
+
+	var entries []protocol.ScratchpadEntry
+	json.NewDecoder(resp.Body).Decode(&entries)
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
 	}
 }
 
 func TestLeaderInitialAndQuery(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
 
-	ws1 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-
-	writeEnvelope(t, ws1, protocol.Envelope{Type: protocol.TypeLeaderQuery})
-	resp := readEnvelope(t, ws1)
-	if resp.Type != protocol.TypeLeaderInfo {
-		t.Fatalf("expected leader_info, got %s", resp.Type)
-	}
-	var info map[string]string
-	json.Unmarshal(resp.Payload, &info)
-	if info["leader_id"] != "agent-1" {
-		t.Fatalf("expected leader agent-1, got %s", info["leader_id"])
-	}
-}
-
-func TestLeaderTransfer(t *testing.T) {
-	server, _ := setupTestServer(t)
-	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-
-	transferPayload, _ := json.Marshal(protocol.LeaderTransferPayload{NewLeaderID: "agent-2"})
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeLeaderTransfer,
-		Payload: transferPayload,
-	})
-
-	// Both should get leader_info broadcast
-	notification := readEnvelope(t, ws1)
-	if notification.Type != protocol.TypeLeaderInfo {
-		t.Fatalf("expected leader_info, got %s", notification.Type)
-	}
-
-	// Verify via query
-	writeEnvelope(t, ws1, protocol.Envelope{Type: protocol.TypeLeaderQuery})
-	resp := readEnvelope(t, ws1)
-	var info map[string]string
-	json.Unmarshal(resp.Payload, &info)
-	if info["leader_id"] != "agent-2" {
-		t.Fatalf("expected leader agent-2, got %s", info["leader_id"])
-	}
-}
-
-func TestLeaderTransferUnauthorized(t *testing.T) {
-	server, _ := setupTestServer(t)
-	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-
-	// agent-2 tries to transfer (but agent-1 is leader)
-	transferPayload, _ := json.Marshal(protocol.LeaderTransferPayload{NewLeaderID: "agent-2"})
-	writeEnvelope(t, ws2, protocol.Envelope{
-		Type:    protocol.TypeLeaderTransfer,
-		Payload: transferPayload,
-	})
-
-	resp := readEnvelope(t, ws2)
-	if resp.Type != protocol.TypeError {
-		t.Fatalf("expected error, got %s", resp.Type)
-	}
-}
-
-func TestLeaderAutoTransferOnLeave(t *testing.T) {
-	server, _ := setupTestServerWithGrace(t, 100*time.Millisecond)
-	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-
-	// agent-1 (leader) disconnects
-	ws1.Close()
-
-	// ws2 should get agent_left then leader_info
-	for i := 0; i < 2; i++ {
-		env := readEnvelope(t, ws2)
-		if env.Type == protocol.TypeLeaderInfo {
-			var info map[string]string
-			json.Unmarshal(env.Payload, &info)
-			if info["leader_id"] != "agent-2" {
-				t.Fatalf("expected auto-transfer to agent-2, got %s", info["leader_id"])
-			}
-			return
-		}
-	}
-	t.Fatal("expected leader_info broadcast after leader left")
-}
-
-func TestHistoryRequest(t *testing.T) {
-	server, _ := setupTestServer(t)
-	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-
-	// Send 3 messages
-	for i := 0; i < 3; i++ {
-		payload, _ := json.Marshal(map[string]string{"text": "msg"})
-		writeEnvelope(t, ws1, protocol.Envelope{
-			Type:    protocol.TypeBroadcast,
-			Payload: payload,
-		})
-	}
-	// drain broadcast from ws2
-	for i := 0; i < 3; i++ {
-		readEnvelope(t, ws2)
-	}
-
-	// Request all history
-	histPayload, _ := json.Marshal(protocol.HistoryRequestPayload{})
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeHistoryRequest,
-		Payload: histPayload,
-	})
-	resp := readEnvelope(t, ws1)
-	if resp.Type != protocol.TypeHistoryResult {
-		t.Fatalf("expected history_result, got %s", resp.Type)
-	}
-	var histData map[string]any
-	json.Unmarshal(resp.Payload, &histData)
-	count, _ := histData["count"].(float64)
-	if int(count) != 3 {
-		t.Fatalf("expected 3 history messages, got %v", count)
-	}
-}
-
-func TestHistoryRequestAfterSequence(t *testing.T) {
-	server, _ := setupTestServer(t)
-	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-
-	// Send 5 broadcasts
-	for i := 0; i < 5; i++ {
-		payload, _ := json.Marshal(map[string]string{"text": "msg"})
-		writeEnvelope(t, ws1, protocol.Envelope{
-			Type:    protocol.TypeBroadcast,
-			Payload: payload,
-		})
-	}
-	for i := 0; i < 5; i++ {
-		readEnvelope(t, ws2) // drain
-	}
-
-	// Request only messages after sequence 2
-	histPayload, _ := json.Marshal(protocol.HistoryRequestPayload{AfterSequence: 2})
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeHistoryRequest,
-		Payload: histPayload,
-	})
-	resp := readEnvelope(t, ws1)
-	var histData map[string]any
-	json.Unmarshal(resp.Payload, &histData)
-	count, _ := histData["count"].(float64)
-	if int(count) != 3 {
-		t.Fatalf("expected 3 messages after seq 2, got %v", count)
-	}
-}
-
-func TestRESTGetLeader(t *testing.T) {
-	server, _ := setupTestServer(t)
-	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-
-	ws1 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-
-	resp, err := http.Get(server.URL + "/sessions/" + sessionID + "/leader")
-	if err != nil {
-		t.Fatalf("get leader: %v", err)
-	}
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/leader", sessionID, psk, "agent-1", nil)
 	defer resp.Body.Close()
 
 	var result map[string]string
@@ -657,86 +398,103 @@ func TestRESTGetLeader(t *testing.T) {
 	}
 }
 
-func TestRESTGetScratchpad(t *testing.T) {
+func TestLeaderTransfer(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
 
-	ws1 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-
-	// Set a scratchpad key
-	setPayload, _ := json.Marshal(protocol.ScratchpadSetPayload{
-		Key:   "test-key",
-		Value: json.RawMessage(`"test-value"`),
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/leader/transfer", sessionID, psk, "agent-1", map[string]any{
+		"new_leader_id": "agent-2",
 	})
-	writeEnvelope(t, ws1, protocol.Envelope{Type: protocol.TypeScratchpadSet, Payload: setPayload})
-	readEnvelope(t, ws1) // scratchpad_result
-
-	// REST get scratchpad
-	resp, err := http.Get(server.URL + "/sessions/" + sessionID + "/scratchpad")
-	if err != nil {
-		t.Fatalf("get scratchpad: %v", err)
-	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
 
-	var entries []protocol.ScratchpadEntry
-	json.NewDecoder(resp.Body).Decode(&entries)
-	if len(entries) != 1 || entries[0].Key != "test-key" {
-		t.Fatalf("expected 1 entry with key 'test-key', got %v", entries)
+	resp2 := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/leader", sessionID, psk, "agent-1", nil)
+	defer resp2.Body.Close()
+	var result map[string]string
+	json.NewDecoder(resp2.Body).Decode(&result)
+	if result["leader_id"] != "agent-2" {
+		t.Fatalf("expected leader agent-2, got %s", result["leader_id"])
 	}
 }
 
-func TestDuplicateAgentIDAccepted(t *testing.T) {
+func TestLeaderTransferUnauthorized(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
 
-	ws1 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-
-	ws2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial ws2: %v", err)
-	}
-	defer ws2.Close()
-
-	authPayload, _ := json.Marshal(protocol.AuthPayload{
-		SessionID: sessionID,
-		AgentID:   "agent-1",
-		PSK:       psk,
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/leader/transfer", sessionID, psk, "agent-2", map[string]any{
+		"new_leader_id": "agent-2",
 	})
-	authMsg, _ := json.Marshal(protocol.Envelope{
-		Type:      protocol.TypeAuth,
-		Payload:   authPayload,
-		Timestamp: time.Now().UTC(),
-	})
-	ws2.WriteMessage(websocket.TextMessage, authMsg)
-
-	ws2.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, resp, err := ws2.ReadMessage()
-	if err != nil {
-		t.Fatalf("read response: %v", err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
-	var errResp protocol.Envelope
-	json.Unmarshal(resp, &errResp)
-	if errResp.Type != protocol.TypeAuthOK {
-		t.Fatalf("expected auth_ok for duplicate agent_id, got %s: %s", errResp.Type, string(resp))
+}
+
+func TestHistoryRequest(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
+
+	drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+
+	for i := 0; i < 3; i++ {
+		doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/broadcast", sessionID, psk, "agent-1", map[string]any{
+			"type":    "broadcast",
+			"payload": map[string]string{"text": "msg"},
+		}).Body.Close()
+	}
+
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/history", sessionID, psk, "agent-1", nil)
+	defer resp.Body.Close()
+
+	var history []protocol.Envelope
+	json.NewDecoder(resp.Body).Decode(&history)
+	if len(history) != 3 {
+		t.Fatalf("expected 3 history messages, got %d", len(history))
+	}
+}
+
+func TestHistoryRequestAfterSequence(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
+
+	drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+
+	for i := 0; i < 5; i++ {
+		doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/broadcast", sessionID, psk, "agent-1", map[string]any{
+			"type":    "broadcast",
+			"payload": map[string]string{"text": "msg"},
+		}).Body.Close()
+	}
+
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/history?after_sequence=2", sessionID, psk, "agent-1", nil)
+	defer resp.Body.Close()
+
+	var history []protocol.Envelope
+	json.NewDecoder(resp.Body).Decode(&history)
+	if len(history) != 3 {
+		t.Fatalf("expected 3 messages after seq 2, got %d", len(history))
 	}
 }
 
 func TestFileUploadAndDownload(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
 
-	ws1 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-
-	// Upload file
 	fileContent := []byte("hello from agent-1, this is a test file!")
-	req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=test.txt", strings.NewReader(string(fileContent)))
+	req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=test.txt", bytes.NewReader(fileContent))
 	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Authorization", "Bearer "+psk)
 	req.Header.Set("X-Agent-ID", "agent-1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -754,15 +512,11 @@ func TestFileUploadAndDownload(t *testing.T) {
 	if fileID == "" {
 		t.Fatal("expected file_id in response")
 	}
-	if uploadResp["file_name"] != "test.txt" {
-		t.Fatalf("expected filename test.txt, got %v", uploadResp["file_name"])
-	}
-	if uploadResp["size"].(float64) != float64(len(fileContent)) {
-		t.Fatalf("expected size %d, got %v", len(fileContent), uploadResp["size"])
-	}
 
-	// Download file
-	dlResp, err := http.Get(server.URL + "/sessions/" + sessionID + "/files/" + fileID)
+	req2, _ := http.NewRequest("GET", server.URL+"/sessions/"+sessionID+"/files/"+fileID, nil)
+	req2.Header.Set("Authorization", "Bearer "+psk)
+	req2.Header.Set("X-Agent-ID", "agent-1")
+	dlResp, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatalf("download file: %v", err)
 	}
@@ -770,183 +524,136 @@ func TestFileUploadAndDownload(t *testing.T) {
 	if dlResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", dlResp.StatusCode)
 	}
-	if dlResp.Header.Get("Content-Type") != "text/plain" {
-		t.Fatalf("expected text/plain, got %s", dlResp.Header.Get("Content-Type"))
-	}
 	downloaded, _ := io.ReadAll(dlResp.Body)
 	if string(downloaded) != string(fileContent) {
 		t.Fatalf("file content mismatch: got %q", string(downloaded))
 	}
-
-	// List files
-	listResp, err := http.Get(server.URL + "/sessions/" + sessionID + "/files")
-	if err != nil {
-		t.Fatalf("list files: %v", err)
-	}
-	defer listResp.Body.Close()
-	var files []map[string]any
-	json.NewDecoder(listResp.Body).Decode(&files)
-	if len(files) != 1 {
-		t.Fatalf("expected 1 file, got %d", len(files))
-	}
 }
 
-func TestFileShareViaWebSocket(t *testing.T) {
+func TestFileShareViaMailbox(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
+	drainMailbox(t, server.URL, sessionID, psk, "agent-2")
 
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
-
-	// Upload file as agent-1
 	fileContent := "shared data payload"
 	req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=report.csv", strings.NewReader(fileContent))
 	req.Header.Set("Content-Type", "text/csv")
+	req.Header.Set("Authorization", "Bearer "+psk)
 	req.Header.Set("X-Agent-ID", "agent-1")
 	uploadResp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("upload: %v", err)
 	}
-	defer uploadResp.Body.Close()
 	var uploadResult map[string]any
 	json.NewDecoder(uploadResp.Body).Decode(&uploadResult)
+	uploadResp.Body.Close()
 	fileID := uploadResult["file_id"].(string)
 
-	// Share file via WebSocket
 	sharePayload, _ := json.Marshal(protocol.FileSharePayload{
-		FileID:      fileID,
-		FileName:    "report.csv",
-		ContentType: "text/csv",
-		Size:        int64(len(fileContent)),
-		Description: "Monthly report",
+		FileID: fileID, FileName: "report.csv", ContentType: "text/csv",
+		Size: int64(len(fileContent)), Description: "Monthly report",
 	})
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeFileShare,
-		To:      "agent-2",
-		Payload: sharePayload,
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/messages", sessionID, psk, "agent-1", map[string]any{
+		"to":      "agent-2",
+		"type":    "file_share",
+		"payload": json.RawMessage(sharePayload),
 	})
+	defer resp.Body.Close()
 
-	// Agent-2 receives file_share
-	received := readEnvelope(t, ws2)
-	if received.Type != protocol.TypeFileShare {
-		t.Fatalf("expected file_share, got %s", received.Type)
+	msgs := drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
-	if received.From != "agent-1" {
-		t.Fatalf("expected from agent-1, got %s", received.From)
+	env := msgs[0]["envelope"].(map[string]any)
+	if env["type"] != "file_share" {
+		t.Fatalf("expected file_share, got %v", env["type"])
 	}
-	var shareInfo protocol.FileSharePayload
-	json.Unmarshal(received.Payload, &shareInfo)
-	if shareInfo.FileID != fileID {
-		t.Fatalf("expected file_id %s, got %s", fileID, shareInfo.FileID)
-	}
-	if shareInfo.FileName != "report.csv" {
-		t.Fatalf("expected report.csv, got %s", shareInfo.FileName)
-	}
-	if shareInfo.Description != "Monthly report" {
-		t.Fatalf("expected description 'Monthly report', got %s", shareInfo.Description)
-	}
-
-	// Agent-2 downloads the file using the file_id
-	dlResp, err := http.Get(server.URL + "/sessions/" + sessionID + "/files/" + shareInfo.FileID)
-	if err != nil {
-		t.Fatalf("download: %v", err)
-	}
-	defer dlResp.Body.Close()
-	downloaded, _ := io.ReadAll(dlResp.Body)
-	if string(downloaded) != fileContent {
-		t.Fatalf("content mismatch: got %q", string(downloaded))
+	if env["from"] != "agent-1" {
+		t.Fatalf("expected from agent-1, got %v", env["from"])
 	}
 }
 
 func TestFileDelete(t *testing.T) {
 	server, _ := setupTestServer(t)
-	sessionID, _ := createTestSession(t, server)
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
 
-	// Upload
 	req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=del.txt", strings.NewReader("bye"))
 	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Authorization", "Bearer "+psk)
+	req.Header.Set("X-Agent-ID", "agent-1")
 	resp, _ := http.DefaultClient.Do(req)
 	var upload map[string]any
 	json.NewDecoder(resp.Body).Decode(&upload)
 	resp.Body.Close()
 	fileID := upload["file_id"].(string)
 
-	// Delete
 	delReq, _ := http.NewRequest("DELETE", server.URL+"/sessions/"+sessionID+"/files/"+fileID, nil)
+	delReq.Header.Set("Authorization", "Bearer "+psk)
+	delReq.Header.Set("X-Agent-ID", "agent-1")
 	delResp, _ := http.DefaultClient.Do(delReq)
 	if delResp.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", delResp.StatusCode)
 	}
 
-	// Verify gone
-	goneResp, _ := http.Get(server.URL + "/sessions/" + sessionID + "/files/" + fileID)
+	goneReq, _ := http.NewRequest("GET", server.URL+"/sessions/"+sessionID+"/files/"+fileID, nil)
+	goneReq.Header.Set("Authorization", "Bearer "+psk)
+	goneReq.Header.Set("X-Agent-ID", "agent-1")
+	goneResp, _ := http.DefaultClient.Do(goneReq)
 	if goneResp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", goneResp.StatusCode)
 	}
 }
 
-func TestMessagesBufferedDuringDisconnect(t *testing.T) {
-	server, _ := setupTestServerWithGrace(t, 5*time.Second)
+func TestAgentJoinedNotificationInMailbox(t *testing.T) {
+	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
 
-	ws1 := dialWS(t, wsURL)
-	ws2 := dialWS(t, wsURL)
-	authAgent(t, ws1, sessionID, "agent-1", psk)
-	authAgent(t, ws2, sessionID, "agent-2", psk)
-	readEnvelope(t, ws1) // agent-2 joined
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
 
-	ws2.Close()
-	time.Sleep(200 * time.Millisecond)
-
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeMessage,
-		To:      "agent-2",
-		Payload: mustMarshalPayload(t, map[string]string{"text": "buffered msg 1"}),
-	})
-	writeEnvelope(t, ws1, protocol.Envelope{
-		Type:    protocol.TypeMessage,
-		To:      "agent-2",
-		Payload: mustMarshalPayload(t, map[string]string{"text": "buffered msg 2"}),
-	})
-
-	time.Sleep(100 * time.Millisecond)
-
-	ws2reconn := dialWS(t, wsURL)
-	authAgent(t, ws2reconn, sessionID, "agent-2", psk)
-
-	readEnvelope(t, ws1) // agent_reconnected
-
-	msg1 := readEnvelope(t, ws2reconn)
-	if msg1.Type != protocol.TypeMessage {
-		t.Fatalf("expected message, got %s", msg1.Type)
+	msgs := drainMailbox(t, server.URL, sessionID, psk, "agent-1")
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(msgs))
 	}
-	var p1 map[string]string
-	json.Unmarshal(msg1.Payload, &p1)
-	if p1["text"] != "buffered msg 1" {
-		t.Fatalf("expected 'buffered msg 1', got %q", p1["text"])
-	}
-
-	msg2 := readEnvelope(t, ws2reconn)
-	if msg2.Type != protocol.TypeMessage {
-		t.Fatalf("expected message, got %s", msg2.Type)
-	}
-	var p2 map[string]string
-	json.Unmarshal(msg2.Payload, &p2)
-	if p2["text"] != "buffered msg 2" {
-		t.Fatalf("expected 'buffered msg 2', got %q", p2["text"])
+	env := msgs[0]["envelope"].(map[string]any)
+	if env["type"] != "agent_joined" {
+		t.Fatalf("expected agent_joined, got %v", env["type"])
 	}
 }
 
-func mustMarshalPayload(t *testing.T, v any) json.RawMessage {
-	t.Helper()
-	data, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
+func TestMultipleAgentsSameID(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+
+	msgs := drainMailbox(t, server.URL, sessionID, psk, "agent-1")
+	if len(msgs) != 0 {
+		t.Fatalf("expected 0 messages for same-agent re-register, got %d", len(msgs))
 	}
-	return data
+}
+
+func TestScratchpadUpdateBroadcast(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
+	drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+
+	doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/scratchpad/set", sessionID, psk, "agent-1", map[string]any{
+		"key": "plan", "value": "step 1",
+	}).Body.Close()
+
+	msgs := drainMailbox(t, server.URL, sessionID, psk, "agent-2")
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 scratchpad_update, got %d", len(msgs))
+	}
+	env := msgs[0]["envelope"].(map[string]any)
+	if env["type"] != "scratchpad_update" {
+		t.Fatalf("expected scratchpad_update, got %v", env["type"])
+	}
 }

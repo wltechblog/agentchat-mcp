@@ -2,31 +2,21 @@ package hub
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
+	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
+	"github.com/wltechblog/agentchat-mcp/internal/presence"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
 	"github.com/wltechblog/agentchat-mcp/internal/session"
 )
 
-const (
-	maxHistory     = 100
-	gracePeriod    = 30 * time.Second
-	sendBufSize    = 256
-	maxMessageSize = 65536
-	pongWait       = 60 * time.Second
-	pingPeriod     = 30 * time.Second
-	maxPendingMsgs = 512
-)
-
-func agentKey(sessionID, agentID string) string {
-	return sessionID + "/" + agentID
-}
+const maxHistory = 100
 
 type Hub struct {
 	mu           sync.RWMutex
@@ -34,39 +24,15 @@ type Hub struct {
 	leader       *leader.Tracker
 	scratchpad   *scratchpad.Store
 	files        *filestore.Store
-
-	agents             map[string][]*AgentConn
-	disconnectedAgents map[string]*disconnectedInfo
-	history            map[string][]protocol.Envelope
-	maxHistory         int
-	gracePeriod        time.Duration
-	seqNums            map[string]int64
-	debugLog           bool
-}
-
-type disconnectedInfo struct {
-	agentName    string
-	capabilities []string
-	timer        *time.Timer
-	pendingMsgs  [][]byte
-}
-
-type AgentConn struct {
-	AgentID      string
-	AgentName    string
-	SessionID    string
-	Capabilities []string
-	conn         *websocket.Conn
-	send         chan []byte
-	hub          *Hub
-	done         chan struct{}
+	presence     *presence.Tracker
+	mailboxes    *mailbox.Store
+	history      map[string][]protocol.Envelope
+	maxHistory   int
+	seqNums      map[string]int64
+	debugLog     bool
 }
 
 type Option func(*Hub)
-
-func WithGracePeriod(d time.Duration) Option {
-	return func(h *Hub) { h.gracePeriod = d }
-}
 
 func WithMaxHistory(n int) Option {
 	return func(h *Hub) { h.maxHistory = n }
@@ -76,22 +42,26 @@ func WithDebugLog(debug bool) Option {
 	return func(h *Hub) { h.debugLog = debug }
 }
 
-func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *filestore.Store, opts ...Option) *Hub {
+func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *filestore.Store, pt *presence.Tracker, mb *mailbox.Store, opts ...Option) *Hub {
 	h := &Hub{
-		sessionStore:       store,
-		leader:             lt,
-		scratchpad:         sp,
-		files:              fs,
-		agents:             make(map[string][]*AgentConn),
-		disconnectedAgents: make(map[string]*disconnectedInfo),
-		history:            make(map[string][]protocol.Envelope),
-		maxHistory:         maxHistory,
-		gracePeriod:        gracePeriod,
-		seqNums:            make(map[string]int64),
+		sessionStore: store,
+		leader:       lt,
+		scratchpad:   sp,
+		files:        fs,
+		presence:     pt,
+		mailboxes:    mb,
+		history:      make(map[string][]protocol.Envelope),
+		maxHistory:   maxHistory,
+		seqNums:      make(map[string]int64),
 	}
 	for _, opt := range opts {
 		opt(h)
 	}
+
+	pt.StartSweep(15*time.Second, func(sessionID, agentID, agentName string, capabilities []string) {
+		h.onAgentExpired(sessionID, agentID, agentName, capabilities)
+	})
+
 	return h
 }
 
@@ -100,390 +70,199 @@ func (h *Hub) nextSeq(sessionID string) int64 {
 	return h.seqNums[sessionID]
 }
 
-func (h *Hub) Register(conn *websocket.Conn, sessionID, agentID, agentName string, capabilities []string) (*AgentConn, [][]byte, error) {
-	key := agentKey(sessionID, agentID)
+func (h *Hub) Register(sessionID, agentID, agentName string, capabilities []string) bool {
+	isNew := h.presence.Touch(sessionID, agentID, agentName, capabilities)
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	ac := &AgentConn{
-		AgentID:      agentID,
-		AgentName:    agentName,
-		SessionID:    sessionID,
-		Capabilities: capabilities,
-		conn:         conn,
-		send:         make(chan []byte, sendBufSize),
-		hub:          h,
-		done:         make(chan struct{}),
-	}
-
-	if info, exists := h.disconnectedAgents[key]; exists {
-		info.timer.Stop()
-		pending := info.pendingMsgs
-		delete(h.disconnectedAgents, key)
-		h.agents[key] = append(h.agents[key], ac)
-		slog.Info("agent reconnected", "session", sessionID, "agent", agentID, "pending_msgs", len(pending))
-		go h.broadcastAfterUnlock(sessionID, protocol.TypeAgentReconnected, "server", protocol.AgentInfo{
-			AgentID:      agentID,
-			AgentName:    agentName,
-			Capabilities: capabilities,
+	if isNew {
+		slog.Info("agent joined", "session", sessionID, "agent", agentID)
+		h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
+			Type:      protocol.TypeAgentJoined,
+			SessionID: sessionID,
+			From:      "server",
+			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, AgentName: agentName, Capabilities: capabilities}),
+			Timestamp: time.Now().UTC(),
 		}, agentID)
 
-		go ac.writePump()
-		go ac.readPump()
-		return ac, pending, nil
-	} else {
-		isNew := len(h.agents[key]) == 0
-		h.agents[key] = append(h.agents[key], ac)
-		if isNew {
-			slog.Info("agent joined", "session", sessionID, "agent", agentID)
-			go h.broadcastAfterUnlock(sessionID, protocol.TypeAgentJoined, "server", protocol.AgentInfo{
-				AgentID:      agentID,
-				AgentName:    agentName,
-				Capabilities: capabilities,
-			}, agentID)
-
-			if _, hasLeader := h.leader.GetLeader(sessionID); !hasLeader {
-				h.leader.SetInitialLeader(sessionID, agentID)
-				slog.Info("initial leader set", "session", sessionID, "leader", agentID)
-			}
+		if _, hasLeader := h.leader.GetLeader(sessionID); !hasLeader {
+			h.leader.SetInitialLeader(sessionID, agentID)
+			slog.Info("initial leader set", "session", sessionID, "leader", agentID)
 		}
 	}
 
-	go ac.writePump()
-	go ac.readPump()
-
-	return ac, nil, nil
+	return isNew
 }
 
-func (h *Hub) Unregister(ac *AgentConn) {
-	key := agentKey(ac.SessionID, ac.AgentID)
-
-	h.mu.Lock()
-
-	conns := h.agents[key]
-	var found bool
-	var newConns []*AgentConn
-	for _, c := range conns {
-		if c == ac {
-			found = true
-		} else {
-			newConns = append(newConns, c)
-		}
-	}
-	if !found {
-		h.mu.Unlock()
-		return
-	}
-
-	if len(newConns) > 0 {
-		h.agents[key] = newConns
-		h.mu.Unlock()
-		return
-	}
-
-	delete(h.agents, key)
-
-	timer := time.AfterFunc(h.gracePeriod, func() {
-		h.mu.Lock()
-		delete(h.disconnectedAgents, key)
-		h.mu.Unlock()
-
-		slog.Info("agent left", "session", ac.SessionID, "agent", ac.AgentID)
-		h.broadcastToSession(ac.SessionID, protocol.Envelope{
-			Type:      protocol.TypeAgentLeft,
-			SessionID: ac.SessionID,
-			From:      "server",
-			Payload:   mustMarshal(protocol.AgentInfo{AgentID: ac.AgentID, AgentName: ac.AgentName, Capabilities: ac.Capabilities}),
-			Timestamp: time.Now().UTC(),
-		}, "")
-
-		if leaderID, ok := h.leader.GetLeader(ac.SessionID); ok && leaderID == ac.AgentID {
-			h.mu.RLock()
-			var newLeader string
-			for _, conns := range h.agents {
-				if len(conns) > 0 && conns[0].SessionID == ac.SessionID {
-					newLeader = conns[0].AgentID
-					break
-				}
-			}
-			h.mu.RUnlock()
-
-			if newLeader != "" {
-				h.leader.Transfer(ac.SessionID, ac.AgentID, newLeader)
-				slog.Info("leader auto-transferred", "session", ac.SessionID, "old_leader", ac.AgentID, "new_leader", newLeader)
-				h.broadcastToSession(ac.SessionID, protocol.Envelope{
-					Type:      protocol.TypeLeaderInfo,
-					SessionID: ac.SessionID,
-					From:      "server",
-					Payload:   mustMarshal(map[string]string{"leader_id": newLeader}),
-					Timestamp: time.Now().UTC(),
-				}, "")
-			}
-		}
-	})
-
-	h.disconnectedAgents[key] = &disconnectedInfo{
-		agentName:    ac.AgentName,
-		capabilities: ac.Capabilities,
-		timer:        timer,
-	}
-	slog.Info("agent disconnected, grace period started", "session", ac.SessionID, "agent", ac.AgentID)
-
-	h.mu.Unlock()
-}
-
-func (h *Hub) HandleMessage(ac *AgentConn, raw []byte) {
-	var env protocol.Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		ac.Send(protocol.NewError(ac.SessionID, "invalid message format"))
-		return
-	}
-	env.From = ac.AgentID
-	env.SessionID = ac.SessionID
-	if env.Timestamp.IsZero() {
-		env.Timestamp = time.Now().UTC()
-	}
-
-	if h.debugLog {
-		slog.Info("server received message", "type", env.Type, "from", env.From, "to", env.To, "request_id", env.RequestID, "session", ac.SessionID)
-	}
-
-	switch env.Type {
-	case protocol.TypeMessage:
-		if env.To == "" {
-			ac.Send(protocol.NewErrorWithID(ac.SessionID, "message requires 'to' field", env.RequestID))
-			return
-		}
-		env.Sequence = h.nextSeq(ac.SessionID)
-		h.addToHistory(ac.SessionID, env)
-		h.sendToAgent(ac.SessionID, env.To, env)
-
-	case protocol.TypeBroadcast:
-		env.Sequence = h.nextSeq(ac.SessionID)
-		h.addToHistory(ac.SessionID, env)
-		h.broadcastToSession(ac.SessionID, env, ac.AgentID)
-
-	case protocol.TypeListAgents:
-		agents := h.GetSessionAgents(ac.SessionID)
-		resp, _ := protocol.NewEnvelope(protocol.TypeAgentsList, ac.SessionID, "server", ac.AgentID, agents)
-		resp.RequestID = env.RequestID
-		ac.Send(resp)
-
-	case protocol.TypeTaskAssign, protocol.TypeTaskStatus, protocol.TypeTaskResult:
-		if env.To == "" {
-			ac.Send(protocol.NewErrorWithID(ac.SessionID, env.Type+" requires 'to' field", env.RequestID))
-			return
-		}
-		env.Sequence = h.nextSeq(ac.SessionID)
-		h.addToHistory(ac.SessionID, env)
-		h.sendToAgent(ac.SessionID, env.To, env)
-
-	case protocol.TypeScratchpadSet:
-		h.handleScratchpadSet(ac, env)
-	case protocol.TypeScratchpadGet:
-		h.handleScratchpadGet(ac, env)
-	case protocol.TypeScratchpadDelete:
-		h.handleScratchpadDelete(ac, env)
-	case protocol.TypeScratchpadList:
-		h.handleScratchpadList(ac, env)
-
-	case protocol.TypeLeaderQuery:
-		leaderID, _ := h.leader.GetLeader(ac.SessionID)
-		resp, _ := protocol.NewEnvelope(protocol.TypeLeaderInfo, ac.SessionID, "server", ac.AgentID,
-			map[string]string{"leader_id": leaderID})
-		resp.RequestID = env.RequestID
-		ac.Send(resp)
-
-	case protocol.TypeLeaderTransfer:
-		h.handleLeaderTransfer(ac, env)
-
-	case protocol.TypeHistoryRequest:
-		h.handleHistoryRequest(ac, env)
-
-	case protocol.TypeFileShare:
-		h.handleFileShare(ac, env)
-
-	default:
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "unknown message type: "+env.Type, env.RequestID))
-	}
-}
-
-func (h *Hub) handleScratchpadSet(ac *AgentConn, env protocol.Envelope) {
-	var payload protocol.ScratchpadSetPayload
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid scratchpad_set payload", env.RequestID))
-		return
-	}
-	if payload.Key == "" {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "key is required", env.RequestID))
-		return
-	}
-
-	entry := h.scratchpad.Set(ac.SessionID, payload.Key, payload.Value, ac.AgentID)
-	resp, _ := protocol.NewEnvelope(protocol.TypeScratchpadResult, ac.SessionID, "server", ac.AgentID, entry)
-	resp.RequestID = env.RequestID
-	ac.Send(resp)
-
-	bcast, _ := protocol.NewEnvelope(protocol.TypeScratchpadUpdate, ac.SessionID, ac.AgentID, "", entry)
-	bcast.Sequence = h.nextSeq(ac.SessionID)
-	h.broadcastToSession(ac.SessionID, bcast, ac.AgentID)
-}
-
-func (h *Hub) handleScratchpadGet(ac *AgentConn, env protocol.Envelope) {
-	var payload struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid scratchpad_get payload", env.RequestID))
-		return
-	}
-	entry, ok := h.scratchpad.Get(ac.SessionID, payload.Key)
-	if !ok {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "key not found: "+payload.Key, env.RequestID))
-		return
-	}
-	resp, _ := protocol.NewEnvelope(protocol.TypeScratchpadResult, ac.SessionID, "server", ac.AgentID, entry)
-	resp.RequestID = env.RequestID
-	ac.Send(resp)
-}
-
-func (h *Hub) handleScratchpadDelete(ac *AgentConn, env protocol.Envelope) {
-	var payload struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid scratchpad_delete payload", env.RequestID))
-		return
-	}
-	if !h.scratchpad.Delete(ac.SessionID, payload.Key) {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "key not found: "+payload.Key, env.RequestID))
-		return
-	}
-	resp, _ := protocol.NewEnvelope(protocol.TypeScratchpadResult, ac.SessionID, "server", ac.AgentID,
-		map[string]string{"key": payload.Key, "deleted": "true"})
-	resp.RequestID = env.RequestID
-	ac.Send(resp)
-
-	bcast, _ := protocol.NewEnvelope(protocol.TypeScratchpadUpdate, ac.SessionID, ac.AgentID, "",
-		map[string]string{"key": payload.Key, "deleted": "true"})
-	bcast.Sequence = h.nextSeq(ac.SessionID)
-	h.broadcastToSession(ac.SessionID, bcast, ac.AgentID)
-}
-
-func (h *Hub) handleScratchpadList(ac *AgentConn, env protocol.Envelope) {
-	entries := h.scratchpad.List(ac.SessionID)
-	resp, _ := protocol.NewEnvelope(protocol.TypeScratchpadResult, ac.SessionID, "server", ac.AgentID,
-		protocol.ScratchpadListResult{Entries: entries})
-	resp.RequestID = env.RequestID
-	ac.Send(resp)
-}
-
-func (h *Hub) handleLeaderTransfer(ac *AgentConn, env protocol.Envelope) {
-	var payload protocol.LeaderTransferPayload
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid leader_transfer payload", env.RequestID))
-		return
-	}
-
-	currentLeader, _ := h.leader.GetLeader(ac.SessionID)
-	if currentLeader != ac.AgentID {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "only the current leader can transfer leadership", env.RequestID))
-		return
-	}
-
-	key := agentKey(ac.SessionID, payload.NewLeaderID)
-	h.mu.RLock()
-	conns, exists := h.agents[key]
-	h.mu.RUnlock()
-
-	if !exists || len(conns) == 0 {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "agent not found in session: "+payload.NewLeaderID, env.RequestID))
-		return
-	}
-
-	if !h.leader.Transfer(ac.SessionID, ac.AgentID, payload.NewLeaderID) {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "leadership transfer failed", env.RequestID))
-		return
-	}
-
-	slog.Info("leader transferred", "session", ac.SessionID, "from", ac.AgentID, "to", payload.NewLeaderID)
-
-	resp, _ := protocol.NewEnvelope(protocol.TypeLeaderInfo, ac.SessionID, "server", ac.AgentID,
-		map[string]string{"leader_id": payload.NewLeaderID, "transferred_by": ac.AgentID})
-	resp.RequestID = env.RequestID
-	ac.Send(resp)
-
-	h.broadcastToSession(ac.SessionID, protocol.Envelope{
-		Type:      protocol.TypeLeaderInfo,
-		SessionID: ac.SessionID,
+func (h *Hub) onAgentExpired(sessionID, agentID, agentName string, capabilities []string) {
+	slog.Info("agent expired", "session", sessionID, "agent", agentID)
+	h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
+		Type:      protocol.TypeAgentLeft,
+		SessionID: sessionID,
 		From:      "server",
-		Payload:   mustMarshal(map[string]string{"leader_id": payload.NewLeaderID, "transferred_by": ac.AgentID}),
-		Sequence:  h.nextSeq(ac.SessionID),
+		Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, AgentName: agentName, Capabilities: capabilities}),
 		Timestamp: time.Now().UTC(),
-	}, ac.AgentID)
-}
+	}, "")
 
-func (h *Hub) handleHistoryRequest(ac *AgentConn, env protocol.Envelope) {
-	var payload protocol.HistoryRequestPayload
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid history_request payload", env.RequestID))
-		return
-	}
-
-	if payload.Limit <= 0 {
-		payload.Limit = h.maxHistory
-	}
-
-	h.mu.RLock()
-	history := h.history[ac.SessionID]
-	h.mu.RUnlock()
-
-	var filtered []protocol.Envelope
-	for _, e := range history {
-		if e.Sequence > payload.AfterSequence {
-			filtered = append(filtered, e)
-		}
-		if len(filtered) >= payload.Limit {
-			break
+	if leaderID, ok := h.leader.GetLeader(sessionID); ok && leaderID == agentID {
+		agents := h.presence.GetAgents(sessionID)
+		if len(agents) > 0 {
+			newLeader := agents[0].AgentID
+			h.leader.Transfer(sessionID, agentID, newLeader)
+			slog.Info("leader auto-transferred", "session", sessionID, "old_leader", agentID, "new_leader", newLeader)
+			h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
+				Type:      protocol.TypeLeaderInfo,
+				SessionID: sessionID,
+				From:      "server",
+				Payload:   mustMarshal(map[string]string{"leader_id": newLeader}),
+				Timestamp: time.Now().UTC(),
+			}, "")
 		}
 	}
-	if filtered == nil {
-		filtered = []protocol.Envelope{}
-	}
 
-	resp, _ := protocol.NewEnvelope(protocol.TypeHistoryResult, ac.SessionID, "server", ac.AgentID,
-		map[string]any{"messages": filtered, "count": len(filtered)})
-	resp.RequestID = env.RequestID
-	ac.Send(resp)
+	h.mailboxes.DeleteBox(sessionID + "/" + agentID)
 }
 
-func (h *Hub) handleFileShare(ac *AgentConn, env protocol.Envelope) {
-	if env.To == "" {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "file_share requires 'to' field", env.RequestID))
-		return
+func (h *Hub) DrainMailbox(sessionID, agentID string) []mailbox.Entry {
+	h.presence.Touch(sessionID, agentID, "", nil)
+	return h.mailboxes.Drain(sessionID + "/" + agentID)
+}
+
+func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawMessage) error {
+	if to == "" {
+		return fmt.Errorf("'to' is required")
+	}
+	env := protocol.Envelope{
+		Type:      msgType,
+		SessionID: sessionID,
+		From:      from,
+		To:        to,
+		Payload:   payload,
+		Sequence:  h.nextSeq(sessionID),
+		Timestamp: time.Now().UTC(),
+	}
+	h.addToHistory(sessionID, env)
+	h.deliverToAgentMailbox(sessionID, to, env)
+	return nil
+}
+
+func (h *Hub) Broadcast(sessionID, from, msgType string, payload json.RawMessage) {
+	env := protocol.Envelope{
+		Type:      msgType,
+		SessionID: sessionID,
+		From:      from,
+		To:        "",
+		Payload:   payload,
+		Sequence:  h.nextSeq(sessionID),
+		Timestamp: time.Now().UTC(),
+	}
+	h.addToHistory(sessionID, env)
+	h.deliverToSessionMailboxes(sessionID, env, from)
+}
+
+func (h *Hub) deliverToAgentMailbox(sessionID, agentID string, env protocol.Envelope) {
+	key := sessionID + "/" + agentID
+	h.mailboxes.Deliver(key, env)
+	if h.debugLog {
+		slog.Info("delivered to mailbox", "agent", agentID, "type", env.Type)
+	}
+}
+
+func (h *Hub) deliverToSessionMailboxes(sessionID string, env protocol.Envelope, excludeAgent string) {
+	agents := h.presence.GetAgents(sessionID)
+	for _, a := range agents {
+		if a.AgentID != excludeAgent {
+			h.deliverToAgentMailbox(sessionID, a.AgentID, env)
+		}
+	}
+}
+
+func (h *Hub) ScratchpadSet(sessionID, agentID, key string, value json.RawMessage) (protocol.ScratchpadEntry, error) {
+	if key == "" {
+		return protocol.ScratchpadEntry{}, fmt.Errorf("key is required")
+	}
+	entry := h.scratchpad.Set(sessionID, key, value, agentID)
+
+	bcast, _ := protocol.NewEnvelope(protocol.TypeScratchpadUpdate, sessionID, agentID, "", entry)
+	bcast.Sequence = h.nextSeq(sessionID)
+	h.deliverToSessionMailboxes(sessionID, bcast, agentID)
+
+	return entry, nil
+}
+
+func (h *Hub) ScratchpadGet(sessionID, key string) (protocol.ScratchpadEntry, error) {
+	entry, ok := h.scratchpad.Get(sessionID, key)
+	if !ok {
+		return protocol.ScratchpadEntry{}, fmt.Errorf("key not found: %s", key)
+	}
+	return entry, nil
+}
+
+func (h *Hub) ScratchpadDelete(sessionID, agentID, key string) error {
+	if !h.scratchpad.Delete(sessionID, key) {
+		return fmt.Errorf("key not found: %s", key)
+	}
+	bcast, _ := protocol.NewEnvelope(protocol.TypeScratchpadUpdate, sessionID, agentID, "",
+		map[string]string{"key": key, "deleted": "true"})
+	bcast.Sequence = h.nextSeq(sessionID)
+	h.deliverToSessionMailboxes(sessionID, bcast, agentID)
+	return nil
+}
+
+func (h *Hub) ScratchpadList(sessionID string) []protocol.ScratchpadEntry {
+	return h.scratchpad.List(sessionID)
+}
+
+func (h *Hub) LeaderTransfer(sessionID, fromAgent, newLeaderID string) error {
+	currentLeader, _ := h.leader.GetLeader(sessionID)
+	if currentLeader != fromAgent {
+		return fmt.Errorf("only the current leader can transfer leadership")
 	}
 
-	var payload protocol.FileSharePayload
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "invalid file_share payload", env.RequestID))
-		return
+	if !h.presence.IsPresent(sessionID, newLeaderID) {
+		return fmt.Errorf("agent not found in session: %s", newLeaderID)
 	}
 
-	if payload.FileID == "" || payload.FileName == "" {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "file_id and file_name are required", env.RequestID))
-		return
+	if !h.leader.Transfer(sessionID, fromAgent, newLeaderID) {
+		return fmt.Errorf("leadership transfer failed")
 	}
 
-	if _, ok := h.files.Get(ac.SessionID, payload.FileID); !ok {
-		ac.Send(protocol.NewErrorWithID(ac.SessionID, "file not found: "+payload.FileID, env.RequestID))
-		return
+	slog.Info("leader transferred", "session", sessionID, "from", fromAgent, "to", newLeaderID)
+
+	h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
+		Type:      protocol.TypeLeaderInfo,
+		SessionID: sessionID,
+		From:      "server",
+		Payload:   mustMarshal(map[string]string{"leader_id": newLeaderID, "transferred_by": fromAgent}),
+		Sequence:  h.nextSeq(sessionID),
+		Timestamp: time.Now().UTC(),
+	}, fromAgent)
+
+	return nil
+}
+
+func (h *Hub) ShareFile(sessionID, from, to, fileID, fileName, contentType, description string, size int64) error {
+	if to == "" {
+		return fmt.Errorf("'to' is required")
+	}
+	if _, ok := h.files.Get(sessionID, fileID); !ok {
+		return fmt.Errorf("file not found: %s", fileID)
 	}
 
-	env.Sequence = h.nextSeq(ac.SessionID)
-	h.addToHistory(ac.SessionID, env)
-	h.sendToAgent(ac.SessionID, env.To, env)
-	slog.Info("file shared", "session", ac.SessionID, "from", ac.AgentID, "to", env.To, "file", payload.FileName, "file_id", payload.FileID)
+	payload, _ := json.Marshal(protocol.FileSharePayload{
+		FileID: fileID, FileName: fileName, ContentType: contentType, Size: size, Description: description,
+	})
+	env := protocol.Envelope{
+		Type:      protocol.TypeFileShare,
+		SessionID: sessionID,
+		From:      from,
+		To:        to,
+		Payload:   payload,
+		Sequence:  h.nextSeq(sessionID),
+		Timestamp: time.Now().UTC(),
+	}
+	h.addToHistory(sessionID, env)
+	h.deliverToAgentMailbox(sessionID, to, env)
+	slog.Info("file shared", "session", sessionID, "from", from, "to", to, "file", fileName, "file_id", fileID)
+	return nil
 }
 
 func (h *Hub) GetFiles(sessionID string) []*filestore.File {
@@ -503,25 +282,7 @@ func (h *Hub) DeleteFile(sessionID, fileID string) bool {
 }
 
 func (h *Hub) GetSessionAgents(sessionID string) []protocol.AgentInfo {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	agents := make([]protocol.AgentInfo, 0)
-	for k, conns := range h.agents {
-		if len(conns) == 0 {
-			continue
-		}
-		ac := conns[0]
-		if ac.SessionID == sessionID {
-			_ = k
-			agents = append(agents, protocol.AgentInfo{
-				AgentID:      ac.AgentID,
-				AgentName:    ac.AgentName,
-				Capabilities: ac.Capabilities,
-			})
-		}
-	}
-	return agents
+	return h.presence.GetAgents(sessionID)
 }
 
 func (h *Hub) GetHistory(sessionID string) []protocol.Envelope {
@@ -531,6 +292,30 @@ func (h *Hub) GetHistory(sessionID string) []protocol.Envelope {
 	out := make([]protocol.Envelope, len(history))
 	copy(out, history)
 	return out
+}
+
+func (h *Hub) GetHistoryAfter(sessionID string, afterSeq int64, limit int) []protocol.Envelope {
+	h.mu.RLock()
+	history := h.history[sessionID]
+	h.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = h.maxHistory
+	}
+
+	var filtered []protocol.Envelope
+	for _, e := range history {
+		if e.Sequence > afterSeq {
+			filtered = append(filtered, e)
+		}
+		if len(filtered) >= limit {
+			break
+		}
+	}
+	if filtered == nil {
+		filtered = []protocol.Envelope{}
+	}
+	return filtered
 }
 
 func (h *Hub) GetScratchpad(sessionID string) []protocol.ScratchpadEntry {
@@ -544,120 +329,14 @@ func (h *Hub) GetLeader(sessionID string) string {
 
 func (h *Hub) CloseSession(sessionID string) {
 	h.mu.Lock()
-
-	var channels []chan []byte
-	for key, conns := range h.agents {
-		if len(conns) > 0 && conns[0].SessionID == sessionID {
-			for _, ac := range conns {
-				channels = append(channels, ac.send)
-				close(ac.done)
-				ac.conn.Close()
-			}
-			delete(h.agents, key)
-		}
-	}
-	for key, info := range h.disconnectedAgents {
-		info.timer.Stop()
-		delete(h.disconnectedAgents, key)
-	}
 	delete(h.history, sessionID)
 	delete(h.seqNums, sessionID)
-
 	h.mu.Unlock()
 
+	h.presence.ClearSession(sessionID)
 	h.leader.ClearSession(sessionID)
 	h.scratchpad.ClearSession(sessionID)
 	h.files.ClearSession(sessionID)
-
-	env, _ := protocol.NewEnvelope(protocol.TypeAgentLeft, sessionID, "server", "", "session closed")
-	data, _ := json.Marshal(env)
-	for _, ch := range channels {
-		select {
-		case ch <- data:
-		default:
-		}
-	}
-}
-
-func (h *Hub) broadcastToSession(sessionID string, env protocol.Envelope, excludeAgent string) {
-	if h.debugLog {
-		slog.Info("server broadcasting message", "type", env.Type, "from", env.From, "request_id", env.RequestID, "session", sessionID, "exclude", excludeAgent)
-	}
-	h.mu.RLock()
-	var targets []chan []byte
-	for _, conns := range h.agents {
-		for _, ac := range conns {
-			if ac.SessionID == sessionID && ac.AgentID != excludeAgent {
-				targets = append(targets, ac.send)
-			}
-		}
-	}
-	h.mu.RUnlock()
-
-	data, _ := json.Marshal(env)
-	for _, ch := range targets {
-		select {
-		case ch <- data:
-		default:
-			slog.Warn("send buffer full, dropping message")
-		}
-	}
-}
-
-func (h *Hub) broadcastAfterUnlock(sessionID, msgType, from string, payload any, excludeAgent string) {
-	env, err := protocol.NewEnvelope(msgType, sessionID, from, "", payload)
-	if err != nil {
-		slog.Error("failed to create broadcast envelope", "error", err)
-		return
-	}
-	h.broadcastToSession(sessionID, env, excludeAgent)
-}
-
-func (h *Hub) sendToAgent(sessionID, agentID string, env protocol.Envelope) {
-	if h.debugLog {
-		slog.Info("server routing message", "type", env.Type, "from", env.From, "to", agentID, "request_id", env.RequestID, "session", sessionID)
-	}
-	key := agentKey(sessionID, agentID)
-	data, _ := json.Marshal(env)
-
-	h.mu.RLock()
-	conns, ok := h.agents[key]
-	h.mu.RUnlock()
-
-	if ok && len(conns) > 0 {
-		for _, ac := range conns {
-			select {
-			case ac.send <- data:
-			default:
-				slog.Warn("send buffer full for agent", "agent", agentID)
-			}
-		}
-		return
-	}
-
-	h.mu.Lock()
-	info, disconnOk := h.disconnectedAgents[key]
-	h.mu.Unlock()
-
-	if disconnOk {
-		if len(info.pendingMsgs) < maxPendingMsgs {
-			info.pendingMsgs = append(info.pendingMsgs, data)
-			slog.Info("buffered message for disconnected agent", "agent", agentID, "pending", len(info.pendingMsgs))
-		} else {
-			slog.Warn("pending message buffer full for agent, dropping", "agent", agentID)
-		}
-		return
-	}
-
-	senderKey := agentKey(sessionID, env.From)
-	h.mu.RLock()
-	senderConns, senderOk := h.agents[senderKey]
-	h.mu.RUnlock()
-	if senderOk && len(senderConns) > 0 {
-		for _, sender := range senderConns {
-			sender.Send(protocol.NewErrorWithID(sessionID, "agent not found: "+agentID, env.RequestID))
-		}
-	}
 }
 
 func (h *Hub) addToHistory(sessionID string, env protocol.Envelope) {
@@ -667,84 +346,6 @@ func (h *Hub) addToHistory(sessionID string, env protocol.Envelope) {
 	h.history[sessionID] = append(h.history[sessionID], env)
 	if len(h.history[sessionID]) > h.maxHistory {
 		h.history[sessionID] = h.history[sessionID][len(h.history[sessionID])-h.maxHistory:]
-	}
-}
-
-func (ac *AgentConn) Send(env protocol.Envelope) {
-	if ac.hub.debugLog {
-		slog.Info("server sending response", "type", env.Type, "to", ac.AgentID, "request_id", env.RequestID, "session", ac.SessionID)
-	}
-	data, err := json.Marshal(env)
-	if err != nil {
-		return
-	}
-	select {
-	case ac.send <- data:
-	default:
-		slog.Warn("send buffer full", "agent", ac.AgentID)
-	}
-}
-
-func (ac *AgentConn) SendRaw(data []byte) {
-	select {
-	case ac.send <- data:
-	default:
-		slog.Warn("send buffer full", "agent", ac.AgentID)
-	}
-}
-
-func (ac *AgentConn) readPump() {
-	defer func() {
-		ac.hub.Unregister(ac)
-		ac.conn.Close()
-	}()
-
-	ac.conn.SetReadLimit(maxMessageSize)
-	ac.conn.SetReadDeadline(time.Now().Add(pongWait))
-	ac.conn.SetPongHandler(func(string) error {
-		ac.conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
-
-	for {
-		_, message, err := ac.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				slog.Error("read error", "agent", ac.AgentID, "error", err)
-			}
-			return
-		}
-		ac.conn.SetReadDeadline(time.Now().Add(pongWait))
-		ac.hub.HandleMessage(ac, message)
-	}
-}
-
-func (ac *AgentConn) writePump() {
-	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		ac.conn.Close()
-	}()
-
-	for {
-		select {
-		case message, ok := <-ac.send:
-			if !ok {
-				ac.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			if err := ac.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				return
-			}
-
-		case <-ticker.C:
-			if err := ac.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-
-		case <-ac.done:
-			return
-		}
 	}
 }
 

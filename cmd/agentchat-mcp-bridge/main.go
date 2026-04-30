@@ -14,42 +14,28 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/wltechblog/agentchat-mcp/internal/mcp"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 )
 
 type Bridge struct {
-	wsURL        string
+	httpBase     string
 	sessionID    string
 	psk          string
 	agentID      string
 	agentName    string
 	capabilities []string
-	httpBase     string
+	client       *http.Client
 
-	connMu      sync.RWMutex
-	conn        *websocket.Conn
-	connected   bool
-	writeMu     sync.Mutex
-	connectOnce sync.Once
-	ctx         context.Context
-	cancel      context.CancelFunc
-
-	pending   map[string]chan protocol.Envelope
-	pendingMu sync.Mutex
-
-	incoming []protocol.Envelope
-	incMu    sync.Mutex
-	notifyCh chan struct{}
-
-	debugLog bool
+	mu          sync.Mutex
+	initialized bool
+	debugLog    bool
 }
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	wsURL := requireEnv("AGENTCHAT_URL")
+	serverURL := requireEnv("AGENTCHAT_URL")
 	sessionID := requireEnv("AGENTCHAT_SESSION_ID")
 	psk := requireEnv("AGENTCHAT_PSK")
 	agentID := requireEnv("AGENTCHAT_AGENT_ID")
@@ -69,291 +55,142 @@ func main() {
 		}
 	}
 
+	httpBase := serverURL
+	httpBase = strings.TrimSuffix(httpBase, "/")
+	httpBase = strings.TrimSuffix(httpBase, "/ws")
+	if strings.HasPrefix(httpBase, "wss://") {
+		httpBase = "https://" + strings.TrimPrefix(httpBase, "wss://")
+	} else if strings.HasPrefix(httpBase, "ws://") {
+		httpBase = "http://" + strings.TrimPrefix(httpBase, "ws://")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	bridge := &Bridge{
-		wsURL:        wsURL,
+		httpBase:     httpBase,
 		sessionID:    sessionID,
 		psk:          psk,
 		agentID:      agentID,
 		agentName:    agentName,
 		capabilities: caps,
-		httpBase:     wsURLToHTTP(wsURL),
-		pending:      make(map[string]chan protocol.Envelope),
-		notifyCh:     make(chan struct{}, 1),
-		ctx:          ctx,
-		cancel:       cancel,
+		client:       &http.Client{Timeout: 30 * time.Second},
 		debugLog:     debugLog,
 	}
 
 	server := mcp.NewServer("agentchat-mcp-bridge", "1.0.0")
 	registerTools(server, bridge)
 
-	slog.Info("bridge started", "agent_id", agentID, "session_id", sessionID)
+	slog.Info("bridge started", "agent_id", agentID, "session_id", sessionID, "server", httpBase)
 	if err := server.Run(ctx); err != nil {
 		slog.Error("MCP server exited", "error", err)
 	}
 }
 
-func (b *Bridge) connectLoop(ctx context.Context) {
-	backoff := time.Second
-	const maxBackoff = 30 * time.Second
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		err := b.connect()
-		if err != nil {
-			slog.Error("connection failed", "error", err, "retry_in", backoff)
-			select {
-			case <-time.After(backoff):
-				backoff = min(backoff*2, maxBackoff)
-				continue
-			case <-ctx.Done():
-				return
-			}
-		}
-
-		backoff = time.Second
-		slog.Info("connected to server")
-
-		b.readPump()
-
-		b.disconnect()
-		slog.Warn("disconnected, will reconnect", "retry_in", backoff)
-
-		select {
-		case <-time.After(backoff):
-			backoff = min(backoff*2, maxBackoff)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (b *Bridge) connect() error {
-	conn, _, err := websocket.DefaultDialer.Dial(b.wsURL, nil)
-	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+func (b *Bridge) ensureInit() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.initialized {
+		return nil
 	}
 
-	authPayload, _ := json.Marshal(protocol.AuthPayload{
-		SessionID:    b.sessionID,
-		AgentID:      b.agentID,
-		AgentName:    b.agentName,
-		PSK:          b.psk,
-		Capabilities: b.capabilities,
+	body, _ := json.Marshal(map[string]any{
+		"agent_name":    b.agentName,
+		"capabilities":  b.capabilities,
 	})
-	authMsg, _ := json.Marshal(protocol.Envelope{
-		Type:      protocol.TypeAuth,
-		Payload:   authPayload,
-		Timestamp: time.Now().UTC(),
-	})
-	if err := conn.WriteMessage(websocket.TextMessage, authMsg); err != nil {
-		conn.Close()
-		return fmt.Errorf("auth write: %w", err)
-	}
-
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, resp, err := conn.ReadMessage()
+	resp, err := b.doRequestLocked("POST", "/sessions/"+b.sessionID+"/register", body)
 	if err != nil {
-		conn.Close()
-		return fmt.Errorf("auth read: %w", err)
+		return fmt.Errorf("register failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		rbody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("register failed (%d): %s", resp.StatusCode, string(rbody))
 	}
 
-	var authResp protocol.Envelope
-	json.Unmarshal(resp, &authResp)
-	if authResp.Type != protocol.TypeAuthOK {
-		conn.Close()
-		return fmt.Errorf("auth rejected: %s", string(resp))
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	b.connMu.Lock()
-	b.conn = conn
-	b.connected = true
-	b.connMu.Unlock()
-
+	b.initialized = true
+	slog.Info("registered with server")
 	return nil
 }
 
-func (b *Bridge) disconnect() {
-	b.connMu.Lock()
-	b.connected = false
-	if b.conn != nil {
-		b.conn.Close()
-		b.conn = nil
+func (b *Bridge) doRequest(method, path string, body []byte) (*http.Response, error) {
+	if err := b.ensureInit(); err != nil {
+		return nil, err
 	}
-	b.connMu.Unlock()
 
-	b.pendingMu.Lock()
-	for k, ch := range b.pending {
-		close(ch)
-		delete(b.pending, k)
-	}
-	b.pendingMu.Unlock()
+	b.mu.Lock()
+	resp, err := b.doRequestLocked(method, path, body)
+	b.mu.Unlock()
+	return resp, err
 }
 
-func (b *Bridge) isConnected() bool {
-	b.connMu.RLock()
-	defer b.connMu.RUnlock()
-	return b.connected
-}
-
-func (b *Bridge) ensureConnected() error {
-	b.connectOnce.Do(func() {
-		go b.connectLoop(b.ctx)
-	})
-
-	deadline := time.Now().Add(10 * time.Second)
-	for !b.isConnected() {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for connection to server")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return nil
-}
-
-func (b *Bridge) readPump() {
-	for {
-		b.connMu.RLock()
-		conn := b.conn
-		b.connMu.RUnlock()
-		if conn == nil {
-			return
-		}
-
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				slog.Error("read error", "error", err)
-			}
-			return
-		}
-
-		var env protocol.Envelope
-		if err := json.Unmarshal(message, &env); err != nil {
-			continue
-		}
-
-		if b.debugLog {
-			slog.Info("received message", "type", env.Type, "from", env.From, "to", env.To, "request_id", env.RequestID)
-		}
-
-		b.routeMessage(env)
-	}
-}
-
-func (b *Bridge) routeMessage(env protocol.Envelope) {
-	if env.RequestID != "" {
-		b.pendingMu.Lock()
-		ch, ok := b.pending[env.RequestID]
-		b.pendingMu.Unlock()
-
-		if ok {
-			select {
-			case ch <- env:
-			default:
-			}
-			return
-		}
-
-		// If it has a RequestID but no pending channel, it means it timed out.
-		// DO NOT put it into b.incoming, drop it.
-		return
+func (b *Bridge) doRequestLocked(method, path string, body []byte) (*http.Response, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
 	}
 
-	if env.From != "server" || env.Type != protocol.TypeLeaderInfo {
-		b.incMu.Lock()
-		b.incoming = append(b.incoming, env)
-		b.incMu.Unlock()
-		select {
-		case b.notifyCh <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (b *Bridge) sendWS(env protocol.Envelope) error {
-	if err := b.ensureConnected(); err != nil {
-		return err
-	}
-
-	b.connMu.RLock()
-	conn := b.conn
-	connected := b.connected
-	b.connMu.RUnlock()
-
-	if !connected {
-		return fmt.Errorf("not connected to server")
-	}
-
-	env.SessionID = b.sessionID
-	env.From = b.agentID
-	if env.Timestamp.IsZero() {
-		env.Timestamp = time.Now().UTC()
-	}
-	data, err := json.Marshal(env)
+	req, err := http.NewRequest(method, b.httpBase+path, bodyReader)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+b.psk)
+	req.Header.Set("X-Agent-ID", b.agentID)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
-	b.writeMu.Lock()
-	defer b.writeMu.Unlock()
 	if b.debugLog {
-		slog.Info("sending message", "type", env.Type, "to", env.To, "request_id", env.RequestID)
+		slog.Info("HTTP request", "method", method, "path", path)
 	}
-	return conn.WriteMessage(websocket.TextMessage, data)
+	return b.client.Do(req)
 }
 
-func (b *Bridge) sendAndWait(env protocol.Envelope, responseType string, timeout time.Duration) (protocol.Envelope, error) {
-	if err := b.ensureConnected(); err != nil {
-		return protocol.Envelope{}, err
-	}
-
-	if !b.isConnected() {
-		return protocol.Envelope{}, fmt.Errorf("not connected to server")
-	}
-
-	env.RequestID = fmt.Sprintf("%d-%d", time.Now().UnixNano(), len(b.pending))
-	ch := make(chan protocol.Envelope, 1)
-	b.pendingMu.Lock()
-	b.pending[env.RequestID] = ch
-	b.pendingMu.Unlock()
-
-	if err := b.sendWS(env); err != nil {
-		b.pendingMu.Lock()
-		delete(b.pending, env.RequestID)
-		b.pendingMu.Unlock()
-		return protocol.Envelope{}, err
-	}
-
-	select {
-	case resp, ok := <-ch:
-		b.pendingMu.Lock()
-		delete(b.pending, env.RequestID)
-		b.pendingMu.Unlock()
-		if !ok {
-			return protocol.Envelope{}, fmt.Errorf("connection lost")
+func (b *Bridge) doJSON(method, path string, payload any) (map[string]any, error) {
+	var body []byte
+	if payload != nil {
+		var err error
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return nil, err
 		}
-		if resp.Type == protocol.TypeError {
-			var errData map[string]string
-			json.Unmarshal(resp.Payload, &errData)
-			return protocol.Envelope{}, fmt.Errorf("%s", errData["error"])
-		}
-		return resp, nil
-	case <-time.After(timeout):
-		b.pendingMu.Lock()
-		delete(b.pending, env.RequestID)
-		b.pendingMu.Unlock()
-		return protocol.Envelope{}, fmt.Errorf("timeout waiting for %s response", responseType)
 	}
+
+	resp, err := b.doRequest(method, path, body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	rbody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, string(rbody))
+	}
+
+	var result map[string]any
+	json.Unmarshal(rbody, &result)
+	return result, nil
+}
+
+func (b *Bridge) drainMailbox() ([]map[string]any, error) {
+	result, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/mailbox", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	rawMsgs, _ := result["messages"].([]any)
+	msgs := make([]map[string]any, 0, len(rawMsgs))
+	for _, m := range rawMsgs {
+		if m, ok := m.(map[string]any); ok {
+			msgs = append(msgs, m)
+		}
+	}
+	return msgs, nil
 }
 
 func registerTools(s *mcp.Server, b *Bridge) {
@@ -375,8 +212,15 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		if to == "" {
 			return "", fmt.Errorf("to is required")
 		}
-		env, _ := protocol.NewEnvelope(protocol.TypeMessage, b.sessionID, b.agentID, to, args["payload"])
-		return "sent", b.sendWS(env)
+		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+			"to":      to,
+			"type":    "message",
+			"payload": args["payload"],
+		})
+		if err != nil {
+			return "", err
+		}
+		return "sent", nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -390,8 +234,14 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"payload"},
 		},
 	}, func(args map[string]any) (string, error) {
-		env, _ := protocol.NewEnvelope(protocol.TypeBroadcast, b.sessionID, b.agentID, "", args["payload"])
-		return "sent", b.sendWS(env)
+		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/broadcast", map[string]any{
+			"type":    "broadcast",
+			"payload": args["payload"],
+		})
+		if err != nil {
+			return "", err
+		}
+		return "sent", nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -399,11 +249,10 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call. Returns immediately with whatever is available. For blocking until a message arrives, use wait_for_message instead.",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
-		b.ensureConnected()
-		b.incMu.Lock()
-		msgs := b.incoming
-		b.incoming = nil
-		b.incMu.Unlock()
+		msgs, err := b.drainMailbox()
+		if err != nil {
+			return "", err
+		}
 		if len(msgs) == 0 {
 			return "[]", nil
 		}
@@ -413,7 +262,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "wait_for_message",
-		Description: "Block until one or more incoming messages arrive, then return them. This avoids repeated polling when waiting for a response from a remote agent which may take seconds or minutes to reply. Checks existing queued messages first, then waits up to the specified timeout.",
+		Description: "Block until one or more incoming messages arrive, then return them. This avoids repeated polling when waiting for a response from a remote agent which may take seconds or minutes to reply. Checks existing queued messages first, then polls up to the specified timeout.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -423,7 +272,6 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			},
 		},
 	}, func(args map[string]any) (string, error) {
-		b.ensureConnected()
 		timeoutSec, _ := args["timeout"].(float64)
 		if timeoutSec <= 0 {
 			timeoutSec = 120
@@ -436,53 +284,61 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		filterFrom, _ := args["from"].(string)
 		filterType, _ := args["type"].(string)
 
-		check := func() []protocol.Envelope {
-			b.incMu.Lock()
-			defer b.incMu.Unlock()
-			if filterFrom == "" && filterType == "" {
-				msgs := b.incoming
-				b.incoming = nil
-				return msgs
+		deadline := time.Now().Add(timeout)
+		pollInterval := 2 * time.Second
+
+		for {
+			msgs, err := b.drainMailbox()
+			if err != nil {
+				return "", err
 			}
-			var matched, remaining []protocol.Envelope
-			for _, m := range b.incoming {
-				if (filterFrom == "" || m.From == filterFrom) && (filterType == "" || m.Type == filterType) {
-					matched = append(matched, m)
-				} else {
+
+			if filterFrom == "" && filterType == "" {
+				if len(msgs) > 0 {
+					data, _ := json.Marshal(msgs)
+					return string(data), nil
+				}
+			} else {
+				var matched, remaining []map[string]any
+				for _, m := range msgs {
+					env := m["envelope"]
+					if envMap, ok := env.(map[string]any); ok {
+						from, _ := envMap["from"].(string)
+						t, _ := envMap["type"].(string)
+						if (filterFrom == "" || from == filterFrom) && (filterType == "" || t == filterType) {
+							matched = append(matched, m)
+							continue
+						}
+					}
 					remaining = append(remaining, m)
 				}
+
+				if len(matched) > 0 {
+					data, _ := json.Marshal(matched)
+					return string(data), nil
+				}
+
+				if len(remaining) > 0 {
+					slog.Warn("wait_for_message: non-matching messages discarded by destructive read", "count", len(remaining))
+				}
 			}
-			b.incoming = remaining
-			return matched
-		}
 
-		if msgs := check(); len(msgs) > 0 {
-			data, _ := json.Marshal(msgs)
-			return string(data), nil
-		}
-
-		deadline := time.Now().Add(timeout)
-		for {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
 				return "[]", nil
 			}
 
-			select {
-			case <-b.notifyCh:
-				if msgs := check(); len(msgs) > 0 {
-					data, _ := json.Marshal(msgs)
-					return string(data), nil
-				}
-			case <-time.After(remaining):
-				return "[]", nil
+			sleep := pollInterval
+			if remaining < sleep {
+				sleep = remaining
 			}
+			time.Sleep(sleep)
 		}
 	})
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "send_and_wait",
-		Description: "Send a message to another agent and block until a reply arrives. Combines send_message + wait_for_message into a single synchronous call. Use this instead of calling send_message and wait_for_message separately.",
+		Description: "Send a message to another agent and block until a reply arrives. Combines send_message + wait_for_message into a single synchronous call.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -507,41 +363,48 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		}
 		timeout := time.Duration(timeoutSec * float64(time.Second))
 
-		env, _ := protocol.NewEnvelope(protocol.TypeMessage, b.sessionID, b.agentID, to, args["payload"])
-		if err := b.sendWS(env); err != nil {
+		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+			"to":      to,
+			"type":    "message",
+			"payload": args["payload"],
+		})
+		if err != nil {
 			return "", fmt.Errorf("send failed: %w", err)
 		}
 
 		deadline := time.Now().Add(timeout)
+		pollInterval := 2 * time.Second
+
 		for {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				return "[]", nil
+			msgs, err := b.drainMailbox()
+			if err != nil {
+				return "", err
 			}
 
-			b.incMu.Lock()
-			var matched []protocol.Envelope
-			var keep []protocol.Envelope
-			for _, m := range b.incoming {
-				if m.From == to {
-					matched = append(matched, m)
-				} else {
-					keep = append(keep, m)
+			var matched []map[string]any
+			for _, m := range msgs {
+				if env, ok := m["envelope"].(map[string]any); ok {
+					if from, _ := env["from"].(string); from == to {
+						matched = append(matched, m)
+					}
 				}
 			}
-			b.incoming = keep
-			b.incMu.Unlock()
 
 			if len(matched) > 0 {
 				data, _ := json.Marshal(matched)
 				return string(data), nil
 			}
 
-			select {
-			case <-b.notifyCh:
-			case <-time.After(remaining):
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
 				return "[]", nil
 			}
+
+			sleep := pollInterval
+			if remaining < sleep {
+				sleep = remaining
+			}
+			time.Sleep(sleep)
 		}
 	})
 
@@ -550,11 +413,12 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		Description: "List all agents currently connected to the session",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
-		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeListAgents}, protocol.TypeAgentsList, 5*time.Second)
+		result, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/agents", nil)
 		if err != nil {
 			return "", err
 		}
-		return string(resp.Payload), nil
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -562,11 +426,12 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		Description: "Get the current leader agent ID for the session",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
-		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeLeaderQuery}, protocol.TypeLeaderInfo, 5*time.Second)
+		result, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/leader", nil)
 		if err != nil {
 			return "", err
 		}
-		return string(resp.Payload), nil
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -581,8 +446,9 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		},
 	}, func(args map[string]any) (string, error) {
 		newLeader, _ := args["new_leader_id"].(string)
-		payload, _ := json.Marshal(protocol.LeaderTransferPayload{NewLeaderID: newLeader})
-		_, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeLeaderTransfer, Payload: payload}, protocol.TypeLeaderInfo, 5*time.Second)
+		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/leader/transfer", map[string]any{
+			"new_leader_id": newLeader,
+		})
 		if err != nil {
 			return "", err
 		}
@@ -605,13 +471,15 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		if key == "" {
 			return "", fmt.Errorf("key is required")
 		}
-		valBytes, _ := json.Marshal(args["value"])
-		payload, _ := json.Marshal(protocol.ScratchpadSetPayload{Key: key, Value: valBytes})
-		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeScratchpadSet, Payload: payload}, protocol.TypeScratchpadResult, 5*time.Second)
+		result, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/scratchpad/set", map[string]any{
+			"key":   key,
+			"value": args["value"],
+		})
 		if err != nil {
 			return "", err
 		}
-		return string(resp.Payload), nil
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -629,12 +497,14 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		if key == "" {
 			return "", fmt.Errorf("key is required")
 		}
-		payload, _ := json.Marshal(map[string]string{"key": key})
-		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeScratchpadGet, Payload: payload}, protocol.TypeScratchpadResult, 5*time.Second)
+		result, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/scratchpad/get", map[string]any{
+			"key": key,
+		})
 		if err != nil {
-			return "", fmt.Errorf("scratchpad_get(%q): %w", key, err)
+			return "", err
 		}
-		return string(resp.Payload), nil
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -652,12 +522,14 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		if key == "" {
 			return "", fmt.Errorf("key is required")
 		}
-		payload, _ := json.Marshal(map[string]string{"key": key})
-		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeScratchpadDelete, Payload: payload}, protocol.TypeScratchpadResult, 5*time.Second)
+		result, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/scratchpad/delete", map[string]any{
+			"key": key,
+		})
 		if err != nil {
 			return "", err
 		}
-		return string(resp.Payload), nil
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -665,11 +537,12 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		Description: "List all key-value entries in the shared session scratchpad",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
-		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeScratchpadList}, protocol.TypeScratchpadResult, 5*time.Second)
+		result, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/scratchpad", nil)
 		if err != nil {
 			return "", err
 		}
-		return string(resp.Payload), nil
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -687,22 +560,28 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		},
 	}, func(args map[string]any) (string, error) {
 		to, _ := args["to"].(string)
-		taskID, _ := args["task_id"].(string)
-		desc, _ := args["description"].(string)
-		var paramsJSON json.RawMessage
-		if p, ok := args["parameters"]; ok {
-			paramsJSON, _ = json.Marshal(p)
+		if to == "" {
+			return "", fmt.Errorf("to is required")
 		}
-		payload, _ := json.Marshal(protocol.TaskAssignPayload{
-			TaskID: taskID, Description: desc, Parameters: paramsJSON,
+		taskPayload, _ := json.Marshal(map[string]any{
+			"task_id":     args["task_id"],
+			"description": args["description"],
+			"parameters":  args["parameters"],
 		})
-		env := protocol.Envelope{Type: protocol.TypeTaskAssign, To: to, Payload: payload}
-		return "sent", b.sendWS(env)
+		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+			"to":      to,
+			"type":    "task_assign",
+			"payload": json.RawMessage(taskPayload),
+		})
+		if err != nil {
+			return "", err
+		}
+		return "sent", nil
 	})
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "task_status",
-		Description: "Update the status of a task and notify the relevant agent. The receiving agent may take time to acknowledge.",
+		Description: "Update the status of a task and notify the relevant agent.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -715,17 +594,28 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		},
 	}, func(args map[string]any) (string, error) {
 		to, _ := args["to"].(string)
-		taskID, _ := args["task_id"].(string)
-		status, _ := args["status"].(string)
-		detail, _ := args["detail"].(string)
-		payload, _ := json.Marshal(protocol.TaskStatusPayload{TaskID: taskID, Status: status, Detail: detail})
-		env := protocol.Envelope{Type: protocol.TypeTaskStatus, To: to, Payload: payload}
-		return "sent", b.sendWS(env)
+		if to == "" {
+			return "", fmt.Errorf("to is required")
+		}
+		taskPayload, _ := json.Marshal(map[string]any{
+			"task_id": args["task_id"],
+			"status":  args["status"],
+			"detail":  args["detail"],
+		})
+		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+			"to":      to,
+			"type":    "task_status",
+			"payload": json.RawMessage(taskPayload),
+		})
+		if err != nil {
+			return "", err
+		}
+		return "sent", nil
 	})
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "task_result",
-		Description: "Return the result of a completed task to the requesting agent. The receiving agent may take time to process the result.",
+		Description: "Return the result of a completed task to the requesting agent.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -737,16 +627,27 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		},
 	}, func(args map[string]any) (string, error) {
 		to, _ := args["to"].(string)
-		taskID, _ := args["task_id"].(string)
-		resultJSON, _ := json.Marshal(args["result"])
-		payload, _ := json.Marshal(protocol.TaskResultPayload{TaskID: taskID, Result: resultJSON})
-		env := protocol.Envelope{Type: protocol.TypeTaskResult, To: to, Payload: payload}
-		return "sent", b.sendWS(env)
+		if to == "" {
+			return "", fmt.Errorf("to is required")
+		}
+		taskPayload, _ := json.Marshal(map[string]any{
+			"task_id": args["task_id"],
+			"result":  args["result"],
+		})
+		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+			"to":      to,
+			"type":    "task_result",
+			"payload": json.RawMessage(taskPayload),
+		})
+		if err != nil {
+			return "", err
+		}
+		return "sent", nil
 	})
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "request_history",
-		Description: "Request message history from the session, optionally after a given sequence number for catch-up after reconnection",
+		Description: "Request message history from the session, optionally after a given sequence number for catch-up",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -755,17 +656,24 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			},
 		},
 	}, func(args map[string]any) (string, error) {
-		afterSeq, _ := args["after_sequence"].(float64)
-		limit, _ := args["limit"].(float64)
-		payload, _ := json.Marshal(protocol.HistoryRequestPayload{
-			AfterSequence: int64(afterSeq),
-			Limit:         int(limit),
-		})
-		resp, err := b.sendAndWait(protocol.Envelope{Type: protocol.TypeHistoryRequest, Payload: payload}, protocol.TypeHistoryResult, 5*time.Second)
+		path := "/sessions/" + b.sessionID + "/history"
+		params := []string{}
+		if afterSeq, ok := args["after_sequence"].(float64); ok && afterSeq > 0 {
+			params = append(params, fmt.Sprintf("after_sequence=%d", int64(afterSeq)))
+		}
+		if limit, ok := args["limit"].(float64); ok && limit > 0 {
+			params = append(params, fmt.Sprintf("limit=%d", int(limit)))
+		}
+		if len(params) > 0 {
+			path += "?" + strings.Join(params, "&")
+		}
+
+		result, err := b.doJSON("GET", path, nil)
 		if err != nil {
 			return "", err
 		}
-		return string(resp.Payload), nil
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 
 	s.RegisterTool(mcp.Tool{
@@ -802,11 +710,16 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			contentType = "application/octet-stream"
 		}
 
+		if err := b.ensureInit(); err != nil {
+			return "", err
+		}
+
 		uploadURL := fmt.Sprintf("%s/sessions/%s/files?filename=%s", b.httpBase, b.sessionID, filename)
 		req, _ := http.NewRequest("POST", uploadURL, bytes.NewReader(data))
 		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("Authorization", "Bearer "+b.psk)
 		req.Header.Set("X-Agent-ID", b.agentID)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := b.client.Do(req)
 		if err != nil {
 			return "", fmt.Errorf("upload failed: %w", err)
 		}
@@ -829,8 +742,12 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			Size:        int64(size),
 			Description: description,
 		})
-		env := protocol.Envelope{Type: protocol.TypeFileShare, To: to, Payload: sharePayload}
-		if err := b.sendWS(env); err != nil {
+		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+			"to":      to,
+			"type":    "file_share",
+			"payload": json.RawMessage(sharePayload),
+		})
+		if err != nil {
 			return "", fmt.Errorf("file uploaded but share message failed: %w", err)
 		}
 
@@ -859,8 +776,15 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			return "", fmt.Errorf("file_id is required")
 		}
 
+		if err := b.ensureInit(); err != nil {
+			return "", err
+		}
+
 		dlURL := fmt.Sprintf("%s/sessions/%s/files/%s", b.httpBase, b.sessionID, fileID)
-		resp, err := http.Get(dlURL)
+		req, _ := http.NewRequest("GET", dlURL, nil)
+		req.Header.Set("Authorization", "Bearer "+b.psk)
+		req.Header.Set("X-Agent-ID", b.agentID)
+		resp, err := b.client.Do(req)
 		if err != nil {
 			return "", fmt.Errorf("download failed: %w", err)
 		}
@@ -869,7 +793,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			return "", fmt.Errorf("download failed (%d)", resp.StatusCode)
 		}
 
-		data, err := io.ReadAll(resp.Body)
+		fdata, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return "", fmt.Errorf("read failed: %w", err)
 		}
@@ -877,8 +801,8 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		result, _ := json.Marshal(map[string]any{
 			"file_id":        fileID,
 			"content_type":   resp.Header.Get("Content-Type"),
-			"size":           len(data),
-			"content_base64": base64.StdEncoding.EncodeToString(data),
+			"size":           len(fdata),
+			"content_base64": base64.StdEncoding.EncodeToString(fdata),
 		})
 		return string(result), nil
 	})
@@ -909,13 +833,4 @@ func envOrDefault(key, def string) string {
 		return def
 	}
 	return v
-}
-
-func wsURLToHTTP(wsURL string) string {
-	u := strings.TrimSuffix(wsURL, "/ws")
-	u = strings.TrimSuffix(u, "/")
-	if strings.HasPrefix(u, "wss://") {
-		return "https://" + strings.TrimPrefix(u, "wss://")
-	}
-	return "http://" + strings.TrimPrefix(u, "ws://")
 }
