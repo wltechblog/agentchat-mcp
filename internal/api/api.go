@@ -43,7 +43,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}", h.getSession)
 	mux.HandleFunc("DELETE /sessions/{id}", h.deleteSession)
 
-	mux.HandleFunc("POST /sessions/{id}/register", h.auth(h.registerAgent))
+	mux.HandleFunc("POST /sessions/{id}/register", h.registerAgent)
 	mux.HandleFunc("POST /sessions/{id}/messages", h.auth(h.sendMessage))
 	mux.HandleFunc("POST /sessions/{id}/broadcast", h.auth(h.broadcastMessage))
 	mux.HandleFunc("GET /sessions/{id}/mailbox", h.auth(h.drainMailbox))
@@ -170,8 +170,37 @@ func (h *Handler) deleteSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) registerAgent(w http.ResponseWriter, r *http.Request) {
-	sessionID := getSessionID(r)
-	agentID := getAgentID(r)
+	sessionID := r.PathValue("id")
+	if sessionID == "" {
+		http.Error(w, "session id required", http.StatusBadRequest)
+		return
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	psk := strings.TrimPrefix(authHeader, "Bearer ")
+	if psk == authHeader || psk == "" {
+		http.Error(w, "Authorization: Bearer <psk> required", http.StatusUnauthorized)
+		return
+	}
+
+	agentID := r.Header.Get("X-Agent-ID")
+	if agentID == "" {
+		http.Error(w, "X-Agent-ID header required", http.StatusUnauthorized)
+		return
+	}
+
+	sess, created, err := h.sessionStore.GetOrCreate(sessionID, psk, "")
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if sess == nil {
+		http.Error(w, "invalid PSK", http.StatusUnauthorized)
+		return
+	}
+	if created {
+		slog.Info("session auto-created", "id", sess.ID, "name", sess.Name)
+	}
 
 	var req struct {
 		AgentName    string   `json:"agent_name"`
