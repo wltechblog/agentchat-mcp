@@ -147,7 +147,7 @@ func (b *Bridge) doRequestLocked(method, path string, body []byte) (*http.Respon
 	return b.client.Do(req)
 }
 
-func (b *Bridge) doJSON(method, path string, payload any) (map[string]any, error) {
+func (b *Bridge) doJSON(method, path string, payload any) (any, error) {
 	var body []byte
 	if payload != nil {
 		var err error
@@ -172,7 +172,7 @@ func (b *Bridge) doJSON(method, path string, payload any) (map[string]any, error
 		return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, string(rbody))
 	}
 
-	var result map[string]any
+	var result any
 	json.Unmarshal(rbody, &result)
 	return result, nil
 }
@@ -183,7 +183,12 @@ func (b *Bridge) drainMailbox() ([]map[string]any, error) {
 		return nil, err
 	}
 
-	rawMsgs, _ := result["messages"].([]any)
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+
+	rawMsgs, _ := resultMap["messages"].([]any)
 	msgs := make([]map[string]any, 0, len(rawMsgs))
 	for _, m := range rawMsgs {
 		if m, ok := m.(map[string]any); ok {
