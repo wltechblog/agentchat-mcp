@@ -92,6 +92,10 @@ func (h *Hub) Register(sessionID, agentID, agentName string, capabilities []stri
 	return isNew
 }
 
+func (h *Hub) RefreshPresence(sessionID, agentID string) {
+	h.presence.Touch(sessionID, agentID, "", nil)
+}
+
 func (h *Hub) onAgentExpired(sessionID, agentID, agentName string, capabilities []string) {
 	slog.Info("agent expired", "session", sessionID, "agent", agentID)
 	h.deliverToSessionMailboxes(sessionID, protocol.Envelope{

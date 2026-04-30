@@ -88,6 +88,8 @@ func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		h.hub.RefreshPresence(sessionID, agentID)
+
 		ctx := context.WithValue(r.Context(), ctxKeyAgentID, agentID)
 		ctx = context.WithValue(ctx, ctxKeySession, sess)
 		next(w, r.WithContext(ctx))

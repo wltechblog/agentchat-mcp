@@ -55,8 +55,12 @@ func (t *Tracker) Touch(sessionID, agentID, agentName string, capabilities []str
 		}
 		t.agents[key] = state
 	}
-	state.AgentName = agentName
-	state.Capabilities = capabilities
+	if agentName != "" {
+		state.AgentName = agentName
+	}
+	if capabilities != nil {
+		state.Capabilities = capabilities
+	}
 	state.LastSeen = time.Now()
 	return isNew
 }
