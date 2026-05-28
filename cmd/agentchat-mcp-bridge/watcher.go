@@ -43,7 +43,7 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 }
 
 func (b *Bridge) watchStream(ctx context.Context) error {
-	url := fmt.Sprintf("%s/sessions/%s/watch?psk=%s", b.httpBase, b.sessionID, b.psk)
+	url := fmt.Sprintf("%s/watch?session=%s&psk=%s", b.httpBase, b.sessionID, b.psk)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
