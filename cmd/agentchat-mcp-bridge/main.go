@@ -85,10 +85,13 @@ func main() {
 		signalSocketPath: signalSocketPath,
 	}
 
-	server := mcp.NewServer("agentchat-mcp-bridge", "1.2.0")
+	server := mcp.NewServer("agentchat-mcp-bridge", "1.3.0")
 	registerTools(server, bridge)
 
 	slog.Info("bridge started", "agent_id", agentID, "session_id", sessionID, "server", httpBase)
+
+	// Start SSE watcher to auto-signal picobot on incoming messages
+	bridge.startWatcher(ctx)
 	if signalSocketPath != "" {
 		slog.Info("signal socket configured", "path", signalSocketPath)
 	}
