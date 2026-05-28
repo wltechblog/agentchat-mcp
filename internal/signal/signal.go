@@ -102,7 +102,7 @@ func ReadAll(conn net.Conn) ([]byte, error) {
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
-			result = append(result, buf[:n])
+			result = append(result, buf[:n]...)
 		}
 		if err != nil {
 			if err == io.EOF {

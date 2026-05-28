@@ -3,11 +3,13 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
@@ -28,12 +30,14 @@ const (
 type Handler struct {
 	hub          *hub.Hub
 	sessionStore *session.Store
+	watcher      *Watcher
 }
 
 func New(h *hub.Hub, store *session.Store) *Handler {
 	return &Handler{
 		hub:          h,
 		sessionStore: store,
+		watcher:      NewWatcher(),
 	}
 }
 
@@ -59,6 +63,32 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/files", h.auth(h.listFiles))
 	mux.HandleFunc("GET /sessions/{id}/files/{fileID}", h.auth(h.downloadFile))
 	mux.HandleFunc("DELETE /sessions/{id}/files/{fileID}", h.auth(h.deleteFile))
+
+	// SSE watch endpoints — PSK via query param
+	mux.HandleFunc("GET /watch", h.authQuery(handleSSE(h)))
+	mux.HandleFunc("GET /watch/sessions", h.authQuery(h.listWatchSessions))
+}
+
+// authQuery validates PSK from query parameter (for SSE connections that can't set headers easily)
+func (h *Handler) authQuery(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		psk := r.URL.Query().Get("psk")
+		sessionID := r.URL.Query().Get("session")
+
+		if psk == "" || sessionID == "" {
+			http.Error(w, "psk and session query parameters required", http.StatusUnauthorized)
+			return
+		}
+
+		_, ok := h.sessionStore.ValidatePSK(sessionID, psk)
+		if !ok {
+			http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), ctxKeySession, sessionID)
+		next(w, r.WithContext(ctx))
+	}
 }
 
 func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -219,7 +249,18 @@ func (h *Handler) registerAgent(w http.ResponseWriter, r *http.Request) {
 		caps = []string{}
 	}
 
-	h.hub.Register(sessionID, agentID, agentName, caps)
+	isNew := h.hub.Register(sessionID, agentID, agentName, caps)
+
+	// Notify watchers of agent join
+	if isNew {
+		h.watcher.Notify(sessionID, protocol.Envelope{
+			Type:      protocol.TypeAgentJoined,
+			SessionID: sessionID,
+			From:      "server",
+			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, AgentName: agentName, Capabilities: caps}),
+			Timestamp: time.Now().UTC(),
+		})
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":    "registered",
@@ -257,6 +298,16 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Notify watchers
+	h.watcher.Notify(sessionID, protocol.Envelope{
+		Type:      msgType,
+		SessionID: sessionID,
+		From:      agentID,
+		To:        req.To,
+		Payload:   req.Payload,
+		Timestamp: time.Now().UTC(),
+	})
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
 }
 
@@ -279,6 +330,17 @@ func (h *Handler) broadcastMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.hub.Broadcast(sessionID, agentID, msgType, req.Payload)
+
+	// Notify watchers
+	h.watcher.Notify(sessionID, protocol.Envelope{
+		Type:      msgType,
+		SessionID: sessionID,
+		From:      agentID,
+		To:        "*",
+		Payload:   req.Payload,
+		Timestamp: time.Now().UTC(),
+	})
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
 }
 
@@ -494,6 +556,92 @@ func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("file deleted", "session", sessionID, "file_id", fileID)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// SSE handler for watching real-time messages
+func handleSSE(h *Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.URL.Query().Get("session")
+
+		// Set SSE headers
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		// Flush headers
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Send initial connection event
+		fmt.Fprintf(w, "event: connected\ndata: {\"session\":\"%s\",\"time\":\"%s\"}\n\n", sessionID, time.Now().UTC().Format(time.RFC3339))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Send recent history
+		history := h.hub.GetHistory(sessionID)
+		for _, env := range history {
+			data, _ := json.Marshal(env)
+			fmt.Fprintf(w, "event: history\ndata: %s\n\n", data)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Subscribe to live messages
+		ch := h.watcher.Subscribe(sessionID)
+		defer h.watcher.Unsubscribe(sessionID, ch)
+
+		ctx := r.Context()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case env, ok := <-ch:
+				if !ok {
+					return
+				}
+				data, err := json.Marshal(env)
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+		}
+	}
+}
+
+// listWatchSessions lists available sessions (used by CLI client)
+func (h *Handler) listWatchSessions(w http.ResponseWriter, r *http.Request) {
+	sessions := h.sessionStore.List()
+	out := make([]map[string]any, 0, len(sessions))
+	for _, s := range sessions {
+		agents := h.hub.GetSessionAgents(s.ID)
+		agentList := make([]map[string]any, 0, len(agents))
+		for _, a := range agents {
+			agentList = append(agentList, map[string]any{
+				"id":   a.AgentID,
+				"name": a.AgentName,
+			})
+		}
+		out = append(out, map[string]any{
+			"id":          s.ID,
+			"name":        s.Name,
+			"agent_count": len(agents),
+			"agents":      agentList,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func mustMarshal(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
