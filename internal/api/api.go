@@ -80,13 +80,19 @@ func (h *Handler) authQuery(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		_, ok := h.sessionStore.ValidatePSK(sessionID, psk)
+		// Try to validate against existing session first
+		sess, ok := h.sessionStore.ValidatePSK(sessionID, psk)
 		if !ok {
-			http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
-			return
+			// Session may not exist yet (server restarted or SSE connects before register).
+			// Auto-create like registerAgent does, so the SSE connection can proceed.
+			sess, _, _ = h.sessionStore.GetOrCreate(sessionID, psk, "")
+			if sess == nil {
+				http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
+				return
+			}
 		}
 
-		ctx := context.WithValue(r.Context(), ctxKeySession, sessionID)
+		ctx := context.WithValue(r.Context(), ctxKeySession, sess.ID)
 		next(w, r.WithContext(ctx))
 	}
 }
@@ -114,8 +120,12 @@ func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 
 		sess, ok := h.sessionStore.ValidatePSK(sessionID, psk)
 		if !ok {
-			http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
-			return
+			// Auto-create session if it doesn't exist (server may have restarted)
+			sess, _, _ = h.sessionStore.GetOrCreate(sessionID, psk, "")
+			if sess == nil {
+				http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
+				return
+			}
 		}
 
 		h.hub.RefreshPresence(sessionID, agentID)
