@@ -16,6 +16,7 @@ import (
 
 	"github.com/wltechblog/agentchat-mcp/internal/mcp"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
+	"github.com/wltechblog/agentchat-mcp/internal/signal"
 )
 
 type Bridge struct {
@@ -27,9 +28,10 @@ type Bridge struct {
 	capabilities []string
 	client       *http.Client
 
-	mu          sync.Mutex
-	initialized bool
-	debugLog    bool
+	mu                sync.Mutex
+	initialized       bool
+	debugLog          bool
+	signalSocketPath  string // path to picobot's Unix socket (local)
 }
 
 func main() {
@@ -46,6 +48,9 @@ func main() {
 	if strings.ToLower(debugStr) == "true" || debugStr == "1" {
 		debugLog = true
 	}
+
+	// Signal socket path — if set, trigger_agent sends directly to picobot's Unix socket
+	signalSocketPath := envOrDefault("AGENTCHAT_SIGNAL_SOCKET", "")
 
 	var caps []string
 	if capsStr != "" {
@@ -68,20 +73,24 @@ func main() {
 	defer cancel()
 
 	bridge := &Bridge{
-		httpBase:     httpBase,
-		sessionID:    sessionID,
-		psk:          psk,
-		agentID:      agentID,
-		agentName:    agentName,
-		capabilities: caps,
-		client:       &http.Client{Timeout: 30 * time.Second},
-		debugLog:     debugLog,
+		httpBase:         httpBase,
+		sessionID:        sessionID,
+		psk:              psk,
+		agentID:          agentID,
+		agentName:        agentName,
+		capabilities:     caps,
+		client:           &http.Client{Timeout: 30 * time.Second},
+		debugLog:         debugLog,
+		signalSocketPath: signalSocketPath,
 	}
 
-	server := mcp.NewServer("agentchat-mcp-bridge", "1.1.0")
+	server := mcp.NewServer("agentchat-mcp-bridge", "1.2.0")
 	registerTools(server, bridge)
 
 	slog.Info("bridge started", "agent_id", agentID, "session_id", sessionID, "server", httpBase)
+	if signalSocketPath != "" {
+		slog.Info("signal socket configured", "path", signalSocketPath)
+	}
 	if err := server.Run(ctx); err != nil {
 		slog.Error("MCP server exited", "error", err)
 	}
@@ -812,10 +821,10 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		return string(result), nil
 	})
 
-	// trigger_agent — send a signal to a connected picobot instance
+	// trigger_agent — send a signal directly to picobot's local Unix socket
 	s.RegisterTool(mcp.Tool{
 		Name:        "trigger_agent",
-		Description: "Send a trigger signal to a connected picobot agent instance. This wakes up the agent and injects a message into its processing loop. The agent will process the message asynchronously. Use this to have picobot perform tasks on behalf of this agent.",
+		Description: "Send a trigger signal directly to a local picobot agent instance via Unix socket. This wakes up the agent and injects a message into its processing loop. Requires AGENTCHAT_SIGNAL_SOCKET to be configured in the bridge environment.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -833,25 +842,45 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			return "", fmt.Errorf("content is required")
 		}
 
+		if b.signalSocketPath == "" {
+			return "", fmt.Errorf("trigger_agent not configured: set AGENTCHAT_SIGNAL_SOCKET env var to picobot's Unix socket path")
+		}
+
 		sigType, _ := args["type"].(string)
 		if sigType == "" {
 			sigType = "agentchat.trigger"
 		}
 
-		result, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/signal", map[string]any{
-			"content":  content,
-			"type":     sigType,
-			"channel":  args["channel"],
-			"chat_id":  args["chat_id"],
-			"priority": args["priority"],
-		})
+		sig := signal.Signal{
+			Type:     sigType,
+			Channel:  maybeString(args["channel"]),
+			ChatID:   maybeString(args["chat_id"]),
+			Content:  content,
+			Priority: maybeString(args["priority"]),
+			Metadata: map[string]interface{}{
+				"source_agent": b.agentID,
+				"source":       "agentchat-mcp",
+			},
+		}
+
+		resp, err := signal.SendToSocket(b.signalSocketPath, sig)
 		if err != nil {
 			return "", fmt.Errorf("trigger failed: %w", err)
 		}
 
-		data, _ := json.Marshal(result)
+		data, _ := json.Marshal(resp)
 		return string(data), nil
 	})
+}
+
+func maybeString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 func stringifyArg(v any) string {
