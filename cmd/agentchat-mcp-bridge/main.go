@@ -49,8 +49,9 @@ func main() {
 		debugLog = true
 	}
 
-	// Signal socket path — if set, trigger_agent sends directly to picobot's Unix socket
-	signalSocketPath := envOrDefault("AGENTCHAT_SIGNAL_SOCKET", "")
+	// Signal socket path — prefer PICOBOT_SIGNAL_SOCKET (auto-injected by picobot),
+	// fall back to AGENTCHAT_SIGNAL_SOCKET for manual config
+	signalSocketPath := envOrDefault("PICOBOT_SIGNAL_SOCKET", envOrDefault("AGENTCHAT_SIGNAL_SOCKET", ""))
 
 	var caps []string
 	if capsStr != "" {
@@ -821,45 +822,36 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		return string(result), nil
 	})
 
-	// trigger_agent — send a signal directly to picobot's local Unix socket
+	// trigger_agent — send an action-based signal to picobot's local Unix socket
 	s.RegisterTool(mcp.Tool{
 		Name:        "trigger_agent",
-		Description: "Send a trigger signal directly to a local picobot agent instance via Unix socket. This wakes up the agent and injects a message into its processing loop. Requires AGENTCHAT_SIGNAL_SOCKET to be configured in the bridge environment.",
+		Description: "Send a trigger signal to a local picobot agent instance via Unix socket. The signal carries a registered action name — picobot validates the action and injects a safe, pre-defined response. This wakes the agent to perform a known task (check messages, check email, etc). Requires PICOBOT_SIGNAL_SOCKET to be configured (auto-injected by picobot).",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"content":  map[string]any{"type": "string", "description": "The message content to send to the agent"},
-				"type":     map[string]any{"type": "string", "description": "Signal type (default: agentchat.trigger)"},
-				"channel":  map[string]any{"type": "string", "description": "Target channel (e.g., telegram, discord). Leave empty for default."},
-				"chat_id":  map[string]any{"type": "string", "description": "Target chat ID. Leave empty for default."},
-				"priority": map[string]any{"type": "string", "description": "Priority: normal (default) or high"},
+				"action":  map[string]any{"type": "string", "description": "The registered action to trigger (e.g., check_messages, motion_detected). Must be a known action registered in picobot's config."},
+				"channel": map[string]any{"type": "string", "description": "Target channel (e.g., telegram, discord). Leave empty for default."},
+				"chat_id": map[string]any{"type": "string", "description": "Target chat ID. Leave empty for default."},
 			},
-			"required": []string{"content"},
+			"required": []string{"action"},
 		},
 	}, func(args map[string]any) (string, error) {
-		content, _ := args["content"].(string)
-		if content == "" {
-			return "", fmt.Errorf("content is required")
+		action, _ := args["action"].(string)
+		if action == "" {
+			return "", fmt.Errorf("action is required")
 		}
 
 		if b.signalSocketPath == "" {
-			return "", fmt.Errorf("trigger_agent not configured: set AGENTCHAT_SIGNAL_SOCKET env var to picobot's Unix socket path")
-		}
-
-		sigType, _ := args["type"].(string)
-		if sigType == "" {
-			sigType = "agentchat.trigger"
+			return "", fmt.Errorf("trigger_agent not configured: PICOBOT_SIGNAL_SOCKET not set. Ensure picobot signal system is enabled and this bridge was spawned by picobot.")
 		}
 
 		sig := signal.Signal{
-			Type:     sigType,
-			Channel:  maybeString(args["channel"]),
-			ChatID:   maybeString(args["chat_id"]),
-			Content:  content,
-			Priority: maybeString(args["priority"]),
+			Source:  "agentchat-mcp",
+			Action:  action,
+			Channel: maybeString(args["channel"]),
+			ChatID:  maybeString(args["chat_id"]),
 			Metadata: map[string]interface{}{
 				"source_agent": b.agentID,
-				"source":       "agentchat-mcp",
 			},
 		}
 

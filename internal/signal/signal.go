@@ -10,12 +10,27 @@ import (
 )
 
 // Signal represents an external trigger to send to a picobot instance.
+// Signals are action-based — they carry a named action, not freeform instructions.
 type Signal struct {
-	Type     string                 `json:"type"`
-	Channel  string                 `json:"channel,omitempty"`
-	ChatID   string                 `json:"chat_id,omitempty"`
-	Content  string                 `json:"content"`
-	Priority string                 `json:"priority,omitempty"`
+	// Source identifies the system sending the signal (e.g., "agentchat-mcp").
+	Source string `json:"source"`
+
+	// Action is the registered action name (e.g., "check_messages").
+	Action string `json:"action"`
+
+	// Timestamp is Unix millis when the signal was sent.
+	Timestamp int64 `json:"timestamp,omitempty"`
+
+	// Channel is the chat channel to inject the message into.
+	// If empty, "signal" is used.
+	Channel string `json:"channel,omitempty"`
+
+	// ChatID is the specific conversation to target.
+	// If empty, "default" is used.
+	ChatID string `json:"chat_id,omitempty"`
+
+	// Metadata holds optional structured data for logging/auditing only.
+	// NEVER exposed to the agent or used in response text.
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
@@ -26,6 +41,11 @@ func SendToSocket(socketPath string, sig Signal) (map[string]string, error) {
 		return nil, fmt.Errorf("failed to connect to %s: %w", socketPath, err)
 	}
 	defer conn.Close()
+
+	// Set timestamp if not provided
+	if sig.Timestamp == 0 {
+		sig.Timestamp = time.Now().UnixMilli()
+	}
 
 	data, err := json.Marshal(sig)
 	if err != nil {
@@ -42,7 +62,6 @@ func SendToSocket(socketPath string, sig Signal) (map[string]string, error) {
 	n, err := conn.Read(buf)
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Timeout is acceptable — server may not respond
 			return map[string]string{"status": "sent"}, nil
 		}
 		return nil, fmt.Errorf("failed to read response: %w", err)
@@ -56,7 +75,6 @@ func SendToSocket(socketPath string, sig Signal) (map[string]string, error) {
 }
 
 // WaitForSocket repeatedly tries to connect to the socket until it succeeds or context is cancelled.
-// Useful for waiting until picobot is ready.
 func WaitForSocket(ctx context.Context, socketPath string, interval time.Duration) error {
 	if interval == 0 {
 		interval = 2 * time.Second
@@ -84,7 +102,7 @@ func ReadAll(conn net.Conn) ([]byte, error) {
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
-			result = append(result, buf[:n]...)
+			result = append(result, buf[:n])
 		}
 		if err != nil {
 			if err == io.EOF {
