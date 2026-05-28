@@ -13,6 +13,7 @@ import (
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/session"
+	"github.com/wltechblog/agentchat-mcp/internal/signal"
 )
 
 const maxUploadMemory = 50 << 20
@@ -26,14 +27,32 @@ const (
 )
 
 type Handler struct {
-	hub          *hub.Hub
-	sessionStore *session.Store
+	hub             *hub.Hub
+	sessionStore    *session.Store
+	signalSocketPath string // path to picobot Unix socket for signal forwarding (empty = disabled)
 }
 
 func New(h *hub.Hub, store *session.Store) *Handler {
 	return &Handler{
 		hub:          h,
 		sessionStore: store,
+	}
+}
+
+// WithSignalSocket sets the picobot signal Unix socket path.
+// When set, agents can trigger picobot via the /signal endpoint.
+func WithSignalSocket(socketPath string) func(*Handler) {
+	return func(h *Handler) {
+		h.signalSocketPath = socketPath
+	}
+}
+
+// NewWithSignal creates a Handler with signal forwarding enabled.
+func NewWithSignal(h *hub.Hub, store *session.Store, signalSocketPath string) *Handler {
+	return &Handler{
+		hub:              h,
+		sessionStore:     store,
+		signalSocketPath: signalSocketPath,
 	}
 }
 
@@ -59,6 +78,12 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/files", h.auth(h.listFiles))
 	mux.HandleFunc("GET /sessions/{id}/files/{fileID}", h.auth(h.downloadFile))
 	mux.HandleFunc("DELETE /sessions/{id}/files/{fileID}", h.auth(h.deleteFile))
+
+	// Signal forwarding — lets agents trigger a picobot instance
+	if h.signalSocketPath != "" {
+		mux.HandleFunc("POST /sessions/{id}/signal", h.auth(h.triggerSignal))
+		slog.Info("signal forwarding enabled", "socket", h.signalSocketPath)
+	}
 }
 
 func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -494,6 +519,67 @@ func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("file deleted", "session", sessionID, "file_id", fileID)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// triggerSignal forwards a signal to the configured picobot Unix socket.
+// This lets any authenticated agent wake up picobot with a message.
+func (h *Handler) triggerSignal(w http.ResponseWriter, r *http.Request) {
+	if h.signalSocketPath == "" {
+		http.Error(w, "signal forwarding not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	agentID := getAgentID(r)
+
+	var req struct {
+		Content  string                 `json:"content"`
+		Type     string                 `json:"type,omitempty"`
+		Channel  string                 `json:"channel,omitempty"`
+		ChatID   string                 `json:"chat_id,omitempty"`
+		Priority string                 `json:"priority,omitempty"`
+		Metadata map[string]interface{} `json:"metadata,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Content == "" {
+		http.Error(w, "content is required", http.StatusBadRequest)
+		return
+	}
+
+	// Default signal type
+	sigType := req.Type
+	if sigType == "" {
+		sigType = "agentchat.trigger"
+	}
+
+	sig := signal.Signal{
+		Type:     sigType,
+		Channel:  req.Channel,
+		ChatID:   req.ChatID,
+		Content:  req.Content,
+		Priority: req.Priority,
+		Metadata: req.Metadata,
+	}
+
+	// Add agent context to metadata if not present
+	if sig.Metadata == nil {
+		sig.Metadata = make(map[string]interface{})
+	}
+	sig.Metadata["source_agent"] = agentID
+	sig.Metadata["source"] = "agentchat-mcp"
+
+	resp, err := signal.SendToSocket(h.signalSocketPath, sig)
+	if err != nil {
+		slog.Error("signal forward failed", "agent", agentID, "error", err)
+		http.Error(w, "failed to forward signal: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	slog.Info("signal forwarded", "agent", agentID, "type", sigType, "socket", h.signalSocketPath)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

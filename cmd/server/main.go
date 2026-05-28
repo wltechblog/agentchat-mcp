@@ -43,7 +43,16 @@ func main() {
 	pt := presence.NewTracker(presenceTTL)
 	mb := mailbox.NewStore(mailboxMax)
 	h := hub.New(store, lt, sp, fs, pt, mb, hub.WithDebugLog(debugLog))
-	handler := api.New(h, store)
+
+	// Check for signal socket configuration
+	signalSocketPath := os.Getenv("AGENTCHAT_SIGNAL_SOCKET")
+	var handler *api.Handler
+	if signalSocketPath != "" {
+		handler = api.NewWithSignal(h, store, signalSocketPath)
+		slog.Info("signal forwarding configured", "socket", signalSocketPath)
+	} else {
+		handler = api.New(h, store)
+	}
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)

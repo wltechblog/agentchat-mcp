@@ -78,7 +78,7 @@ func main() {
 		debugLog:     debugLog,
 	}
 
-	server := mcp.NewServer("agentchat-mcp-bridge", "1.0.0")
+	server := mcp.NewServer("agentchat-mcp-bridge", "1.1.0")
 	registerTools(server, bridge)
 
 	slog.Info("bridge started", "agent_id", agentID, "session_id", sessionID, "server", httpBase)
@@ -95,8 +95,8 @@ func (b *Bridge) ensureInit() error {
 	}
 
 	body, _ := json.Marshal(map[string]any{
-		"agent_name":    b.agentName,
-		"capabilities":  b.capabilities,
+		"agent_name":   b.agentName,
+		"capabilities": b.capabilities,
 	})
 	resp, err := b.doRequestLocked("POST", "/sessions/"+b.sessionID+"/register", body)
 	if err != nil {
@@ -810,6 +810,47 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"content_base64": base64.StdEncoding.EncodeToString(fdata),
 		})
 		return string(result), nil
+	})
+
+	// trigger_agent — send a signal to a connected picobot instance
+	s.RegisterTool(mcp.Tool{
+		Name:        "trigger_agent",
+		Description: "Send a trigger signal to a connected picobot agent instance. This wakes up the agent and injects a message into its processing loop. The agent will process the message asynchronously. Use this to have picobot perform tasks on behalf of this agent.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"content":  map[string]any{"type": "string", "description": "The message content to send to the agent"},
+				"type":     map[string]any{"type": "string", "description": "Signal type (default: agentchat.trigger)"},
+				"channel":  map[string]any{"type": "string", "description": "Target channel (e.g., telegram, discord). Leave empty for default."},
+				"chat_id":  map[string]any{"type": "string", "description": "Target chat ID. Leave empty for default."},
+				"priority": map[string]any{"type": "string", "description": "Priority: normal (default) or high"},
+			},
+			"required": []string{"content"},
+		},
+	}, func(args map[string]any) (string, error) {
+		content, _ := args["content"].(string)
+		if content == "" {
+			return "", fmt.Errorf("content is required")
+		}
+
+		sigType, _ := args["type"].(string)
+		if sigType == "" {
+			sigType = "agentchat.trigger"
+		}
+
+		result, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/signal", map[string]any{
+			"content":  content,
+			"type":     sigType,
+			"channel":  args["channel"],
+			"chat_id":  args["chat_id"],
+			"priority": args["priority"],
+		})
+		if err != nil {
+			return "", fmt.Errorf("trigger failed: %w", err)
+		}
+
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 }
 
