@@ -52,7 +52,8 @@ func (b *Bridge) watchStream(ctx context.Context) error {
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 
-	resp, err := b.client.Do(req)
+	// Use sseClient (no timeout) instead of b.client (30s timeout)
+	resp, err := b.sseClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
