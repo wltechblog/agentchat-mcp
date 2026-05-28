@@ -27,6 +27,7 @@ type Bridge struct {
 	agentName    string
 	capabilities []string
 	client       *http.Client
+	sseClient    *http.Client
 
 	mu                sync.Mutex
 	initialized       bool
@@ -81,6 +82,7 @@ func main() {
 		agentName:        agentName,
 		capabilities:     caps,
 		client:           &http.Client{Timeout: 30 * time.Second},
+	sseClient:        &http.Client{},
 		debugLog:         debugLog,
 		signalSocketPath: signalSocketPath,
 	}
