@@ -26,6 +26,13 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 		return
 	}
 
+	// Register with the server immediately so our mailbox exists
+	// before we start watching for incoming messages.
+	if err := b.ensureInit(); err != nil {
+		slog.Error("watcher: failed to register with server on startup", "error", err)
+		// Continue anyway — tools will retry registration on demand
+	}
+
 	// Initialize lastSeq from current history so we skip stale messages on startup.
 	b.initLastSeq(ctx)
 
