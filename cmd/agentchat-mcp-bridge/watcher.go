@@ -105,7 +105,12 @@ type sseEnvelope struct {
 	Sequence int64  `json:"sequence"`
 }
 
-func (b *Bridge) handleSSEEvent(eventType, data string) {
+func (b *Bridge) handleSSEEvent(sseEventType, data string) {
+	// Only process live "message" SSE events, skip history replays and system events
+	if sseEventType != "message" {
+		return
+	}
+
 	var env sseEnvelope
 	if err := json.Unmarshal([]byte(data), &env); err != nil {
 		slog.Debug("watcher: failed to parse SSE data", "error", err)
