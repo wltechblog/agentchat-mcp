@@ -54,14 +54,8 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 // highest sequence number found. This ensures that on startup/reconnect,
 // only genuinely new messages trigger signals.
 func (b *Bridge) initLastSeq(ctx context.Context) {
-	type historyEnvelope struct {
+	type histEntry struct {
 		Sequence int64 `json:"sequence"`
-	}
-	type historyMsg struct {
-		Envelope historyEnvelope `json:"envelope"`
-	}
-	type historyResponse struct {
-		Messages []historyMsg `json:"messages"`
 	}
 
 	url := fmt.Sprintf("%s/sessions/%s/history?limit=50", b.httpBase, b.sessionID)
@@ -85,16 +79,17 @@ func (b *Bridge) initLastSeq(ctx context.Context) {
 		return
 	}
 
-	var hist historyResponse
+	// The API returns a flat JSON array of envelopes, not a wrapped object.
+	var hist []histEntry
 	if err := json.NewDecoder(resp.Body).Decode(&hist); err != nil {
 		slog.Warn("watcher: failed to decode history", "error", err)
 		return
 	}
 
 	var maxSeq int64
-	for _, m := range hist.Messages {
-		if m.Envelope.Sequence > maxSeq {
-			maxSeq = m.Envelope.Sequence
+	for _, m := range hist {
+		if m.Sequence > maxSeq {
+			maxSeq = m.Sequence
 		}
 	}
 
