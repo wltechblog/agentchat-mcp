@@ -120,7 +120,12 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 	// Only signal on messages directed to us or broadcasts
 	switch env.Type {
 	case "message":
-		if env.To != b.agentID {
+		if env.To == "*" {
+			// Broadcast delivered as "message" type with To=*
+			if env.From == b.agentID {
+				return // our own broadcast, skip
+			}
+		} else if env.To != b.agentID {
 			return // not for us
 		}
 	case "broadcast":
