@@ -192,25 +192,94 @@ func (b *Bridge) doJSON(method, path string, payload any) (any, error) {
 	return result, nil
 }
 
-func (b *Bridge) drainMailbox() ([]map[string]any, error) {
-	result, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/mailbox", nil)
+// drainAll fetches messages from both the mailbox (direct messages) and
+// recent history (broadcasts and other messages not delivered to the mailbox),
+// merges them, deduplicates by sequence number, and tags each message with
+// _source ("mailbox" or "history") and _delivery ("direct" or "broadcast").
+func (b *Bridge) drainAll() ([]map[string]any, error) {
+	// Fetch mailbox (direct messages)
+	mailboxResult, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/mailbox", nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch mailbox: %w", err)
 	}
 
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return nil, nil
-	}
-
-	rawMsgs, _ := resultMap["messages"].([]any)
-	msgs := make([]map[string]any, 0, len(rawMsgs))
-	for _, m := range rawMsgs {
-		if m, ok := m.(map[string]any); ok {
-			msgs = append(msgs, m)
+	var mailboxMsgs []map[string]any
+	if resultMap, ok := mailboxResult.(map[string]any); ok {
+		if rawMsgs, ok := resultMap["messages"].([]any); ok {
+			for _, m := range rawMsgs {
+				if m, ok := m.(map[string]any); ok {
+					mailboxMsgs = append(mailboxMsgs, m)
+				}
+			}
 		}
 	}
-	return msgs, nil
+
+	// Fetch recent history for broadcasts and other messages not in mailbox
+	curSeq := lastSeq.Load()
+	histPath := fmt.Sprintf("/sessions/%s/history?after_sequence=%d&limit=50", b.sessionID, curSeq)
+	histResult, err := b.doJSON("GET", histPath, nil)
+	if err != nil {
+		// If history fails, still return mailbox messages
+		slog.Warn("drainAll: failed to fetch history, returning mailbox only", "error", err)
+		for _, m := range mailboxMsgs {
+			m["_source"] = "mailbox"
+			m["_delivery"] = "direct"
+		}
+		return mailboxMsgs, nil
+	}
+
+	// History is a flat JSON array of envelopes
+	var histMsgs []map[string]any
+	if rawArr, ok := histResult.([]any); ok {
+		for _, m := range rawArr {
+			if m, ok := m.(map[string]any); ok {
+				histMsgs = append(histMsgs, m)
+			}
+		}
+	}
+
+	// Build a dedup set from mailbox messages (by sequence number)
+	seen := make(map[int64]bool)
+	for _, m := range mailboxMsgs {
+		if seq, ok := m["sequence"].(float64); ok {
+			seen[int64(seq)] = true
+		}
+		m["_source"] = "mailbox"
+		m["_delivery"] = tagDelivery(m)
+	}
+
+	// Add history messages that aren't already in the mailbox
+	for _, m := range histMsgs {
+		seq := int64(0)
+		if s, ok := m["sequence"].(float64); ok {
+			seq = int64(s)
+		}
+		if seq == 0 || seen[seq] {
+			continue
+		}
+		seen[seq] = true
+		m["_source"] = "history"
+		m["_delivery"] = tagDelivery(m)
+		mailboxMsgs = append(mailboxMsgs, m)
+	}
+
+	return mailboxMsgs, nil
+}
+
+// tagDelivery determines if a message is a "direct" or "broadcast" delivery
+// based on the envelope's "to" field.
+func tagDelivery(m map[string]any) string {
+	// Check if there's an inner envelope
+	if env, ok := m["envelope"].(map[string]any); ok {
+		if to, ok := env["to"].(string); ok && to == "*" {
+			return "broadcast"
+		}
+	}
+	// Check top-level "to" field
+	if to, ok := m["to"].(string); ok && to == "*" {
+		return "broadcast"
+	}
+	return "direct"
 }
 
 func registerTools(s *mcp.Server, b *Bridge) {
@@ -269,7 +338,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call. Returns immediately with whatever is available. For blocking until a message arrives, use wait_for_message instead.",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
-		msgs, err := b.drainMailbox()
+		msgs, err := b.drainAll()
 		if err != nil {
 			return "", err
 		}
@@ -308,7 +377,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		pollInterval := 2 * time.Second
 
 		for {
-			msgs, err := b.drainMailbox()
+			msgs, err := b.drainAll()
 			if err != nil {
 				return "", err
 			}
@@ -396,7 +465,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		pollInterval := 2 * time.Second
 
 		for {
-			msgs, err := b.drainMailbox()
+			msgs, err := b.drainAll()
 			if err != nil {
 				return "", err
 			}
