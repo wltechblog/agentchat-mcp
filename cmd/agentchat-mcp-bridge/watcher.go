@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -17,6 +19,16 @@ import (
 // lastSeq tracks the highest sequence number we've seen, to avoid
 // re-processing old messages on SSE reconnect.
 var lastSeq atomic.Int64
+
+// pendingSignal holds metadata about the message(s) that triggered the last signal,
+// so we can include contextual info when the agent calls receive_messages or wait_for_message.
+var pendingSignal atomic.Pointer[pendingSignalInfo]
+
+type pendingSignalInfo struct {
+	TriggerType string `json:"trigger_type"` // "message", "broadcast", "task_assign", etc.
+	FromAgent   string `json:"from_agent"`
+	Sequence    int64  `json:"sequence"`
+}
 
 // startWatcher connects to the server's SSE /watch endpoint and sends
 // a check_messages signal to picobot whenever a message arrives for this agent.
@@ -61,9 +73,11 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 	}()
 }
 
-// presenceHeartbeat periodically re-registers with the server to keep
+// presenceHeartbeat periodically sends a registration request to keep
 // the agent's presence alive. The server expires agents after 60s of
 // inactivity (presence TTL), so we refresh every 30s.
+// This does NOT reset the initialized flag — it directly calls the
+// register endpoint to touch presence without affecting MCP tool state.
 func (b *Bridge) presenceHeartbeat(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -73,18 +87,44 @@ func (b *Bridge) presenceHeartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Reset initialized flag so ensureInit will re-register
-			b.mu.Lock()
-			b.initialized = false
-			b.mu.Unlock()
-
-			if err := b.ensureInit(); err != nil {
+			if err := b.touchPresence(ctx); err != nil {
 				slog.Warn("watcher: presence heartbeat failed", "error", err)
-			} else {
-				slog.Debug("watcher: presence heartbeat ok")
 			}
 		}
 	}
+}
+
+// touchPresence sends a registration request to refresh the agent's
+// presence TTL on the server. Unlike ensureInit, this doesn't change
+// the bridge's internal initialized state.
+func (b *Bridge) touchPresence(ctx context.Context) error {
+	body, _ := json.Marshal(map[string]any{
+		"agent_name":   b.agentName,
+		"capabilities": b.capabilities,
+	})
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		b.httpBase+"/sessions/"+b.sessionID+"/register", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.psk)
+	req.Header.Set("X-Agent-ID", b.agentID)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		rbody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(rbody))
+	}
+
+	slog.Debug("watcher: presence heartbeat ok")
+	return nil
 }
 
 // initLastSeq fetches the current session history and sets lastSeq to the
@@ -248,18 +288,33 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 		lastSeq.Store(env.Sequence)
 	}
 
+	// Determine a human-friendly trigger type label
+	triggerType := env.Type
+	if env.Type == "message" && env.To == "*" {
+		triggerType = "broadcast"
+	}
+
 	slog.Info("watcher: relevant message detected, sending check_messages signal",
 		"type", env.Type,
 		"from", env.From,
 		"to", env.To,
 		"sequence", env.Sequence,
+		"trigger_type", triggerType,
 	)
+
+	// Store pending signal info so receive_messages/wait_for_message can
+	// report what triggered the signal
+	pendingSignal.Store(&pendingSignalInfo{
+		TriggerType: triggerType,
+		FromAgent:   env.From,
+		Sequence:    env.Sequence,
+	})
 
 	sig := signal.Signal{
 		Source: "agentchat-mcp",
 		Action: "check_messages",
 		Metadata: map[string]interface{}{
-			"trigger_type": env.Type,
+			"trigger_type": triggerType,
 			"from_agent":   env.From,
 			"sequence":     env.Sequence,
 		},
@@ -272,4 +327,9 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 	}
 
 	slog.Info("watcher: signal sent", "response", resp)
+}
+
+// getPendingSignalInfo returns and clears the pending signal metadata.
+func getPendingSignalInfo() *pendingSignalInfo {
+	return pendingSignal.Swap(nil)
 }
