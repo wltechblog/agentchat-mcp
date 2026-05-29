@@ -8,10 +8,15 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/wltechblog/agentchat-mcp/internal/signal"
 )
+
+// lastSeq tracks the highest sequence number we've seen, to avoid
+// re-processing old messages on SSE reconnect.
+var lastSeq atomic.Int64
 
 // startWatcher connects to the server's SSE /watch endpoint and sends
 // a check_messages signal to picobot whenever a message arrives for this agent.
@@ -20,6 +25,9 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 		slog.Info("watcher: no signal socket configured, skipping SSE watch")
 		return
 	}
+
+	// Initialize lastSeq from current history so we skip stale messages on startup.
+	b.initLastSeq(ctx)
 
 	go func() {
 		for {
@@ -40,6 +48,58 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// initLastSeq fetches the current session history and sets lastSeq to the
+// highest sequence number found. This ensures that on startup/reconnect,
+// only genuinely new messages trigger signals.
+func (b *Bridge) initLastSeq(ctx context.Context) {
+	type historyEnvelope struct {
+		Sequence int64 `json:"sequence"`
+	}
+	type historyMsg struct {
+		Envelope historyEnvelope `json:"envelope"`
+	}
+	type historyResponse struct {
+		Messages []historyMsg `json:"messages"`
+	}
+
+	url := fmt.Sprintf("%s/sessions/%s/history?limit=50", b.httpBase, b.sessionID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		slog.Warn("watcher: failed to create history request", "error", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+b.psk)
+	req.Header.Set("X-Agent-ID", b.agentID)
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		slog.Warn("watcher: failed to fetch history for lastSeq init", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		slog.Warn("watcher: history fetch returned non-200", "status", resp.StatusCode)
+		return
+	}
+
+	var hist historyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hist); err != nil {
+		slog.Warn("watcher: failed to decode history", "error", err)
+		return
+	}
+
+	var maxSeq int64
+	for _, m := range hist.Messages {
+		if m.Envelope.Sequence > maxSeq {
+			maxSeq = m.Envelope.Sequence
+		}
+	}
+
+	lastSeq.Store(maxSeq)
+	slog.Info("watcher: initialized lastSeq from history", "lastSeq", maxSeq)
 }
 
 func (b *Bridge) watchStream(ctx context.Context) error {
@@ -117,6 +177,13 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 		return
 	}
 
+	// Skip messages we've already seen (stale replay on reconnect)
+	current := lastSeq.Load()
+	if env.Sequence > 0 && env.Sequence <= current {
+		slog.Debug("watcher: skipping stale message", "seq", env.Sequence, "lastSeq", current)
+		return
+	}
+
 	// Only signal on messages directed to us or broadcasts
 	switch env.Type {
 	case "message":
@@ -142,6 +209,11 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 		return
 	default:
 		return
+	}
+
+	// Update lastSeq to the latest sequence we've processed
+	if env.Sequence > 0 {
+		lastSeq.Store(env.Sequence)
 	}
 
 	slog.Info("watcher: relevant message detected, sending check_messages signal",
