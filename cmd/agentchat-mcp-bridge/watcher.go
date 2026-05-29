@@ -36,6 +36,10 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 	// Initialize lastSeq from current history so we skip stale messages on startup.
 	b.initLastSeq(ctx)
 
+	// Start presence heartbeat to keep agent visible in list_agents.
+	// The server's presence tracker has a 60s TTL, so we refresh every 30s.
+	go b.presenceHeartbeat(ctx)
+
 	go func() {
 		for {
 			select {
@@ -55,6 +59,32 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// presenceHeartbeat periodically re-registers with the server to keep
+// the agent's presence alive. The server expires agents after 60s of
+// inactivity (presence TTL), so we refresh every 30s.
+func (b *Bridge) presenceHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Reset initialized flag so ensureInit will re-register
+			b.mu.Lock()
+			b.initialized = false
+			b.mu.Unlock()
+
+			if err := b.ensureInit(); err != nil {
+				slog.Warn("watcher: presence heartbeat failed", "error", err)
+			} else {
+				slog.Debug("watcher: presence heartbeat ok")
+			}
+		}
+	}
 }
 
 // initLastSeq fetches the current session history and sets lastSeq to the
