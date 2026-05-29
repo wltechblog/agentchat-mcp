@@ -215,6 +215,8 @@ func (c *CLI) run() {
 			return
 		case <-sseDone:
 			fmt.Printf("\n%sSSE connection lost. Reconnecting...%s\n", colorRed, colorReset)
+			// Create a fresh channel for the new goroutine
+			sseDone = make(chan struct{})
 			go c.watchSSE(sseDone)
 		default:
 			if !scanner.Scan() {
