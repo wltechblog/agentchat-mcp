@@ -410,12 +410,12 @@ func (c *CLI) displayEnvelope(eventType string, env protocol.Envelope) {
 	case protocol.TypeAgentJoined:
 		info := parseAgentInfo(env.Payload)
 		fmt.Printf("\n%s%s → %s joined the session%s\n",
-			colorGreen, timestamp, info.AgentName, colorReset)
+			colorGreen, timestamp, info.AgentID, colorReset)
 
 	case protocol.TypeAgentLeft:
 		info := parseAgentInfo(env.Payload)
 		fmt.Printf("\n%s%s ← %s left the session%s\n",
-			colorRed, timestamp, info.AgentName, colorReset)
+			colorRed, timestamp, info.AgentID, colorReset)
 
 	case protocol.TypeMessage:
 		from := env.From
