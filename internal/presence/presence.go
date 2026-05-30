@@ -11,13 +11,12 @@ const defaultTTL = 60 * time.Second
 
 type AgentState struct {
 	AgentID      string
-	AgentName    string
 	SessionID    string
 	Capabilities []string
 	LastSeen     time.Time
 }
 
-type ExpireFunc func(sessionID, agentID, agentName string, capabilities []string)
+type ExpireFunc func(sessionID, agentID string, capabilities []string)
 
 type Tracker struct {
 	mu     sync.RWMutex
@@ -32,7 +31,7 @@ func NewTracker(ttl time.Duration) *Tracker {
 	}
 	return &Tracker{
 		agents: make(map[string]*AgentState),
-		ttl:    ttl,
+		ttl:    defaultTTL,
 		stopCh: make(chan struct{}),
 	}
 }
@@ -41,7 +40,7 @@ func agentKey(sessionID, agentID string) string {
 	return sessionID + "/" + agentID
 }
 
-func (t *Tracker) Touch(sessionID, agentID, agentName string, capabilities []string) bool {
+func (t *Tracker) Touch(sessionID, agentID string, capabilities []string) bool {
 	key := agentKey(sessionID, agentID)
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -54,9 +53,6 @@ func (t *Tracker) Touch(sessionID, agentID, agentName string, capabilities []str
 			SessionID: sessionID,
 		}
 		t.agents[key] = state
-	}
-	if agentName != "" {
-		state.AgentName = agentName
 	}
 	if capabilities != nil {
 		state.Capabilities = capabilities
@@ -84,7 +80,6 @@ func (t *Tracker) GetAgents(sessionID string) []protocol.AgentInfo {
 		if state.SessionID == sessionID && time.Since(state.LastSeen) < t.ttl {
 			agents = append(agents, protocol.AgentInfo{
 				AgentID:      state.AgentID,
-				AgentName:    state.AgentName,
 				Capabilities: state.Capabilities,
 			})
 		}
@@ -129,7 +124,7 @@ func (t *Tracker) sweep(onExpire ExpireFunc) {
 	t.mu.Unlock()
 
 	for _, state := range expired {
-		onExpire(state.SessionID, state.AgentID, state.AgentName, state.Capabilities)
+		onExpire(state.SessionID, state.AgentID, state.Capabilities)
 	}
 }
 

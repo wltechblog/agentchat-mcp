@@ -91,7 +91,6 @@ func NewErrorWithID(sessionID, errMsg, requestID string) Envelope {
 type AuthPayload struct {
 	SessionID    string   `json:"session_id"`
 	AgentID      string   `json:"agent_id"`
-	AgentName    string   `json:"agent_name"`
 	PSK          string   `json:"psk"`
 	Capabilities []string `json:"capabilities,omitempty"`
 	SessionName  string   `json:"session_name,omitempty"`
@@ -99,7 +98,6 @@ type AuthPayload struct {
 
 type AgentInfo struct {
 	AgentID      string   `json:"agent_id"`
-	AgentName    string   `json:"agent_name"`
 	Capabilities []string `json:"capabilities,omitempty"`
 }
 

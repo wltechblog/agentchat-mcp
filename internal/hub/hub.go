@@ -58,8 +58,8 @@ func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *fil
 		opt(h)
 	}
 
-	pt.StartSweep(15*time.Second, func(sessionID, agentID, agentName string, capabilities []string) {
-		h.onAgentExpired(sessionID, agentID, agentName, capabilities)
+	pt.StartSweep(15*time.Second, func(sessionID, agentID string, capabilities []string) {
+		h.onAgentExpired(sessionID, agentID, capabilities)
 	})
 
 	return h
@@ -70,8 +70,8 @@ func (h *Hub) nextSeq(sessionID string) int64 {
 	return h.seqNums[sessionID]
 }
 
-func (h *Hub) Register(sessionID, agentID, agentName string, capabilities []string) bool {
-	isNew := h.presence.Touch(sessionID, agentID, agentName, capabilities)
+func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
+	isNew := h.presence.Touch(sessionID, agentID, capabilities)
 
 	if isNew {
 		slog.Info("agent joined", "session", sessionID, "agent", agentID)
@@ -79,7 +79,7 @@ func (h *Hub) Register(sessionID, agentID, agentName string, capabilities []stri
 			Type:      protocol.TypeAgentJoined,
 			SessionID: sessionID,
 			From:      "server",
-			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, AgentName: agentName, Capabilities: capabilities}),
+			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities}),
 			Timestamp: time.Now().UTC(),
 		}, agentID)
 
@@ -93,16 +93,16 @@ func (h *Hub) Register(sessionID, agentID, agentName string, capabilities []stri
 }
 
 func (h *Hub) RefreshPresence(sessionID, agentID string) {
-	h.presence.Touch(sessionID, agentID, "", nil)
+	h.presence.Touch(sessionID, agentID, nil)
 }
 
-func (h *Hub) onAgentExpired(sessionID, agentID, agentName string, capabilities []string) {
+func (h *Hub) onAgentExpired(sessionID, agentID string, capabilities []string) {
 	slog.Info("agent expired", "session", sessionID, "agent", agentID)
 	h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
 		Type:      protocol.TypeAgentLeft,
 		SessionID: sessionID,
 		From:      "server",
-		Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, AgentName: agentName, Capabilities: capabilities}),
+		Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities}),
 		Timestamp: time.Now().UTC(),
 	}, "")
 
@@ -126,13 +126,17 @@ func (h *Hub) onAgentExpired(sessionID, agentID, agentName string, capabilities 
 }
 
 func (h *Hub) DrainMailbox(sessionID, agentID string) []mailbox.Entry {
-	h.presence.Touch(sessionID, agentID, "", nil)
+	h.presence.Touch(sessionID, agentID, nil)
 	return h.mailboxes.Drain(sessionID + "/" + agentID)
 }
 
 func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawMessage) error {
 	if to == "" {
 		return fmt.Errorf("'to' is required")
+	}
+	// Check that the target agent exists in the session
+	if !h.presence.IsPresent(sessionID, to) {
+		return fmt.Errorf("agent not found in session: %s", to)
 	}
 	env := protocol.Envelope{
 		Type:      msgType,
