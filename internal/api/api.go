@@ -245,21 +245,16 @@ func (h *Handler) registerAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		AgentName    string   `json:"agent_name"`
 		Capabilities []string `json:"capabilities"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	agentName := req.AgentName
-	if agentName == "" {
-		agentName = agentID
-	}
 	caps := req.Capabilities
 	if caps == nil {
 		caps = []string{}
 	}
 
-	isNew := h.hub.Register(sessionID, agentID, agentName, caps)
+	isNew := h.hub.Register(sessionID, agentID, caps)
 
 	// Notify watchers of agent join
 	if isNew {
@@ -267,7 +262,7 @@ func (h *Handler) registerAgent(w http.ResponseWriter, r *http.Request) {
 			Type:      protocol.TypeAgentJoined,
 			SessionID: sessionID,
 			From:      "server",
-			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, AgentName: agentName, Capabilities: caps}),
+			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: caps}),
 			Timestamp: time.Now().UTC(),
 		})
 	}
@@ -635,8 +630,7 @@ func (h *Handler) listWatchSessions(w http.ResponseWriter, r *http.Request) {
 		agentList := make([]map[string]any, 0, len(agents))
 		for _, a := range agents {
 			agentList = append(agentList, map[string]any{
-				"id":   a.AgentID,
-				"name": a.AgentName,
+				"id": a.AgentID,
 			})
 		}
 		out = append(out, map[string]any{

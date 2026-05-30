@@ -24,7 +24,6 @@ type Bridge struct {
 	sessionID    string
 	psk          string
 	agentID      string
-	agentName    string
 	capabilities []string
 	client       *http.Client
 	sseClient    *http.Client
@@ -42,7 +41,6 @@ func main() {
 	sessionID := requireEnv("AGENTCHAT_SESSION_ID")
 	psk := requireEnv("AGENTCHAT_PSK")
 	agentID := requireEnv("AGENTCHAT_AGENT_ID")
-	agentName := envOrDefault("AGENTCHAT_AGENT_NAME", agentID)
 	capsStr := envOrDefault("AGENTCHAT_CAPABILITIES", "")
 	debugStr := envOrDefault("AGENTCHAT_DEBUG", "")
 	var debugLog bool
@@ -79,7 +77,6 @@ func main() {
 		sessionID:        sessionID,
 		psk:              psk,
 		agentID:          agentID,
-		agentName:        agentName,
 		capabilities:     caps,
 		client:           &http.Client{Timeout: 30 * time.Second},
 	sseClient:        &http.Client{},
@@ -110,7 +107,6 @@ func (b *Bridge) ensureInit() error {
 	}
 
 	body, _ := json.Marshal(map[string]any{
-		"agent_name":   b.agentName,
 		"capabilities": b.capabilities,
 	})
 	resp, err := b.doRequestLocked("POST", "/sessions/"+b.sessionID+"/register", body)

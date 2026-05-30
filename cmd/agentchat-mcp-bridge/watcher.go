@@ -99,7 +99,6 @@ func (b *Bridge) presenceHeartbeat(ctx context.Context) {
 // the bridge's internal initialized state.
 func (b *Bridge) touchPresence(ctx context.Context) error {
 	body, _ := json.Marshal(map[string]any{
-		"agent_name":   b.agentName,
 		"capabilities": b.capabilities,
 	})
 
