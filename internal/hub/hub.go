@@ -200,6 +200,19 @@ func (h *Hub) DrainMailbox(sessionID, agentID string) []mailbox.Entry {
 	return h.mailboxes.Drain(sessionID + "/" + agentID)
 }
 
+// DrainMailboxFiltered drains entries matching from/type; with wait > 0 it
+// long-polls server-side until a match arrives or the wait elapses.
+// Non-matching entries stay queued — a filtered wait never destroys mail it
+// didn't want.
+func (h *Hub) DrainMailboxFiltered(sessionID, agentID string, wait time.Duration, from, msgType string) []mailbox.Entry {
+	h.presence.Touch(sessionID, agentID, nil)
+	key := sessionID + "/" + agentID
+	if wait <= 0 && from == "" && msgType == "" {
+		return h.mailboxes.Drain(key)
+	}
+	return h.mailboxes.DrainMatchingWait(key, from, msgType, wait)
+}
+
 func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawMessage) error {
 	if to == "" {
 		return fmt.Errorf("'to' is required")

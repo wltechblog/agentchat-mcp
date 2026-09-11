@@ -31,7 +31,11 @@ type Handler struct {
 	hub             *hub.Hub
 	sessionStore    *session.Store
 	watcher         *Watcher
+	tokens          *watchTokenStore
 	ssePingInterval time.Duration
+	// maxWatchersPerSession caps concurrent SSE streams per session so a
+	// misbehaving client can't pin unbounded server resources.
+	maxWatchersPerSession int
 }
 
 func New(h *hub.Hub, store *session.Store) *Handler {
@@ -40,10 +44,12 @@ func New(h *hub.Hub, store *session.Store) *Handler {
 	// API handlers never notify watchers directly.
 	h.SetNotifier(w.Notify)
 	return &Handler{
-		hub:             h,
-		sessionStore:    store,
-		watcher:         w,
-		ssePingInterval: 15 * time.Second,
+		hub:                   h,
+		sessionStore:          store,
+		watcher:               w,
+		tokens:                newWatchTokenStore(time.Hour),
+		ssePingInterval:       15 * time.Second,
+		maxWatchersPerSession: 64,
 	}
 }
 
@@ -52,6 +58,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions", h.listSessions)
 	mux.HandleFunc("GET /sessions/{id}", h.getSession)
 	mux.HandleFunc("DELETE /sessions/{id}", h.deleteSession)
+	mux.HandleFunc("GET /healthz", h.healthz)
 
 	mux.HandleFunc("POST /sessions/{id}/register", h.registerAgent)
 	mux.HandleFunc("POST /sessions/{id}/messages", h.auth(h.sendMessage))
@@ -70,34 +77,45 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/files/{fileID}", h.auth(h.downloadFile))
 	mux.HandleFunc("DELETE /sessions/{id}/files/{fileID}", h.auth(h.deleteFile))
 
-	// SSE watch endpoints — PSK via query param
+	// SSE watch endpoint. Preferred auth: short-lived watch token issued by
+	// register (PSKs must not travel in URLs). Header-auth PSK still accepted
+	// for backward compatibility.
 	mux.HandleFunc("GET /watch", h.authQuery(handleSSE(h)))
-	mux.HandleFunc("GET /watch/sessions", h.authQuery(h.listWatchSessions))
 }
 
-// authQuery validates PSK from query parameter (for SSE connections that can't set headers easily)
+// healthz is an unauthenticated liveness probe.
+func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// authQuery validates watch credentials from query parameters (SSE
+// connections cannot always set headers). A `token` issued by register is
+// preferred; a PSK is accepted for backward compatibility. Sessions are
+// never created here — authentication only ever validates.
 func (h *Handler) authQuery(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		psk := r.URL.Query().Get("psk")
 		sessionID := r.URL.Query().Get("session")
-
-		if psk == "" || sessionID == "" {
-			http.Error(w, "psk and session query parameters required", http.StatusUnauthorized)
+		if sessionID == "" {
+			http.Error(w, "session query parameter required", http.StatusUnauthorized)
 			return
 		}
 
-		// Try to validate against existing session first
-		sess, ok := h.sessionStore.ValidatePSK(sessionID, psk)
-		if !ok {
-			// Session may not exist yet (server restarted or SSE connects before register).
-			// Auto-create like registerAgent does, so the SSE connection can proceed.
-			sess, _, _ = h.sessionStore.GetOrCreate(sessionID, psk, "")
-			if sess == nil {
-				http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
+		if token := r.URL.Query().Get("token"); token != "" {
+			if !h.tokens.Validate(token, sessionID) {
+				http.Error(w, "invalid or expired watch token", http.StatusUnauthorized)
 				return
 			}
+			ctx := context.WithValue(r.Context(), ctxKeySession, sessionID)
+			next(w, r.WithContext(ctx))
+			return
 		}
 
+		psk := r.URL.Query().Get("psk")
+		sess, ok := h.sessionStore.ValidatePSK(sessionID, psk)
+		if !ok {
+			http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
+			return
+		}
 		ctx := context.WithValue(r.Context(), ctxKeySession, sess.ID)
 		next(w, r.WithContext(ctx))
 	}
@@ -126,12 +144,13 @@ func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 
 		sess, ok := h.sessionStore.ValidatePSK(sessionID, psk)
 		if !ok {
-			// Auto-create session if it doesn't exist (server may have restarted)
-			sess, _, _ = h.sessionStore.GetOrCreate(sessionID, psk, "")
-			if sess == nil {
-				http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
-				return
-			}
+			// No auto-create here: authentication only validates. Sessions
+			// are created by POST /sessions or explicitly via
+			// POST /sessions/{id}/register, which checks the PSK it creates
+			// with. Accepting any caller-supplied PSK on every request would
+			// let anyone claim any session ID that isn't currently in memory.
+			http.Error(w, "invalid session or PSK", http.StatusUnauthorized)
+			return
 		}
 
 		h.hub.RefreshPresence(sessionID, agentID)
@@ -179,11 +198,19 @@ func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) {
 	sessions := h.sessionStore.List()
 	out := make([]map[string]any, 0, len(sessions))
 	for _, s := range sessions {
+		agentList := make([]map[string]any, 0)
+		for _, a := range h.hub.GetSessionAgents(s.ID) {
+			agentList = append(agentList, map[string]any{
+				"id":     a.AgentID,
+				"online": a.Online,
+			})
+		}
 		out = append(out, map[string]any{
 			"id":          s.ID,
 			"name":        s.Name,
 			"created_at":  s.CreatedAt,
-			"agent_count": len(h.hub.GetSessionAgents(s.ID)),
+			"agent_count": len(agentList),
+			"agents":      agentList,
 			"leader_id":   h.hub.GetLeader(s.ID),
 		})
 	}
@@ -264,9 +291,10 @@ func (h *Handler) registerAgent(w http.ResponseWriter, r *http.Request) {
 	h.hub.Register(sessionID, agentID, caps)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":    "registered",
-		"leader_id": h.hub.GetLeader(sessionID),
-		"agents":    h.hub.GetSessionAgents(sessionID),
+		"status":      "registered",
+		"leader_id":   h.hub.GetLeader(sessionID),
+		"agents":      h.hub.GetSessionAgents(sessionID),
+		"watch_token": h.tokens.Issue(sessionID),
 	})
 }
 
@@ -329,7 +357,26 @@ func (h *Handler) drainMailbox(w http.ResponseWriter, r *http.Request) {
 	sessionID := getSessionID(r)
 	agentID := getAgentID(r)
 
-	entries := h.hub.DrainMailbox(sessionID, agentID)
+	// Optional server-side long-poll: wait=N (seconds, capped) holds the
+	// request until a matching message arrives. from/type filter the drain —
+	// non-matching messages stay queued instead of being destroyed.
+	q := r.URL.Query()
+	waitSec, _ := strconv.Atoi(q.Get("wait"))
+	if waitSec < 0 {
+		waitSec = 0
+	}
+	if waitSec > 30 {
+		waitSec = 30
+	}
+	from := q.Get("from")
+	msgType := q.Get("type")
+
+	var wait time.Duration
+	if waitSec > 0 || from != "" || msgType != "" {
+		wait = time.Duration(waitSec) * time.Second
+	}
+	entries := h.hub.DrainMailboxFiltered(sessionID, agentID, wait, from, msgType)
+
 	if entries == nil {
 		entries = []mailbox.Entry{}
 	}
@@ -539,10 +586,19 @@ func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// listWatchSessions was removed: the public GET /sessions listing now
+// includes the same agent detail, and the old endpoint's auth was
+// unenforceable (it had to accept any PSK to be useful for discovery).
+
 // SSE handler for watching real-time messages
 func handleSSE(h *Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.URL.Query().Get("session")
+
+		if h.watcher.Count(sessionID) >= h.maxWatchersPerSession {
+			http.Error(w, "too many watchers for session", http.StatusTooManyRequests)
+			return
+		}
 
 		// Set SSE headers
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -609,29 +665,6 @@ func handleSSE(h *Handler) http.HandlerFunc {
 			}
 		}
 	}
-}
-
-// listWatchSessions lists available sessions (used by CLI client)
-func (h *Handler) listWatchSessions(w http.ResponseWriter, r *http.Request) {
-	sessions := h.sessionStore.List()
-	out := make([]map[string]any, 0, len(sessions))
-	for _, s := range sessions {
-		agents := h.hub.GetSessionAgents(s.ID)
-		agentList := make([]map[string]any, 0, len(agents))
-		for _, a := range agents {
-			agentList = append(agentList, map[string]any{
-				"id":     a.AgentID,
-				"online": a.Online,
-			})
-		}
-		out = append(out, map[string]any{
-			"id":          s.ID,
-			"name":        s.Name,
-			"agent_count": len(agents),
-			"agents":      agentList,
-		})
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -36,9 +37,9 @@ type Bridge struct {
 	// signalCh coalesces wake-up requests for the signal loop (capacity 1,
 	// non-blocking sends). Only used when signalSocketPath is set.
 	signalCh chan struct{}
-	// holdback keeps messages drained from the server but not yet accepted
-	// by a filtered wait, so wait_for_message filters never destroy them.
-	holdback holdbackBuffer
+	// watchToken is a short-lived token issued by register so /watch URLs
+	// don't carry the PSK. Guarded by mu.
+	watchToken string
 }
 
 func main() {
@@ -128,9 +129,42 @@ func (b *Bridge) ensureInit() error {
 		return fmt.Errorf("register failed (%d): %s", resp.StatusCode, string(rbody))
 	}
 
+	var regResp struct {
+		WatchToken string `json:"watch_token"`
+	}
+	json.NewDecoder(resp.Body).Decode(&regResp)
+	b.watchToken = regResp.WatchToken
+
 	b.initialized = true
 	slog.Info("registered with server")
 	return nil
+}
+
+// getWatchToken returns the current watch token.
+func (b *Bridge) getWatchToken() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.watchToken
+}
+
+// setWatchToken stores a freshly issued watch token.
+func (b *Bridge) setWatchToken(token string) {
+	if token == "" {
+		return
+	}
+	b.mu.Lock()
+	b.watchToken = token
+	b.mu.Unlock()
+}
+
+// invalidateRegistration forgets registration state so the next request
+// re-registers (and picks up a fresh watch token) — used when the server
+// rejects our credentials, e.g. after a server restart.
+func (b *Bridge) invalidateRegistration() {
+	b.mu.Lock()
+	b.initialized = false
+	b.watchToken = ""
+	b.mu.Unlock()
 }
 
 func (b *Bridge) doRequest(method, path string, body []byte) (*http.Response, error) {
@@ -196,94 +230,53 @@ func (b *Bridge) doJSON(method, path string, payload any) (any, error) {
 	return result, nil
 }
 
-// holdbackCap bounds the holdback buffer; beyond it the oldest held-back
-// messages are dropped (each one was already delivered to a filtered wait
-// that didn't want it, and receive_messages frees space).
-const holdbackCap = 1000
-
-// holdbackBuffer keeps messages that were drained from the server mailbox but
-// did not match a filtered wait_for_message, so filtered waits never destroy
-// them. The next drainAll returns them alongside fresh mail.
-type holdbackBuffer struct {
-	mu   sync.Mutex
-	msgs []map[string]any
-}
-
-func (h *holdbackBuffer) add(msgs []map[string]any) {
-	if len(msgs) == 0 {
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.msgs = append(h.msgs, msgs...)
-	if len(h.msgs) > holdbackCap {
-		dropped := len(h.msgs) - holdbackCap
-		h.msgs = h.msgs[dropped:]
-		slog.Warn("holdback overflow, dropping oldest held-back messages", "dropped", dropped)
+// tagMessages stamps provenance fields the agent can read: _source is always
+// "mailbox" (the mailbox is the single delivery record) and _delivery says
+// whether the envelope was a direct message or a broadcast.
+func tagMessages(msgs []map[string]any) {
+	for _, m := range msgs {
+		m["_source"] = "mailbox"
+		m["_delivery"] = tagDelivery(m)
 	}
 }
 
-func (h *holdbackBuffer) take() []map[string]any {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	msgs := h.msgs
-	h.msgs = nil
-	return msgs
-}
+// pollMailbox drains the agent's mailbox via the server-side long-poll
+// endpoint. With wait > 0 the server holds the request until a matching
+// message arrives; with from/type filters, non-matching messages stay queued
+// server-side — a filtered wait never destroys mail it didn't want.
+func (b *Bridge) pollMailbox(wait time.Duration, from, msgType string) ([]map[string]any, error) {
+	path := fmt.Sprintf("/sessions/%s/mailbox?wait=%d", b.sessionID, int(wait.Seconds()))
+	if from != "" {
+		path += "&from=" + url.QueryEscape(from)
+	}
+	if msgType != "" {
+		path += "&type=" + url.QueryEscape(msgType)
+	}
 
-// drainAll returns everything currently waiting for the agent: messages held
-// back by earlier filtered waits, plus a fresh destructive drain of the
-// server-side mailbox.
-//
-// The mailbox is the single source of truth. The server delivers every
-// message addressed to this agent to the mailbox — including while the agent
-// is offline — so the old mailbox+history merge is unnecessary, and merging
-// history was actively harmful: it re-delivered stale copies of the session's
-// (other agents' private) traffic on every poll.
-func (b *Bridge) drainAll() ([]map[string]any, error) {
-	held := b.holdback.take()
-
-	mailboxResult, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/mailbox", nil)
+	result, err := b.doJSON("GET", path, nil)
 	if err != nil {
-		// Put held-back messages back so nothing is lost to a failed poll.
-		b.holdback.add(held)
 		return nil, fmt.Errorf("fetch mailbox: %w", err)
 	}
 
-	var mailboxMsgs []map[string]any
-	if resultMap, ok := mailboxResult.(map[string]any); ok {
+	var msgs []map[string]any
+	if resultMap, ok := result.(map[string]any); ok {
 		if rawMsgs, ok := resultMap["messages"].([]any); ok {
 			for _, m := range rawMsgs {
 				if m, ok := m.(map[string]any); ok {
-					mailboxMsgs = append(mailboxMsgs, m)
+					msgs = append(msgs, m)
 				}
 			}
 		}
 	}
-
-	for _, m := range mailboxMsgs {
-		m["_source"] = "mailbox"
-		m["_delivery"] = tagDelivery(m)
-	}
-
-	return append(held, mailboxMsgs...), nil
+	tagMessages(msgs)
+	return msgs, nil
 }
 
-// partitionMessages splits drained messages into those matching a
-// wait_for_message filter (matched on the inner envelope's from/type) and
-// the rest. The rest must be held back, not discarded.
-func partitionMessages(msgs []map[string]any, from, msgType string) (matched, rest []map[string]any) {
-	for _, m := range msgs {
-		env, _ := m["envelope"].(map[string]any)
-		envFrom, _ := env["from"].(string)
-		envType, _ := env["type"].(string)
-		if (from == "" || envFrom == from) && (msgType == "" || envType == msgType) {
-			matched = append(matched, m)
-		} else {
-			rest = append(rest, m)
-		}
-	}
-	return matched, rest
+// drainAll returns everything currently waiting for the agent: a full,
+// immediate drain of the server-side mailbox. The mailbox is the single
+// source of truth; history catch-up is the explicit request_history tool.
+func (b *Bridge) drainAll() ([]map[string]any, error) {
+	return b.pollMailbox(0, "", "")
 }
 
 // tagDelivery determines if a message is a "direct" or "broadcast" delivery.
@@ -388,39 +381,32 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		if timeoutSec > 600 {
 			timeoutSec = 600
 		}
-		timeout := time.Duration(timeoutSec * float64(time.Second))
+		deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
 
 		filterFrom, _ := args["from"].(string)
 		filterType, _ := args["type"].(string)
 
-		deadline := time.Now().Add(timeout)
-		pollInterval := 2 * time.Second
-
+		// Server-side long-poll: each request blocks up to 25s until a
+		// matching message arrives, so there is no client polling loop and
+		// no risk of destroying non-matching mail.
+		const pollWait = 25 * time.Second
 		for {
-			msgs, err := b.drainAll()
-			if err != nil {
-				return "", err
+			wait := pollWait
+			if remaining := time.Until(deadline); remaining < wait {
+				wait = remaining
 			}
-
-			matched, rest := partitionMessages(msgs, filterFrom, filterType)
-			if len(matched) > 0 {
-				// Keep everything that didn't match for the next drain.
-				b.holdback.add(rest)
-				data, _ := json.Marshal(matched)
-				return string(data), nil
-			}
-			b.holdback.add(rest)
-
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
+			if wait <= 0 {
 				return "[]", nil
 			}
 
-			sleep := pollInterval
-			if remaining < sleep {
-				sleep = remaining
+			msgs, err := b.pollMailbox(wait, filterFrom, filterType)
+			if err != nil {
+				return "", err
 			}
-			time.Sleep(sleep)
+			if len(msgs) > 0 {
+				data, _ := json.Marshal(msgs)
+				return string(data), nil
+			}
 		}
 	})
 
@@ -449,7 +435,6 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		if timeoutSec > 600 {
 			timeoutSec = 600
 		}
-		timeout := time.Duration(timeoutSec * float64(time.Second))
 
 		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
 			"to":      to,
@@ -460,33 +445,28 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			return "", fmt.Errorf("send failed: %w", err)
 		}
 
-		deadline := time.Now().Add(timeout)
-		pollInterval := 2 * time.Second
+		deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
 
+		// Long-poll for a reply from the target agent; other messages stay
+		// queued server-side.
+		const pollWait = 25 * time.Second
 		for {
-			msgs, err := b.drainAll()
-			if err != nil {
-				return "", err
+			wait := pollWait
+			if remaining := time.Until(deadline); remaining < wait {
+				wait = remaining
 			}
-
-			matched, rest := partitionMessages(msgs, to, "")
-			if len(matched) > 0 {
-				b.holdback.add(rest)
-				data, _ := json.Marshal(matched)
-				return string(data), nil
-			}
-			b.holdback.add(rest)
-
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
+			if wait <= 0 {
 				return "[]", nil
 			}
 
-			sleep := pollInterval
-			if remaining < sleep {
-				sleep = remaining
+			msgs, err := b.pollMailbox(wait, to, "")
+			if err != nil {
+				return "", err
 			}
-			time.Sleep(sleep)
+			if len(msgs) > 0 {
+				data, _ := json.Marshal(msgs)
+				return string(data), nil
+			}
 		}
 	})
 

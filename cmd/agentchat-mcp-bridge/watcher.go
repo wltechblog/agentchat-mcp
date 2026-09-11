@@ -133,10 +133,22 @@ func (b *Bridge) touchPresence(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		// Server doesn't know us (restart); re-register on the next attempt.
+		b.invalidateRegistration()
+		return fmt.Errorf("heartbeat unauthorized; registration invalidated")
+	case resp.StatusCode != http.StatusOK:
 		rbody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(rbody))
 	}
+
+	// Each register renews the short-lived watch token.
+	var regResp struct {
+		WatchToken string `json:"watch_token"`
+	}
+	json.NewDecoder(resp.Body).Decode(&regResp)
+	b.setWatchToken(regResp.WatchToken)
 
 	slog.Debug("watcher: presence heartbeat ok")
 	return nil
@@ -226,6 +238,15 @@ func (b *Bridge) sseLoop(ctx context.Context) {
 // arrive for sseWatchdogTimeout, converting a silently-dead connection into
 // a reconnect instead of a forever-blocked read.
 func (b *Bridge) watchStream(ctx context.Context) error {
+	// The watch token comes from register. Without one — fresh start, or
+	// the server restarted and forgot everything — register first; that also
+	// re-creates the session if needed.
+	if b.getWatchToken() == "" {
+		if err := b.ensureInit(); err != nil {
+			return fmt.Errorf("register for watch token: %w", err)
+		}
+	}
+
 	// Re-sync the stale-skip watermark before connecting.
 	b.initLastSeq(ctx)
 
@@ -233,7 +254,7 @@ func (b *Bridge) watchStream(ctx context.Context) error {
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	url := fmt.Sprintf("%s/watch?session=%s&psk=%s", b.httpBase, b.sessionID, b.psk)
+	url := fmt.Sprintf("%s/watch?session=%s&token=%s", b.httpBase, b.sessionID, b.getWatchToken())
 
 	req, err := http.NewRequestWithContext(streamCtx, "GET", url, nil)
 	if err != nil {
@@ -250,7 +271,12 @@ func (b *Bridge) watchStream(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		// Token expired or server forgot it; re-register on the next attempt.
+		b.invalidateRegistration()
+		return fmt.Errorf("watch unauthorized; registration invalidated for retry")
+	case resp.StatusCode != http.StatusOK:
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 

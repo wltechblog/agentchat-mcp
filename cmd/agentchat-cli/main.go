@@ -69,6 +69,8 @@ type CLI struct {
 	// same envelope arriving via history replay, live SSE, and mailbox
 	// drain. Only touched from the watch goroutine.
 	lastSeq int64
+	// watchToken is issued by register so /watch URLs don't carry the PSK.
+	watchToken string
 }
 
 func main() {
@@ -176,7 +178,8 @@ func (c *CLI) doJSON(method, path string, payload any) (any, error) {
 }
 
 func (c *CLI) listSessions() {
-	resp, err := c.doRequest("GET", "/watch/sessions?session=list&psk=list", nil)
+	// GET /sessions is public and includes the agent roster.
+	resp, err := c.doRequest("GET", "/sessions", nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -187,14 +190,9 @@ func (c *CLI) listSessions() {
 }
 
 func (c *CLI) run() {
-	// Register as an agent
-	_, err := c.doJSON("POST", "/sessions/"+c.sessionID+"/register", map[string]any{
-		"capabilities": []string{"chat", "human"},
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to register: %v\n", err)
-		os.Exit(1)
-	}
+	// Register as an agent; the response includes a watch token so the SSE
+	// URL never has to carry the PSK.
+	c.register()
 
 	fmt.Printf("%s%s╔══════════════════════════════════════════════════╗%s\n", colorBold, colorCyan, colorReset)
 	fmt.Printf("%s%s║  AgentChat CLI — connected to session %s%s%s%s ║%s\n",
@@ -235,6 +233,22 @@ func (c *CLI) run() {
 	}
 }
 
+// register (re)registers this agent and refreshes the watch token.
+func (c *CLI) register() error {
+	result, err := c.doJSON("POST", "/sessions/"+c.sessionID+"/register", map[string]any{
+		"capabilities": []string{"chat", "human"},
+	})
+	if err != nil {
+		return err
+	}
+	if m, ok := result.(map[string]any); ok {
+		if tok, ok := m["watch_token"].(string); ok {
+			c.watchToken = tok
+		}
+	}
+	return nil
+}
+
 // heartbeatLoop keeps the CLI's presence alive; the server expires agents
 // after 60s of inactivity, and an idle human at the terminal is exactly the
 // kind of agent that would otherwise vanish.
@@ -247,9 +261,7 @@ func (c *CLI) heartbeatLoop(quit <-chan struct{}) {
 		case <-quit:
 			return
 		case <-ticker.C:
-			if _, err := c.doJSON("POST", "/sessions/"+c.sessionID+"/register", map[string]any{
-				"capabilities": []string{"chat", "human"},
-			}); err != nil {
+			if err := c.register(); err != nil {
 				fmt.Fprintf(os.Stderr, "%sheartbeat failed: %v%s\n", colorDim, err, colorReset)
 			}
 		}
@@ -444,7 +456,15 @@ func (p *sseParser) feed(line string) (sseFrame, bool) {
 }
 
 func (c *CLI) watchSSE(quit <-chan struct{}) error {
-	url := fmt.Sprintf("%s/watch?session=%s&psk=%s", c.serverURL, c.sessionID, c.psk)
+	// Prefer the short-lived watch token; fall back to the PSK for servers
+	// that don't issue tokens.
+	var auth string
+	if c.watchToken != "" {
+		auth = "token=" + c.watchToken
+	} else {
+		auth = "psk=" + c.psk
+	}
+	url := fmt.Sprintf("%s/watch?session=%s&%s", c.serverURL, c.sessionID, auth)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {

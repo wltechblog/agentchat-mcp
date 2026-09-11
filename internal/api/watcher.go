@@ -45,6 +45,13 @@ func (w *Watcher) Unsubscribe(sessionID string, ch chan protocol.Envelope) {
 	w.mu.Unlock()
 }
 
+// Count returns the number of live subscribers for a session.
+func (w *Watcher) Count(sessionID string) int {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return len(w.subs[sessionID])
+}
+
 // Notify sends an envelope to all subscribers of a session.
 //
 // The read lock is held for the entire loop so Unsubscribe cannot remove a

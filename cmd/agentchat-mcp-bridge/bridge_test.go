@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -54,62 +56,6 @@ func TestTagDelivery(t *testing.T) {
 	}
 }
 
-func TestPartitionMessages(t *testing.T) {
-	msgs := []map[string]any{
-		envelope("agent-b", "a1", "message", 1),
-		envelope("agent-c", "a1", "message", 2),
-		envelope("agent-b", "a1", "task_result", 3),
-		envelope("agent-c", "", "broadcast", 4),
-	}
-
-	matched, rest := partitionMessages(msgs, "agent-b", "")
-	if len(matched) != 2 || len(rest) != 2 {
-		t.Fatalf("expected 2 matched / 2 rest, got %d / %d", len(matched), len(rest))
-	}
-
-	matched, rest = partitionMessages(msgs, "", "broadcast")
-	if len(matched) != 1 || len(rest) != 3 {
-		t.Fatalf("expected 1 broadcast matched, got %d matched / %d rest", len(matched), len(rest))
-	}
-
-	// Empty filters match everything.
-	matched, rest = partitionMessages(msgs, "", "")
-	if len(matched) != 4 || len(rest) != 0 {
-		t.Fatalf("expected all matched with empty filters, got %d / %d", len(matched), len(rest))
-	}
-}
-
-func TestHoldbackBuffer(t *testing.T) {
-	var h holdbackBuffer
-	if got := h.take(); len(got) != 0 {
-		t.Fatalf("expected empty holdback, got %d", len(got))
-	}
-
-	h.add([]map[string]any{{"n": 1}, {"n": 2}})
-	h.add([]map[string]any{{"n": 3}})
-	got := h.take()
-	if len(got) != 3 || got[0]["n"] != 1 {
-		t.Fatalf("expected FIFO [1 2 3], got %v", got)
-	}
-	if got := h.take(); len(got) != 0 {
-		t.Fatalf("expected holdback drained, got %d", len(got))
-	}
-
-	// Overflow drops the oldest.
-	for i := 0; i < holdbackCap+5; i++ {
-		h.add([]map[string]any{{"n": i}})
-	}
-	got = h.take()
-	if len(got) != holdbackCap {
-		t.Fatalf("expected holdback capped at %d, got %d", holdbackCap, len(got))
-	}
-	if got[0]["n"] != 5 {
-		t.Fatalf("expected 5 oldest entries dropped, first entry is %v", got[0]["n"])
-	}
-}
-
-// TestDrainAllMailboxOnly verifies drainAll reads only the mailbox — merging
-// history re-delivered other agents' private traffic on every poll.
 func TestDrainAllMailboxOnly(t *testing.T) {
 	var historyHits atomic.Int32
 	mux := http.NewServeMux()
@@ -140,45 +86,6 @@ func TestDrainAllMailboxOnly(t *testing.T) {
 	}
 	if hits := historyHits.Load(); hits != 0 {
 		t.Fatalf("drainAll must not fetch history, got %d history calls", hits)
-	}
-}
-
-// TestDrainAllHoldbackRoundTrip: messages held back by a filtered wait must
-// survive a failed poll and be returned by the next successful one.
-func TestDrainAllHoldbackRoundTrip(t *testing.T) {
-	var fail atomic.Bool
-	fail.Store(true)
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /sessions/s1/mailbox", func(w http.ResponseWriter, r *http.Request) {
-		if fail.Load() {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"messages": []map[string]any{envelope("agent-b", "a1", "message", 9)},
-		})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	b := testBridge(srv)
-	b.holdback.add([]map[string]any{{"held": true}})
-
-	if _, err := b.drainAll(); err == nil {
-		t.Fatal("expected error while mailbox endpoint fails")
-	}
-
-	fail.Store(false)
-	msgs, err := b.drainAll()
-	if err != nil {
-		t.Fatalf("drainAll: %v", err)
-	}
-	if len(msgs) != 2 {
-		t.Fatalf("expected held-back + fresh message, got %d", len(msgs))
-	}
-	if msgs[0]["held"] != true {
-		t.Fatalf("expected held-back message first, got %v", msgs[0])
 	}
 }
 
@@ -298,4 +205,77 @@ func TestHandleSSEEventSignalsOnSystemEvents(t *testing.T) {
 
 	b.handleSSEEvent("message", envJSON("message", "agent-b", "a1", 5))
 	expectSignal("direct message")
+}
+
+// TestEnsureInitCapturesWatchToken: register issues a short-lived watch
+// token so /watch URLs never carry the PSK; the bridge must store it and be
+// able to drop it when the server rejects it.
+func TestEnsureInitCapturesWatchToken(t *testing.T) {
+	var registerHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /sessions/s1/register", func(w http.ResponseWriter, r *http.Request) {
+		registerHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":      "registered",
+			"watch_token": fmt.Sprintf("tok-%d", registerHits.Load()),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := testBridge(srv)
+	b.initialized = false
+
+	if err := b.ensureInit(); err != nil {
+		t.Fatalf("ensureInit: %v", err)
+	}
+	if got := b.getWatchToken(); got != "tok-1" {
+		t.Fatalf("expected watch token tok-1, got %q", got)
+	}
+
+	// A server-side rejection must drop registration state so the next call
+	// re-registers with fresh credentials.
+	b.invalidateRegistration()
+	if got := b.getWatchToken(); got != "" {
+		t.Fatalf("expected watch token cleared on invalidate, got %q", got)
+	}
+	if err := b.ensureInit(); err != nil {
+		t.Fatalf("ensureInit after invalidate: %v", err)
+	}
+	if got := b.getWatchToken(); got != "tok-2" {
+		t.Fatalf("expected fresh token tok-2, got %q", got)
+	}
+}
+
+// TestPollMailboxFiltered: filtered drains hit the long-poll endpoint with
+// the filters encoded as query params.
+func TestPollMailboxFiltered(t *testing.T) {
+	var gotQuery url.Values
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /sessions/s1/mailbox", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"messages": []map[string]any{envelope("agent-b", "a1", "task_result", 3)},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := testBridge(srv)
+	msgs, err := b.pollMailbox(25*time.Second, "agent-b", "task_result")
+	if err != nil {
+		t.Fatalf("pollMailbox: %v", err)
+	}
+
+	if gotQuery.Get("from") != "agent-b" || gotQuery.Get("type") != "task_result" {
+		t.Fatalf("filters not forwarded: %v", gotQuery)
+	}
+	if gotQuery.Get("wait") != "25" {
+		t.Fatalf("expected wait=25 forwarded, got %q", gotQuery.Get("wait"))
+	}
+	if len(msgs) != 1 || msgs[0]["_delivery"] != "direct" {
+		t.Fatalf("unexpected messages: %v", msgs)
+	}
 }

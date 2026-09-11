@@ -303,9 +303,10 @@ Once configured, agents can use these MCP tools to communicate:
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/sessions` | Create a session. Body: `{"name": "..."}`. Returns session with PSK |
-| `GET` | `/sessions` | List all sessions |
+| `GET` | `/sessions` | List all sessions, including each session's agent roster |
 | `GET` | `/sessions/{id}` | Get session details |
 | `DELETE` | `/sessions/{id}` | Delete session and disconnect all agents |
+| `GET` | `/healthz` | Unauthenticated liveness probe |
 
 ### Agent-authenticated endpoints
 
@@ -313,10 +314,10 @@ All require `Authorization: Bearer <psk>` and `X-Agent-ID: <agent_id>` headers.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/sessions/{id}/register` | Register agent presence / heartbeat. Body: `{"agent_name": "...", "capabilities": [...]}` |
+| `POST` | `/sessions/{id}/register` | Register agent presence / heartbeat. Body: `{"capabilities": [...]}`. Auto-creates the session if unknown (besides `POST /sessions`, the only way to create one). Returns a short-lived `watch_token` for `/watch`, renewed on every register |
 | `POST` | `/sessions/{id}/messages` | Send a direct message. Body: `{"to": "...", "type": "message", "payload": {...}}` |
 | `POST` | `/sessions/{id}/broadcast` | Broadcast to session. Body: `{"type": "broadcast", "payload": {...}}` |
-| `GET` | `/sessions/{id}/mailbox` | Drain mailbox — destructive read of all queued messages |
+| `GET` | `/sessions/{id}/mailbox` | Drain mailbox — destructive read of all queued messages. Query params: `wait` (seconds, ≤30) holds the request until a match arrives; `from`/`type` filter the drain — non-matching messages stay queued |
 | `GET` | `/sessions/{id}/agents` | List active agents |
 | `GET` | `/sessions/{id}/leader` | Get current leader |
 | `POST` | `/sessions/{id}/leader/transfer` | Transfer leadership. Body: `{"new_leader_id": "..."}` |
