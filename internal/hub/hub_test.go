@@ -9,6 +9,7 @@ import (
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
+	"github.com/wltechblog/agentchat-mcp/internal/persist"
 	"github.com/wltechblog/agentchat-mcp/internal/presence"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
@@ -21,14 +22,14 @@ func newTestHub(t *testing.T, ttl, sweepInterval time.Duration) (*Hub, *session.
 	t.Helper()
 	store := session.NewStore()
 	pt := presence.NewTracker(ttl)
-	h := New(store,
-		leader.NewTracker(),
-		scratchpad.NewStore(),
-		filestore.NewStore(1<<20),
-		pt,
-		mailbox.NewStore(1000),
-		WithSweepInterval(sweepInterval),
-	)
+	h := New(Deps{
+		SessionStore: store,
+		Leader:       leader.NewTracker(),
+		Scratchpad:   scratchpad.NewStore(),
+		Files:        filestore.NewStore(1 << 20),
+		Presence:     pt,
+		Mailboxes:    mailbox.NewStore(1000),
+	}, WithSweepInterval(sweepInterval))
 	t.Cleanup(pt.Stop)
 	return h, store, pt
 }
@@ -282,5 +283,77 @@ func TestAllEventsSequencedAndFannedOut(t *testing.T) {
 		if m.Envelope.Sequence == 0 {
 			t.Fatalf("mailbox entry of type %s has no sequence", m.Envelope.Type)
 		}
+	}
+}
+
+// TestPersistenceRestartRoundTrip simulates a server restart: capture a
+// snapshot from live stores, restore it into fresh ones, and verify that
+// sessions, queued mail, history, sequence continuity, and the scratchpad
+// all survive. This is what makes a restart a bump instead of a lobotomy.
+func TestPersistenceRestartRoundTrip(t *testing.T) {
+	// Live world.
+	store := session.NewStore()
+	pt := presence.NewTracker(time.Minute)
+	defer pt.Stop()
+	mb := mailbox.NewStore(100)
+	sp := scratchpad.NewStore()
+	h := New(Deps{SessionStore: store, Leader: leader.NewTracker(), Scratchpad: sp,
+		Files: filestore.NewStore(1 << 20), Presence: pt, Mailboxes: mb}, WithSweepInterval(time.Hour))
+
+	sess := store.Create("persist")
+	h.Register(sess.ID, "agent-a", []string{"search"})
+	if err := h.SendMessage(sess.ID, "agent-a", "agent-b", "message", payload("queued")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	sp.Set(sess.ID, "plan", payload("step 1"), "agent-a")
+
+	// Snapshot, then a fresh "process".
+	snap := persist.Snapshot{
+		Sessions:   store.Snapshot(),
+		Mailboxes:  mb.Snapshot(),
+		History:    h.HistorySnapshot(),
+		SeqNums:    h.SeqSnapshot(),
+		Scratchpad: sp.Snapshot(),
+	}
+
+	store2 := session.NewStore()
+	pt2 := presence.NewTracker(time.Minute)
+	defer pt2.Stop()
+	mb2 := mailbox.NewStore(100)
+	sp2 := scratchpad.NewStore()
+	h2 := New(Deps{SessionStore: store2, Leader: leader.NewTracker(), Scratchpad: sp2,
+		Files: filestore.NewStore(1 << 20), Presence: pt2, Mailboxes: mb2}, WithSweepInterval(time.Hour))
+	store2.Restore(snap.Sessions)
+	mb2.Restore(snap.Mailboxes)
+	h2.RestoreState(snap.History, snap.SeqNums)
+	sp2.Restore(snap.Scratchpad)
+
+	// Session credentials survived.
+	if _, ok := store2.ValidatePSK(sess.ID, sess.PSK); !ok {
+		t.Fatal("session lost across restart")
+	}
+
+	// Queued mail survived.
+	msgs := mb2.Drain(sess.ID + "/agent-b")
+	if len(msgs) != 1 || msgs[0].Envelope.Payload == nil {
+		t.Fatalf("queued mail lost across restart: %+v", msgs)
+	}
+
+	// Sequence continuity: the next message must not reuse old numbers.
+	h2.Register(sess.ID, "agent-a", nil)
+	if err := h2.SendMessage(sess.ID, "agent-a", "agent-b", "message", payload("after")); err != nil {
+		t.Fatalf("send after restore: %v", err)
+	}
+	hist := h2.GetHistory(sess.ID)
+	if len(hist) != 2 {
+		t.Fatalf("expected restored history + new message, got %d entries", len(hist))
+	}
+	if hist[1].Sequence <= hist[0].Sequence {
+		t.Fatalf("sequence restarted after restore: %d then %d", hist[0].Sequence, hist[1].Sequence)
+	}
+
+	// Scratchpad survived.
+	if _, ok := sp2.Get(sess.ID, "plan"); !ok {
+		t.Fatal("scratchpad lost across restart")
 	}
 }

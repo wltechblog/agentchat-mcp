@@ -118,7 +118,7 @@ func (b *Bridge) ensureInit() error {
 	body, _ := json.Marshal(map[string]any{
 		"capabilities": b.capabilities,
 	})
-	resp, err := b.doRequestLocked("POST", "/sessions/"+b.sessionID+"/register", body)
+	resp, err := b.doRequestNow("POST", "/sessions/"+b.sessionID+"/register", body)
 	if err != nil {
 		return fmt.Errorf("register failed: %w", err)
 	}
@@ -172,13 +172,22 @@ func (b *Bridge) doRequest(method, path string, body []byte) (*http.Response, er
 		return nil, err
 	}
 
-	b.mu.Lock()
-	resp, err := b.doRequestLocked(method, path, body)
-	b.mu.Unlock()
-	return resp, err
+	// No bridge-wide lock across the round trip: the HTTP client is safe for
+	// concurrent use and tool calls run concurrently — a 25s long-poll wait
+	// must not block sends or heartbeats.
+	resp, err := b.doRequestNow(method, path, body)
+	if err != nil {
+		// Transport failure: drop registration state so the next call
+		// re-registers with fresh credentials (e.g. after a server restart).
+		b.invalidateRegistration()
+		return nil, err
+	}
+	return resp, nil
 }
 
-func (b *Bridge) doRequestLocked(method, path string, body []byte) (*http.Response, error) {
+// doRequestNow performs a single authenticated HTTP request. Callable from
+// any goroutine: it only reads immutable bridge fields and shared clients.
+func (b *Bridge) doRequestNow(method, path string, body []byte) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		bodyReader = bytes.NewReader(body)
@@ -221,6 +230,11 @@ func (b *Bridge) doJSON(method, path string, payload any) (any, error) {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// Server rejected our credentials (restart or replaced session):
+		// re-register on the next call.
+		b.invalidateRegistration()
+	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, string(rbody))
 	}
@@ -275,8 +289,22 @@ func (b *Bridge) pollMailbox(wait time.Duration, from, msgType string) ([]map[st
 // drainAll returns everything currently waiting for the agent: a full,
 // immediate drain of the server-side mailbox. The mailbox is the single
 // source of truth; history catch-up is the explicit request_history tool.
+// The message that triggered the most recent wake-up signal is stamped with
+// _signal_trigger so the agent can see why it was woken.
 func (b *Bridge) drainAll() ([]map[string]any, error) {
-	return b.pollMailbox(0, "", "")
+	msgs, err := b.pollMailbox(0, "", "")
+	if err != nil {
+		return nil, err
+	}
+	if info := getPendingSignalInfo(); info != nil {
+		for _, m := range msgs {
+			env, _ := m["envelope"].(map[string]any)
+			if s, ok := env["sequence"].(float64); ok && int64(s) == info.Sequence {
+				m["_signal_trigger"] = true
+			}
+		}
+	}
+	return msgs, nil
 }
 
 // tagDelivery determines if a message is a "direct" or "broadcast" delivery.

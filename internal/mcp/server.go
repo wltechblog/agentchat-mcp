@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 )
 
 const ProtocolVersion = "2024-11-05"
@@ -23,8 +24,11 @@ type jsonRPCRequest struct {
 type jsonRPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id"`
-	Result  any             `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
+	// Result is a pointer so a legitimately empty result (e.g. "") still
+	// marshals as "result":"" — omitempty on a plain any would drop it and
+	// produce a response with neither result nor error.
+	Result *json.RawMessage `json:"result,omitempty"`
+	Error  *rpcError        `json:"error,omitempty"`
 }
 
 type rpcError struct {
@@ -68,11 +72,18 @@ func (s *Server) Run(ctx context.Context) error {
 	return s.RunWith(ctx, os.Stdin, os.Stdout)
 }
 
+// shutdownGrace bounds how long RunWith waits for in-flight handlers after
+// the input stream ends. The host will not read further responses, so an
+// unbounded wait (handlers may long-poll for minutes) would hang shutdown.
+const shutdownGrace = 2 * time.Second
+
 func (s *Server) RunWith(ctx context.Context, in io.Reader, out io.Writer) error {
 	s.writer = bufio.NewWriter(out)
 
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	var inFlight sync.WaitGroup
 
 	for {
 		select {
@@ -85,10 +96,10 @@ func (s *Server) RunWith(ctx context.Context, in io.Reader, out io.Writer) error
 			if scanner.Err() != nil {
 				return scanner.Err()
 			}
-			return io.EOF
+			break
 		}
 
-		line := scanner.Bytes()
+		line := append([]byte(nil), scanner.Bytes()...) // scanner reuses its buffer; handlers run async
 		if len(line) == 0 {
 			continue
 		}
@@ -103,8 +114,29 @@ func (s *Server) RunWith(ctx context.Context, in io.Reader, out io.Writer) error
 			continue
 		}
 
-		s.handleRequest(req)
+		// Dispatch each request in its own goroutine: a tool can block for
+		// minutes (wait_for_message long-polls server-side), and the host
+		// must still be able to call other tools and get ping responses.
+		// Responses are serialized by s.mu; JSON-RPC ids let the host match
+		// responses that arrive out of order.
+		inFlight.Add(1)
+		go func(req jsonRPCRequest) {
+			defer inFlight.Done()
+			s.handleRequest(req)
+		}(req)
 	}
+
+	// Don't return while handlers are still writing responses.
+	done := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownGrace):
+	}
+	return nil
 }
 
 func (s *Server) handleRequest(req jsonRPCRequest) {
@@ -123,6 +155,9 @@ func (s *Server) handleRequest(req jsonRPCRequest) {
 
 	case "notifications/initialized":
 		// no-op
+
+	case "ping":
+		s.sendResult(req.ID, map[string]any{})
 
 	case "tools/list":
 		s.sendResult(req.ID, map[string]any{
@@ -163,7 +198,15 @@ func (s *Server) handleRequest(req jsonRPCRequest) {
 }
 
 func (s *Server) sendResult(id json.RawMessage, result any) {
-	resp := jsonRPCResponse{JSONRPC: "2.0", ID: id, Result: result}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		// A result that can't marshal is as useless as an error response;
+		// surface it as one so the host doesn't hang waiting.
+		s.sendError(id, -32603, fmt.Sprintf("marshal result: %v", err))
+		return
+	}
+	rm := json.RawMessage(raw)
+	resp := jsonRPCResponse{JSONRPC: "2.0", ID: id, Result: &rm}
 	s.write(resp)
 }
 

@@ -23,10 +23,7 @@ func TestInitialize(t *testing.T) {
 	if resp.JSONRPC != "2.0" {
 		t.Fatalf("expected jsonrpc 2.0, got %s", resp.JSONRPC)
 	}
-	result, ok := resp.Result.(map[string]any)
-	if !ok {
-		t.Fatal("expected map result")
-	}
+	result := resultMap(t, resp)
 	if result["protocolVersion"] != ProtocolVersion {
 		t.Fatalf("expected protocol version %s, got %v", ProtocolVersion, result["protocolVersion"])
 	}
@@ -53,7 +50,7 @@ func TestToolsList(t *testing.T) {
 
 	var resp jsonRPCResponse
 	json.Unmarshal(buf.Bytes(), &resp)
-	result := resp.Result.(map[string]any)
+	result := resultMap(t, resp)
 	tools := result["tools"].([]any)
 	if len(tools) != 1 {
 		t.Fatalf("expected 1 tool, got %d", len(tools))
@@ -86,7 +83,7 @@ func TestToolCall(t *testing.T) {
 
 	var resp jsonRPCResponse
 	json.Unmarshal(buf.Bytes(), &resp)
-	result := resp.Result.(map[string]any)
+	result := resultMap(t, resp)
 	content := result["content"].([]any)
 	text := content[0].(map[string]any)
 	if text["text"] != "hello" {
@@ -175,11 +172,125 @@ func TestRunWithIO(t *testing.T) {
 		t.Fatal("expected init result")
 	}
 
+	// Requests are dispatched concurrently, so match responses by id rather
+	// than position.
 	var toolsResp jsonRPCResponse
-	json.Unmarshal([]byte(lines[1]), &toolsResp)
-	result := toolsResp.Result.(map[string]any)
+	for _, line := range lines {
+		var r jsonRPCResponse
+		if json.Unmarshal([]byte(line), &r) != nil {
+			continue
+		}
+		if string(r.ID) == `"i2"` {
+			toolsResp = r
+		}
+	}
+	result := resultMap(t, toolsResp)
 	tools := result["tools"].([]any)
 	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "ping" {
 		t.Fatalf("expected ping tool, got %v", tools)
+	}
+}
+
+// resultMap decodes a response's result object.
+func resultMap(t *testing.T, resp jsonRPCResponse) map[string]any {
+	t.Helper()
+	if resp.Result == nil {
+		t.Fatal("expected result")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(*resp.Result, &m); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	return m
+}
+
+func TestPing(t *testing.T) {
+	s := NewServer("test", "1.0.0")
+	var buf bytes.Buffer
+	s.writer = bufio.NewWriter(&buf)
+
+	req := jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`"p1"`), Method: "ping"}
+	s.handleRequest(req)
+
+	var resp jsonRPCResponse
+	json.Unmarshal(buf.Bytes(), &resp)
+	if resp.Error != nil {
+		t.Fatalf("ping must not error, got %v", resp.Error)
+	}
+	if resp.Result == nil {
+		t.Fatal("ping must return a result")
+	}
+}
+
+// TestEmptyStringResultEmitted: a tool returning "" must produce
+// "result":"" — omitempty on a plain any dropped it entirely, yielding a
+// response with neither result nor error.
+func TestEmptyStringResultEmitted(t *testing.T) {
+	s := NewServer("test", "1.0.0")
+	s.RegisterTool(Tool{
+		Name:        "empty",
+		Description: "returns empty string",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+	}, func(args map[string]any) (string, error) {
+		return "", nil
+	})
+	var buf bytes.Buffer
+	s.writer = bufio.NewWriter(&buf)
+
+	params, _ := json.Marshal(map[string]any{"name": "empty", "arguments": map[string]any{}})
+	s.handleRequest(jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`"e1"`), Method: "tools/call", Params: params})
+
+	out := buf.String()
+	if !strings.Contains(out, `"result"`) {
+		t.Fatalf("expected result in response, got %s", out)
+	}
+	if !strings.Contains(out, `"text":""`) {
+		t.Fatalf("expected empty text to survive marshaling, got %s", out)
+	}
+}
+
+// TestConcurrentDispatch: a blocking tool call must not delay subsequent
+// requests — two slow calls should overlap, not serialize.
+func TestConcurrentDispatch(t *testing.T) {
+	s := NewServer("test", "1.0.0")
+	s.RegisterTool(Tool{
+		Name:        "slow",
+		Description: "takes a while",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+	}, func(args map[string]any) (string, error) {
+		time.Sleep(300 * time.Millisecond)
+		return "done", nil
+	})
+
+	call := func(id string) []byte {
+		b, _ := json.Marshal(jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`"` + id + `"`), Method: "tools/call",
+			Params: json.RawMessage(`{"name":"slow","arguments":{}}`)})
+		return b
+	}
+	input := strings.NewReader(string(call("s1")) + "\n" + string(call("s2")) + "\n")
+	var out bytes.Buffer
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.RunWith(ctx, input, &out)
+	elapsed := time.Since(start)
+
+	if elapsed >= 600*time.Millisecond {
+		t.Fatalf("slow calls serialized (%v); requests must dispatch concurrently", elapsed)
+	}
+
+	var found int
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var r jsonRPCResponse
+		if json.Unmarshal([]byte(line), &r) != nil {
+			continue
+		}
+		if string(r.ID) == `"s1"` || string(r.ID) == `"s2"` {
+			found++
+		}
+	}
+	if found != 2 {
+		t.Fatalf("expected both responses, got %d in: %s", found, out.String())
 	}
 }

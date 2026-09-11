@@ -24,8 +24,8 @@ func TestSSEKeepaliveAndRetry(t *testing.T) {
 	store := session.NewStore()
 	pt := presence.NewTracker(60 * time.Second)
 	defer pt.Stop()
-	h := hub.New(store, leader.NewTracker(), scratchpad.NewStore(),
-		filestore.NewStore(1<<20), pt, mailbox.NewStore(1000))
+	h := hub.New(hub.Deps{SessionStore: store, Leader: leader.NewTracker(), Scratchpad: scratchpad.NewStore(),
+		Files: filestore.NewStore(1 << 20), Presence: pt, Mailboxes: mailbox.NewStore(1000)})
 	handler := New(h, store)
 	handler.ssePingInterval = 20 * time.Millisecond // speed up for the test
 

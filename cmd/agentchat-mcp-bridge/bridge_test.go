@@ -279,3 +279,61 @@ func TestPollMailboxFiltered(t *testing.T) {
 		t.Fatalf("unexpected messages: %v", msgs)
 	}
 }
+
+// TestUnauthorizedInvalidates: when the server rejects our credentials
+// (401/403), registration state must drop so the next call re-registers.
+func TestUnauthorizedInvalidates(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /sessions/s1/mailbox", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := testBridge(srv)
+	b.watchToken = "tok"
+
+	if _, err := b.doJSON("GET", "/sessions/s1/mailbox", nil); err == nil {
+		t.Fatal("expected error from 401 response")
+	}
+	if b.getWatchToken() != "" {
+		t.Fatalf("watch token should be cleared on 401, got %q", b.getWatchToken())
+	}
+	if b.initialized {
+		t.Fatal("initialized should be false after 401")
+	}
+}
+
+// TestDrainAllStampsSignalTrigger: the message whose sequence triggered the
+// most recent wake-up signal is stamped so the agent can see why it woke.
+func TestDrainAllStampsSignalTrigger(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /sessions/s1/mailbox", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"messages": []map[string]any{
+				envelope("agent-b", "a1", "message", 7),
+				envelope("agent-c", "a1", "message", 8),
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := testBridge(srv)
+	pendingSignal.Store(&pendingSignalInfo{TriggerType: "message", FromAgent: "agent-b", Sequence: 7})
+
+	msgs, err := b.drainAll()
+	if err != nil {
+		t.Fatalf("drainAll: %v", err)
+	}
+	if stamped, ok := msgs[0]["_signal_trigger"].(bool); !ok || !stamped {
+		t.Fatalf("expected seq-7 message stamped as signal trigger, got %v", msgs[0])
+	}
+	if _, ok := msgs[1]["_signal_trigger"]; ok {
+		t.Fatalf("seq-8 message must not be stamped")
+	}
+	if getPendingSignalInfo() != nil {
+		t.Fatal("pending signal info should be consumed by the drain")
+	}
+}

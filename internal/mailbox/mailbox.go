@@ -188,3 +188,28 @@ func (s *Store) Len(key string) int {
 	b.mu.Unlock()
 	return n
 }
+
+// Snapshot copies every box's entries for persistence.
+func (s *Store) Snapshot() map[string][]Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string][]Entry, len(s.boxes))
+	for key, b := range s.boxes {
+		b.mu.Lock()
+		out[key] = append([]Entry(nil), b.entries...)
+		b.mu.Unlock()
+	}
+	return out
+}
+
+// Restore replaces all boxes (startup only).
+func (s *Store) Restore(boxes map[string][]Entry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.boxes = make(map[string]*Box, len(boxes))
+	for key, entries := range boxes {
+		b := &Box{max: s.maxPer, changed: make(chan struct{}, 1)}
+		b.entries = append(b.entries, entries...)
+		s.boxes[key] = b
+	}
+}

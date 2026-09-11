@@ -89,3 +89,33 @@ func (s *Store) ClearSession(sessionID string) {
 	delete(s.pads, sessionID)
 	delete(s.seq, sessionID)
 }
+
+// Snapshot copies all scratchpad entries for persistence.
+func (s *Store) Snapshot() map[string][]protocol.ScratchpadEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string][]protocol.ScratchpadEntry, len(s.pads))
+	for sid, pad := range s.pads {
+		entries := make([]protocol.ScratchpadEntry, 0, len(pad))
+		for _, e := range pad {
+			entries = append(entries, *e)
+		}
+		out[sid] = entries
+	}
+	return out
+}
+
+// Restore replaces all pads (startup only).
+func (s *Store) Restore(pads map[string][]protocol.ScratchpadEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pads = make(map[string]map[string]*protocol.ScratchpadEntry, len(pads))
+	for sid, entries := range pads {
+		pad := make(map[string]*protocol.ScratchpadEntry, len(entries))
+		for i := range entries {
+			e := entries[i]
+			pad[e.Key] = &e
+		}
+		s.pads[sid] = pad
+	}
+}

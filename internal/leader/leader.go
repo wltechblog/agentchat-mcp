@@ -45,3 +45,24 @@ func (t *Tracker) ClearSession(sessionID string) {
 	defer t.mu.Unlock()
 	delete(t.leaders, sessionID)
 }
+
+// Snapshot copies the leader map for persistence.
+func (t *Tracker) Snapshot() map[string]string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make(map[string]string, len(t.leaders))
+	for k, v := range t.leaders {
+		out[k] = v
+	}
+	return out
+}
+
+// Restore replaces the leader map (startup only).
+func (t *Tracker) Restore(leaders map[string]string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.leaders = make(map[string]string, len(leaders))
+	for k, v := range leaders {
+		t.leaders[k] = v
+	}
+}

@@ -29,7 +29,7 @@ func setupTestServer(t *testing.T) (*httptest.Server, *session.Store) {
 	fs := filestore.NewStore(10 << 20)
 	pt := presence.NewTracker(60 * time.Second)
 	mb := mailbox.NewStore(1000)
-	h := hub.New(store, lt, sp, fs, pt, mb)
+	h := hub.New(hub.Deps{SessionStore: store, Leader: lt, Scratchpad: sp, Files: fs, Presence: pt, Mailboxes: mb})
 	handler := New(h, store)
 
 	mux := http.NewServeMux()

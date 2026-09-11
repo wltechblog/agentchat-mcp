@@ -25,8 +25,8 @@ func setupWithHandler(t *testing.T) (*httptest.Server, *Handler, *session.Store)
 	t.Helper()
 	store := session.NewStore()
 	pt := presence.NewTracker(60 * time.Second)
-	h := hub.New(store, leader.NewTracker(), scratchpad.NewStore(),
-		filestore.NewStore(10<<20), pt, mailbox.NewStore(1000))
+	h := hub.New(hub.Deps{SessionStore: store, Leader: leader.NewTracker(), Scratchpad: scratchpad.NewStore(),
+		Files: filestore.NewStore(10 << 20), Presence: pt, Mailboxes: mailbox.NewStore(1000)})
 	handler := New(h, store)
 
 	mux := http.NewServeMux()

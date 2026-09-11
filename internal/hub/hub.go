@@ -64,14 +64,26 @@ func WithSweepInterval(d time.Duration) Option {
 	return func(h *Hub) { h.sweepInterval = d }
 }
 
-func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *filestore.Store, pt *presence.Tracker, mb *mailbox.Store, opts ...Option) *Hub {
+// Deps bundles Hub's collaborators. Named fields exist because the previous
+// six-argument positional constructor kept getting its stores swapped at
+// call sites.
+type Deps struct {
+	SessionStore *session.Store
+	Leader       *leader.Tracker
+	Scratchpad   *scratchpad.Store
+	Files        *filestore.Store
+	Presence     *presence.Tracker
+	Mailboxes    *mailbox.Store
+}
+
+func New(d Deps, opts ...Option) *Hub {
 	h := &Hub{
-		sessionStore:  store,
-		leader:        lt,
-		scratchpad:    sp,
-		files:         fs,
-		presence:      pt,
-		mailboxes:     mb,
+		sessionStore:  d.SessionStore,
+		leader:        d.Leader,
+		scratchpad:    d.Scratchpad,
+		files:         d.Files,
+		presence:      d.Presence,
+		mailboxes:     d.Mailboxes,
 		history:       make(map[string][]protocol.Envelope),
 		maxHistory:    maxHistory,
 		sweepInterval: 15 * time.Second,
@@ -81,7 +93,7 @@ func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *fil
 		opt(h)
 	}
 
-	pt.StartSweep(h.sweepInterval, func(sessionID, agentID string, capabilities []string) {
+	h.presence.StartSweep(h.sweepInterval, func(sessionID, agentID string, capabilities []string) {
 		h.onAgentExpired(sessionID, agentID, capabilities)
 	}, func(sessionID, agentID string) {
 		// The agent is being forgotten entirely (past the presence tracker's
@@ -415,6 +427,44 @@ func (h *Hub) GetHistoryAfter(sessionID string, afterSeq int64, limit int) []pro
 
 func (h *Hub) GetScratchpad(sessionID string) []protocol.ScratchpadEntry {
 	return h.scratchpad.List(sessionID)
+}
+
+// HistorySnapshot copies all session history for persistence.
+func (h *Hub) HistorySnapshot() map[string][]protocol.Envelope {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make(map[string][]protocol.Envelope, len(h.history))
+	for sid, envs := range h.history {
+		out[sid] = append([]protocol.Envelope(nil), envs...)
+	}
+	return out
+}
+
+// SeqSnapshot copies per-session sequence counters for persistence.
+func (h *Hub) SeqSnapshot() map[string]int64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make(map[string]int64, len(h.seqNums))
+	for sid, seq := range h.seqNums {
+		out[sid] = seq
+	}
+	return out
+}
+
+// RestoreState restores persisted history and sequence counters (startup
+// only). Counters must be restored together with history or new messages
+// would reuse sequence numbers that client watermarks already passed.
+func (h *Hub) RestoreState(history map[string][]protocol.Envelope, seqNums map[string]int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for sid, envs := range history {
+		h.history[sid] = append([]protocol.Envelope(nil), envs...)
+	}
+	for sid, seq := range seqNums {
+		if seq > h.seqNums[sid] {
+			h.seqNums[sid] = seq
+		}
+	}
 }
 
 func (h *Hub) GetLeader(sessionID string) string {

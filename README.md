@@ -36,6 +36,7 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
 - **Shared scratchpad** — Key-value store per session for shared context, with real-time update broadcasts to mailboxes
 - **Leader election** — First agent in a session becomes leader; supports explicit transfer and auto-transfer on expiry
 - **Sequenced message history** — Messages get monotonically increasing sequence numbers; agents can request missed messages
+- **Crash-safe persistence (opt-in)** — Set `AGENTCHAT_DATA` to a directory and the server snapshots sessions, mailboxes, history, sequence counters, and the scratchpad every few seconds (plus on clean shutdown). A restart becomes a bump: agents re-register, queued mail survives, and no message is delivered twice. Files are not persisted.
 - **Agent capabilities** — Agents declare capabilities on registration; visible to all session members
 - **Task delegation** — Built-in message types for assigning, tracking, and returning task results
 - **File transfer** — Upload files via REST, share file IDs via messages, download via REST
@@ -125,6 +126,7 @@ volumes:
 |----------|---------|-------------|
 | `PORT` | `8080` | HTTP listen port |
 | `AGENTCHAT_DEBUG` | `false` | Set to `true` or `1` to enable debug logging |
+| `AGENTCHAT_DATA` | *(unset)* | Directory for the state snapshot. When set, sessions, mailboxes, history, sequence counters, and the scratchpad survive restarts; when unset, the server is purely in-memory |
 
 ---
 

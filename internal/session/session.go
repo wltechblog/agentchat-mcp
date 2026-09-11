@@ -111,3 +111,25 @@ func generateID() string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+// Snapshot copies all sessions for persistence.
+func (s *Store) Snapshot() []Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		out = append(out, *sess)
+	}
+	return out
+}
+
+// Restore replaces all sessions (startup only).
+func (s *Store) Restore(sessions []Session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions = make(map[string]*Session, len(sessions))
+	for i := range sessions {
+		sess := sessions[i]
+		s.sessions[sess.ID] = &sess
+	}
+}
