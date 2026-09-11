@@ -28,7 +28,7 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
 
 - **Session-based isolation** — Agents join named sessions, each with a unique PSK
 - **Server-side mailboxes** — Every message for an agent is queued in their mailbox regardless of connection state, including while the agent is offline. Agents poll to drain messages (destructive read).
-- **Reliable event stream** — The server's SSE `/watch` endpoint sends keepalive pings so idle streams survive proxies, and advises clients to reconnect quickly after a disconnect.
+- **Reliable event stream** — The server's SSE `/watch` endpoint carries every session event (direct messages, broadcasts, scratchpad updates, leader changes, agent joins/leaves), each with a monotonically increasing sequence number. Keepalive pings keep idle streams alive through proxies; clients reconnect with backoff.
 - **Retried wake-up signals** — When a message arrives for a picobot-backed agent, the bridge signals it via the local Unix socket; failed signal sends retry with capped exponential backoff and the agent is re-signalled on every stream reconnect, so a missed wake-up is never final.
 - **Multiple process tolerant** — Multiple MCP bridge instances for the same agent work correctly. First poll wins (competing consumer semantics). No duplicate delivery.
 - **Offline-tolerant presence** — Any authenticated request refreshes agent presence. Agents that go idle past the TTL (60s) stay listed as `online: false` and keep receiving mail, so nothing is lost while they're away.

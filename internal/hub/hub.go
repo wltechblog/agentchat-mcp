@@ -31,6 +31,21 @@ type Hub struct {
 	sweepInterval time.Duration
 	seqNums       map[string]int64
 	debugLog      bool
+	notifier      Notifier
+}
+
+// Notifier receives every event envelope for fan-out to real-time watchers
+// (the API layer's SSE hub). It must be non-blocking. The hub emits each
+// event exactly once through this path — there is no second fan-out.
+type Notifier func(sessionID string, env protocol.Envelope)
+
+// SetNotifier wires the real-time fan-out. Call before serving traffic.
+func (h *Hub) SetNotifier(n Notifier) { h.notifier = n }
+
+func (h *Hub) notifyWatchers(sessionID string, env protocol.Envelope) {
+	if h.notifier != nil {
+		h.notifier(sessionID, env)
+	}
 }
 
 type Option func(*Hub)
@@ -77,14 +92,6 @@ func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *fil
 	return h
 }
 
-// nextSeq returns the next sequence number for a session.
-func (h *Hub) nextSeq(sessionID string) int64 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.seqNums[sessionID]++
-	return h.seqNums[sessionID]
-}
-
 // recordEnvelope assigns the next sequence number and appends the envelope to
 // the session history atomically, so history order always matches sequence
 // order. seqNums and history share h.mu; the counter must never be bumped
@@ -101,15 +108,35 @@ func (h *Hub) recordEnvelope(sessionID string, env *protocol.Envelope) {
 	}
 }
 
+// sequenceEnvelope assigns the next sequence number without recording the
+// envelope in history. System events (joins, leaves, leader and scratchpad
+// changes) share the message counter so clients can hold one high-water
+// mark, but history stays a message catch-up log.
+func (h *Hub) sequenceEnvelope(sessionID string, env *protocol.Envelope) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seqNums[sessionID]++
+	env.Sequence = h.seqNums[sessionID]
+}
+
+// emitSystemEvent sequences a system event, delivers it to session mailboxes,
+// and notifies real-time watchers — the single fan-out for server events.
+func (h *Hub) emitSystemEvent(sessionID string, env protocol.Envelope, excludeAgent string) {
+	h.sequenceEnvelope(sessionID, &env)
+	h.deliverToSessionMailboxes(sessionID, env, excludeAgent)
+	h.notifyWatchers(sessionID, env)
+}
+
 func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
 	isNew := h.presence.Touch(sessionID, agentID, capabilities)
 
 	if isNew {
 		slog.Info("agent joined", "session", sessionID, "agent", agentID)
-		h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
+		h.emitSystemEvent(sessionID, protocol.Envelope{
 			Type:      protocol.TypeAgentJoined,
 			SessionID: sessionID,
 			From:      "server",
+			To:        "*",
 			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: true}),
 			Timestamp: time.Now().UTC(),
 		}, agentID)
@@ -129,10 +156,11 @@ func (h *Hub) RefreshPresence(sessionID, agentID string) {
 
 func (h *Hub) onAgentExpired(sessionID, agentID string, capabilities []string) {
 	slog.Info("agent expired", "session", sessionID, "agent", agentID)
-	h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
+	h.emitSystemEvent(sessionID, protocol.Envelope{
 		Type:      protocol.TypeAgentLeft,
 		SessionID: sessionID,
 		From:      "server",
+		To:        "*",
 		Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: false}),
 		Timestamp: time.Now().UTC(),
 	}, "")
@@ -152,10 +180,11 @@ func (h *Hub) onAgentExpired(sessionID, agentID string, capabilities []string) {
 		if newLeader != "" {
 			h.leader.Transfer(sessionID, agentID, newLeader)
 			slog.Info("leader auto-transferred", "session", sessionID, "old_leader", agentID, "new_leader", newLeader)
-			h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
+			h.emitSystemEvent(sessionID, protocol.Envelope{
 				Type:      protocol.TypeLeaderInfo,
 				SessionID: sessionID,
 				From:      "server",
+				To:        "*",
 				Payload:   mustMarshal(map[string]string{"leader_id": newLeader}),
 				Timestamp: time.Now().UTC(),
 			}, "")
@@ -187,6 +216,7 @@ func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawM
 	}
 	h.recordEnvelope(sessionID, &env)
 	h.deliverToAgentMailbox(sessionID, to, env)
+	h.notifyWatchers(sessionID, env)
 	return nil
 }
 
@@ -195,12 +225,13 @@ func (h *Hub) Broadcast(sessionID, from, msgType string, payload json.RawMessage
 		Type:      msgType,
 		SessionID: sessionID,
 		From:      from,
-		To:        "",
+		To:        "*",
 		Payload:   payload,
 		Timestamp: time.Now().UTC(),
 	}
 	h.recordEnvelope(sessionID, &env)
 	h.deliverToSessionMailboxes(sessionID, env, from)
+	h.notifyWatchers(sessionID, env)
 }
 
 func (h *Hub) deliverToAgentMailbox(sessionID, agentID string, env protocol.Envelope) {
@@ -226,9 +257,14 @@ func (h *Hub) ScratchpadSet(sessionID, agentID, key string, value json.RawMessag
 	}
 	entry := h.scratchpad.Set(sessionID, key, value, agentID)
 
-	bcast, _ := protocol.NewEnvelope(protocol.TypeScratchpadUpdate, sessionID, agentID, "", entry)
-	bcast.Sequence = h.nextSeq(sessionID)
-	h.deliverToSessionMailboxes(sessionID, bcast, agentID)
+	h.emitSystemEvent(sessionID, protocol.Envelope{
+		Type:      protocol.TypeScratchpadUpdate,
+		SessionID: sessionID,
+		From:      agentID,
+		To:        "*",
+		Payload:   mustMarshal(entry),
+		Timestamp: time.Now().UTC(),
+	}, agentID)
 
 	return entry, nil
 }
@@ -245,10 +281,14 @@ func (h *Hub) ScratchpadDelete(sessionID, agentID, key string) error {
 	if !h.scratchpad.Delete(sessionID, key) {
 		return fmt.Errorf("key not found: %s", key)
 	}
-	bcast, _ := protocol.NewEnvelope(protocol.TypeScratchpadUpdate, sessionID, agentID, "",
-		map[string]string{"key": key, "deleted": "true"})
-	bcast.Sequence = h.nextSeq(sessionID)
-	h.deliverToSessionMailboxes(sessionID, bcast, agentID)
+	h.emitSystemEvent(sessionID, protocol.Envelope{
+		Type:      protocol.TypeScratchpadUpdate,
+		SessionID: sessionID,
+		From:      agentID,
+		To:        "*",
+		Payload:   mustMarshal(map[string]string{"key": key, "deleted": "true"}),
+		Timestamp: time.Now().UTC(),
+	}, agentID)
 	return nil
 }
 
@@ -272,12 +312,12 @@ func (h *Hub) LeaderTransfer(sessionID, fromAgent, newLeaderID string) error {
 
 	slog.Info("leader transferred", "session", sessionID, "from", fromAgent, "to", newLeaderID)
 
-	h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
+	h.emitSystemEvent(sessionID, protocol.Envelope{
 		Type:      protocol.TypeLeaderInfo,
 		SessionID: sessionID,
 		From:      "server",
+		To:        "*",
 		Payload:   mustMarshal(map[string]string{"leader_id": newLeaderID, "transferred_by": fromAgent}),
-		Sequence:  h.nextSeq(sessionID),
 		Timestamp: time.Now().UTC(),
 	}, fromAgent)
 
@@ -305,6 +345,7 @@ func (h *Hub) ShareFile(sessionID, from, to, fileID, fileName, contentType, desc
 	}
 	h.recordEnvelope(sessionID, &env)
 	h.deliverToAgentMailbox(sessionID, to, env)
+	h.notifyWatchers(sessionID, env)
 	slog.Info("file shared", "session", sessionID, "from", from, "to", to, "file", fileName, "file_id", fileID)
 	return nil
 }

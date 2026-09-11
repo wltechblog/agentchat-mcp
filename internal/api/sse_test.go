@@ -125,3 +125,60 @@ func waitForLine(t *testing.T, lines <-chan string, prefix string) {
 		}
 	}
 }
+
+// TestWatchCarriesSystemEvents: after the pipeline unification, the watch
+// stream carries scratchpad updates, leader changes, and joins — not just
+// messages and broadcasts.
+func TestWatchCarriesSystemEvents(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+
+	resp, err := http.Get(server.URL + "/watch?session=" + sessionID + "&psk=" + psk)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer resp.Body.Close()
+
+	lines := make(chan string, 256)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+	}()
+
+	waitForLine(t, lines, "event: connected")
+
+	set := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/scratchpad/set", sessionID, psk, "agent-1", map[string]any{
+		"key": "plan", "value": "step 1",
+	})
+	set.Body.Close()
+	waitForDataLine(t, lines, `{"type":"scratchpad_update"`)
+
+	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
+	waitForDataLine(t, lines, `{"type":"agent_joined"`)
+
+	xfer := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/leader/transfer", sessionID, psk, "agent-1", map[string]any{
+		"new_leader_id": "agent-2",
+	})
+	xfer.Body.Close()
+	waitForDataLine(t, lines, `{"type":"leader_info"`)
+}
+
+// waitForDataLine reads lines until a data line's JSON payload starts with
+// the given prefix, failing on timeout.
+func waitForDataLine(t *testing.T, lines <-chan string, payloadPrefix string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line := <-lines:
+			if strings.HasPrefix(line, "data:") && strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")), payloadPrefix) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for data payload with prefix %q", payloadPrefix)
+		}
+	}
+}

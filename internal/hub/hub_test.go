@@ -10,6 +10,7 @@ import (
 	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/presence"
+	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
 	"github.com/wltechblog/agentchat-mcp/internal/session"
 )
@@ -206,4 +207,80 @@ func TestLeaderTransfersToOnlineAgentOnExpiry(t *testing.T) {
 func payload(text string) json.RawMessage {
 	b, _ := json.Marshal(map[string]string{"text": text})
 	return b
+}
+
+// TestAllEventsSequencedAndFannedOut: every event — joins, messages,
+// broadcasts, scratchpad, leader — must carry a sequence from the session's
+// single counter and reach the SSE fan-out exactly once. Before the pipeline
+// unification, scratchpad/leader/left events never reached watchers at all.
+func TestAllEventsSequencedAndFannedOut(t *testing.T) {
+	h, store, _ := newTestHub(t, 60*time.Second, 15*time.Second)
+	sess := store.Create("fanout")
+
+	var mu sync.Mutex
+	var sse []protocol.Envelope
+	h.SetNotifier(func(sessionID string, env protocol.Envelope) {
+		mu.Lock()
+		defer mu.Unlock()
+		if sessionID != sess.ID {
+			t.Errorf("notifier got wrong session %q", sessionID)
+		}
+		sse = append(sse, env)
+	})
+
+	h.Register(sess.ID, "agent-a", nil)
+	h.Register(sess.ID, "agent-b", nil)
+	if err := h.SendMessage(sess.ID, "agent-a", "agent-b", "message", payload("hi")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	h.Broadcast(sess.ID, "agent-a", "broadcast", payload("bc"))
+	if _, err := h.ScratchpadSet(sess.ID, "agent-a", "plan", payload("v")); err != nil {
+		t.Fatalf("scratchpad set: %v", err)
+	}
+	if err := h.LeaderTransfer(sess.ID, "agent-a", "agent-b"); err != nil {
+		t.Fatalf("transfer: %v", err)
+	}
+	if err := h.ScratchpadDelete(sess.ID, "agent-b", "plan"); err != nil {
+		t.Fatalf("scratchpad delete: %v", err)
+	}
+	h.Register(sess.ID, "agent-c", nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	wantTypes := []string{
+		"agent_joined", "agent_joined", "message", "broadcast",
+		"scratchpad_update", "leader_info", "scratchpad_update", "agent_joined",
+	}
+	if len(sse) != len(wantTypes) {
+		got := make([]string, len(sse))
+		for i, e := range sse {
+			got[i] = e.Type
+		}
+		t.Fatalf("expected %v on the watcher fan-out, got %v", wantTypes, got)
+	}
+	last := int64(0)
+	for i, env := range sse {
+		if env.Type != wantTypes[i] {
+			t.Fatalf("event %d: expected %q, got %q", i, wantTypes[i], env.Type)
+		}
+		if env.Sequence != last+1 {
+			t.Fatalf("event %d (%s): sequences must advance by one across ALL event types, got %d after %d",
+				i, env.Type, env.Sequence, last)
+		}
+		last = env.Sequence
+	}
+
+	// Mailbox-side spot check: agent-b should hold the direct message, the
+	// broadcast, agent-a's scratchpad update, the leader info, and agent-c's
+	// join. (b's own scratchpad delete is excluded from b's mailbox.)
+	msgs := h.DrainMailbox(sess.ID, "agent-b")
+	if len(msgs) != 5 {
+		t.Fatalf("expected 5 mailbox entries for agent-b, got %d", len(msgs))
+	}
+	for _, m := range msgs {
+		if m.Envelope.Sequence == 0 {
+			t.Fatalf("mailbox entry of type %s has no sequence", m.Envelope.Type)
+		}
+	}
 }

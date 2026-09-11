@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -476,13 +477,24 @@ func TestHistoryRequestAfterSequence(t *testing.T) {
 		}).Body.Close()
 	}
 
-	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/history?after_sequence=2", sessionID, psk, "agent-1", nil)
-	defer resp.Body.Close()
-
+	// System events (agent_joined) share the sequence counter but are not
+	// recorded in history, so derive the watermark from history itself.
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/history", sessionID, psk, "agent-1", nil)
 	var history []protocol.Envelope
 	json.NewDecoder(resp.Body).Decode(&history)
-	if len(history) != 3 {
-		t.Fatalf("expected 3 messages after seq 2, got %d", len(history))
+	resp.Body.Close()
+	if len(history) != 5 {
+		t.Fatalf("expected 5 history messages, got %d", len(history))
+	}
+
+	resp2 := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/history?after_sequence="+
+		strconv.FormatInt(history[2].Sequence, 10), sessionID, psk, "agent-1", nil)
+	defer resp2.Body.Close()
+
+	var after []protocol.Envelope
+	json.NewDecoder(resp2.Body).Decode(&after)
+	if len(after) != 2 {
+		t.Fatalf("expected 2 messages after seq %d, got %d", history[2].Sequence, len(after))
 	}
 }
 

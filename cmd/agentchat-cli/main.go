@@ -65,6 +65,10 @@ type CLI struct {
 	agentID   string
 	agentName string
 	client    *http.Client
+	// lastSeq is the highest envelope sequence shown; used to dedupe the
+	// same envelope arriving via history replay, live SSE, and mailbox
+	// drain. Only touched from the watch goroutine.
+	lastSeq int64
 }
 
 func main() {
@@ -185,7 +189,6 @@ func (c *CLI) listSessions() {
 func (c *CLI) run() {
 	// Register as an agent
 	_, err := c.doJSON("POST", "/sessions/"+c.sessionID+"/register", map[string]any{
-		"agent_name":   c.agentName,
 		"capabilities": []string{"chat", "human"},
 	})
 	if err != nil {
@@ -199,9 +202,11 @@ func (c *CLI) run() {
 	fmt.Printf("%s%s╚══════════════════════════════════════════════════╝%s\n", colorBold, colorCyan, colorReset)
 	fmt.Printf("%sType messages to broadcast. Use /help for commands.%s\n\n", colorDim, colorReset)
 
-	// Start SSE watcher in background
-	sseDone := make(chan struct{})
-	go c.watchSSE(sseDone)
+	quit := make(chan struct{})
+	defer close(quit)
+
+	go c.watchLoop(quit)
+	go c.heartbeatLoop(quit)
 
 	// Handle input
 	sigCh := make(chan os.Signal, 1)
@@ -213,11 +218,6 @@ func (c *CLI) run() {
 		case <-sigCh:
 			fmt.Printf("\n%sGoodbye!%s\n", colorYellow, colorReset)
 			return
-		case <-sseDone:
-			fmt.Printf("\n%sSSE connection lost. Reconnecting...%s\n", colorRed, colorReset)
-			// Create a fresh channel for the new goroutine
-			sseDone = make(chan struct{})
-			go c.watchSSE(sseDone)
 		default:
 			if !scanner.Scan() {
 				return
@@ -231,6 +231,70 @@ func (c *CLI) run() {
 			} else {
 				c.sendBroadcast(line)
 			}
+		}
+	}
+}
+
+// heartbeatLoop keeps the CLI's presence alive; the server expires agents
+// after 60s of inactivity, and an idle human at the terminal is exactly the
+// kind of agent that would otherwise vanish.
+func (c *CLI) heartbeatLoop(quit <-chan struct{}) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-quit:
+			return
+		case <-ticker.C:
+			if _, err := c.doJSON("POST", "/sessions/"+c.sessionID+"/register", map[string]any{
+				"capabilities": []string{"chat", "human"},
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "%sheartbeat failed: %v%s\n", colorDim, err, colorReset)
+			}
+		}
+	}
+}
+
+// watchLoop keeps an SSE connection alive with capped exponential backoff.
+func (c *CLI) watchLoop(quit <-chan struct{}) {
+	backoff := time.Second
+	const maxBackoff = 10 * time.Second
+	const healthyUptime = 30 * time.Second
+
+	for {
+		select {
+		case <-quit:
+			return
+		default:
+		}
+
+		started := time.Now()
+		err := c.watchSSE(quit)
+
+		select {
+		case <-quit:
+			return
+		default:
+		}
+
+		if err != nil {
+			fmt.Printf("%sSSE connection lost (%v). Reconnecting in %v...%s\n", colorRed, err, backoff, colorReset)
+		}
+
+		if time.Since(started) >= healthyUptime {
+			backoff = time.Second
+		} else if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+
+		select {
+		case <-quit:
+			return
+		case <-time.After(backoff):
 		}
 	}
 }
@@ -336,71 +400,136 @@ func (c *CLI) showScratchpad() {
 	fmt.Printf("%sScratchpad:%s\n%s\n", colorBold, colorReset, string(data))
 }
 
-func (c *CLI) watchSSE(done chan struct{}) {
+// sseFrame is a complete Server-Sent Events frame.
+type sseFrame struct {
+	Event string
+	Data  string
+}
+
+// sseParser assembles SSE frames from raw lines, handling multi-line data,
+// comments, CRLF line endings, and retry/id fields per the SSE spec.
+type sseParser struct {
+	event   string
+	data    []string
+	hasData bool
+}
+
+// feed consumes one raw line and returns a frame when a blank line completes
+// one.
+func (p *sseParser) feed(line string) (sseFrame, bool) {
+	line = strings.TrimSuffix(line, "\r")
+
+	switch {
+	case line == "":
+		if !p.hasData {
+			return sseFrame{}, false
+		}
+		f := sseFrame{Event: p.event, Data: strings.Join(p.data, "\n")}
+		p.event, p.data, p.hasData = "", nil, false
+		return f, true
+	case strings.HasPrefix(line, ":"):
+		return sseFrame{}, false // comment / keepalive
+	case strings.HasPrefix(line, "event:"):
+		p.event = strings.TrimPrefix(strings.TrimPrefix(line, "event:"), " ")
+		return sseFrame{}, false
+	case strings.HasPrefix(line, "data:"):
+		p.hasData = true
+		p.data = append(p.data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+		return sseFrame{}, false
+	case strings.HasPrefix(line, "retry:"), strings.HasPrefix(line, "id:"):
+		// The CLI uses its own backoff schedule and has no resume support.
+		return sseFrame{}, false
+	}
+	return sseFrame{}, false
+}
+
+func (c *CLI) watchSSE(quit <-chan struct{}) error {
 	url := fmt.Sprintf("%s/watch?session=%s&psk=%s", c.serverURL, c.sessionID, c.psk)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		fmt.Printf("%sSSE error: %v%s\n", colorRed, err, colorReset)
-		close(done)
-		return
+		return err
 	}
+	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 
-	// Longer timeout for SSE
-	client := &http.Client{Timeout: 0} // no timeout for SSE
+	client := &http.Client{Timeout: 0} // no timeout: the stream is long-lived
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("%sSSE connection failed: %v%s\n", colorRed, err, colorReset)
-		close(done)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("%sSSE error (%d): %s%s\n", colorRed, resp.StatusCode, string(body), colorReset)
-		close(done)
-		return
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
+	var p sseParser
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
-		line := scanner.Text()
+		select {
+		case <-quit:
+			return nil
+		default:
+		}
 
-		if strings.HasPrefix(line, "event: ") {
-			eventType := strings.TrimPrefix(line, "event: ")
+		frame, ok := p.feed(scanner.Text())
+		if !ok {
+			continue
+		}
 
-			// Read data line
-			if !scanner.Scan() {
-				break
-			}
-			dataLine := scanner.Text()
-			if !strings.HasPrefix(dataLine, "data: ") {
-				continue
-			}
-			data := strings.TrimPrefix(dataLine, "data: ")
-
-			// Skip connected event
-			if eventType == "connected" {
-				continue
-			}
-
-			// Parse envelope
+		switch frame.Event {
+		case "connected":
+			// (Re)connected: drain the mailbox so messages missed while the
+			// stream was down are shown (deduped against live/history).
+			c.drainAndDisplay()
+		case "history", "message":
 			var env protocol.Envelope
-			if err := json.Unmarshal([]byte(data), &env); err != nil {
-				continue
+			if err := json.Unmarshal([]byte(frame.Data), &env); err == nil {
+				c.showEnvelope(frame.Event, env)
 			}
-
-			// Display the message
-			c.displayEnvelope(eventType, env)
-
-			// Read empty line separator
-			scanner.Scan()
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("stream ended")
+}
 
-	close(done)
+// showEnvelope displays an envelope, deduping by sequence number so the same
+// event arriving via history replay, live SSE, and mailbox drain shows once.
+func (c *CLI) showEnvelope(eventType string, env protocol.Envelope) {
+	if env.Sequence > 0 {
+		if env.Sequence <= c.lastSeq {
+			return
+		}
+		c.lastSeq = env.Sequence
+	}
+	c.displayEnvelope(eventType, env)
+}
+
+// drainAndDisplay drains this agent's server-side mailbox and displays
+// everything in it — this is how the human sees direct messages at all,
+// and whatever queued while the SSE stream was down.
+func (c *CLI) drainAndDisplay() {
+	result, err := c.doJSON("GET", "/sessions/"+c.sessionID+"/mailbox", nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%smailbox drain failed: %v%s\n", colorDim, err, colorReset)
+		return
+	}
+	data, _ := json.Marshal(result)
+	var resp struct {
+		Messages []struct {
+			Envelope protocol.Envelope `json:"envelope"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(data, &resp) != nil {
+		return
+	}
+	for _, m := range resp.Messages {
+		c.showEnvelope("mailbox", m.Envelope)
+	}
 }
 
 func (c *CLI) displayEnvelope(eventType string, env protocol.Envelope) {

@@ -257,3 +257,45 @@ func TestBackoffJitterStaysBounded(t *testing.T) {
 		t.Fatalf("jitter not capped at max: %v", got)
 	}
 }
+
+// TestHandleSSEEventSignalsOnSystemEvents: with the unified pipeline the
+// stream also carries scratchpad and leader events — the bridge should wake
+// the agent for those (unless it made the change itself).
+func TestHandleSSEEventSignalsOnSystemEvents(t *testing.T) {
+	lastSeq.Store(0) // shared global; isolate this test
+	b := &Bridge{agentID: "a1", signalCh: make(chan struct{}, 1)}
+
+	envJSON := func(msgType, from, to string, seq int64) string {
+		data, _ := json.Marshal(map[string]any{"type": msgType, "from": from, "to": to, "sequence": seq})
+		return string(data)
+	}
+
+	expectSignal := func(msg string) {
+		t.Helper()
+		if len(b.signalCh) != 1 {
+			t.Fatalf("%s: expected a pending signal", msg)
+		}
+		<-b.signalCh
+	}
+	expectQuiet := func(msg string) {
+		t.Helper()
+		if len(b.signalCh) != 0 {
+			t.Fatalf("%s: expected no signal", msg)
+		}
+	}
+
+	b.handleSSEEvent("message", envJSON("scratchpad_update", "agent-b", "*", 1))
+	expectSignal("scratchpad_update from another agent")
+
+	b.handleSSEEvent("message", envJSON("scratchpad_update", "a1", "*", 2))
+	expectQuiet("own scratchpad_update")
+
+	b.handleSSEEvent("message", envJSON("leader_info", "server", "*", 3))
+	expectSignal("leader_info")
+
+	b.handleSSEEvent("message", envJSON("agent_joined", "server", "*", 4))
+	expectQuiet("agent_joined")
+
+	b.handleSSEEvent("message", envJSON("message", "agent-b", "a1", 5))
+	expectSignal("direct message")
+}

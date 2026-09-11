@@ -277,7 +277,7 @@ func (b *Bridge) watchStream(ctx context.Context) error {
 	var eventType, eventData string
 
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSuffix(scanner.Text(), "\r")
 
 		if strings.HasPrefix(line, "event: ") {
 			eventType = strings.TrimPrefix(line, "event: ")
@@ -384,6 +384,12 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 	case "task_assign", "task_status", "task_result", "file_share":
 		// These are message types we want to know about
 		if env.To != b.agentID {
+			return
+		}
+	case "scratchpad_update", "leader_info":
+		// Session-wide state changes worth waking the agent for — unless it
+		// made the change itself and already knows.
+		if env.From == b.agentID {
 			return
 		}
 	case "agent_joined", "agent_left":

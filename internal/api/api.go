@@ -35,10 +35,14 @@ type Handler struct {
 }
 
 func New(h *hub.Hub, store *session.Store) *Handler {
+	w := NewWatcher()
+	// The hub emits every event once and fans out to the SSE watcher here —
+	// API handlers never notify watchers directly.
+	h.SetNotifier(w.Notify)
 	return &Handler{
 		hub:             h,
 		sessionStore:    store,
-		watcher:         NewWatcher(),
+		watcher:         w,
 		ssePingInterval: 15 * time.Second,
 	}
 }
@@ -256,18 +260,8 @@ func (h *Handler) registerAgent(w http.ResponseWriter, r *http.Request) {
 		caps = []string{}
 	}
 
-	isNew := h.hub.Register(sessionID, agentID, caps)
-
-	// Notify watchers of agent join
-	if isNew {
-		h.watcher.Notify(sessionID, protocol.Envelope{
-			Type:      protocol.TypeAgentJoined,
-			SessionID: sessionID,
-			From:      "server",
-			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: caps}),
-			Timestamp: time.Now().UTC(),
-		})
-	}
+	// agent_joined fan-out (mailboxes + watchers) is handled by the hub
+	h.hub.Register(sessionID, agentID, caps)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":    "registered",
@@ -305,16 +299,6 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Notify watchers
-	h.watcher.Notify(sessionID, protocol.Envelope{
-		Type:      msgType,
-		SessionID: sessionID,
-		From:      agentID,
-		To:        req.To,
-		Payload:   req.Payload,
-		Timestamp: time.Now().UTC(),
-	})
-
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
 }
 
@@ -337,16 +321,6 @@ func (h *Handler) broadcastMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.hub.Broadcast(sessionID, agentID, msgType, req.Payload)
-
-	// Notify watchers
-	h.watcher.Notify(sessionID, protocol.Envelope{
-		Type:      msgType,
-		SessionID: sessionID,
-		From:      agentID,
-		To:        "*",
-		Payload:   req.Payload,
-		Timestamp: time.Now().UTC(),
-	})
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
 }
@@ -658,11 +632,6 @@ func (h *Handler) listWatchSessions(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
-}
-
-func mustMarshal(v any) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
