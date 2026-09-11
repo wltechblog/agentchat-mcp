@@ -19,17 +19,18 @@ import (
 const maxHistory = 100
 
 type Hub struct {
-	mu           sync.RWMutex
-	sessionStore *session.Store
-	leader       *leader.Tracker
-	scratchpad   *scratchpad.Store
-	files        *filestore.Store
-	presence     *presence.Tracker
-	mailboxes    *mailbox.Store
-	history      map[string][]protocol.Envelope
-	maxHistory   int
-	seqNums      map[string]int64
-	debugLog     bool
+	mu            sync.RWMutex
+	sessionStore  *session.Store
+	leader        *leader.Tracker
+	scratchpad    *scratchpad.Store
+	files         *filestore.Store
+	presence      *presence.Tracker
+	mailboxes     *mailbox.Store
+	history       map[string][]protocol.Envelope
+	maxHistory    int
+	sweepInterval time.Duration
+	seqNums       map[string]int64
+	debugLog      bool
 }
 
 type Option func(*Hub)
@@ -42,32 +43,62 @@ func WithDebugLog(debug bool) Option {
 	return func(h *Hub) { h.debugLog = debug }
 }
 
+// WithSweepInterval sets how often expired agents are detected. The default
+// is 15s; tests use a much shorter interval.
+func WithSweepInterval(d time.Duration) Option {
+	return func(h *Hub) { h.sweepInterval = d }
+}
+
 func New(store *session.Store, lt *leader.Tracker, sp *scratchpad.Store, fs *filestore.Store, pt *presence.Tracker, mb *mailbox.Store, opts ...Option) *Hub {
 	h := &Hub{
-		sessionStore: store,
-		leader:       lt,
-		scratchpad:   sp,
-		files:        fs,
-		presence:     pt,
-		mailboxes:    mb,
-		history:      make(map[string][]protocol.Envelope),
-		maxHistory:   maxHistory,
-		seqNums:      make(map[string]int64),
+		sessionStore:  store,
+		leader:        lt,
+		scratchpad:    sp,
+		files:         fs,
+		presence:      pt,
+		mailboxes:     mb,
+		history:       make(map[string][]protocol.Envelope),
+		maxHistory:    maxHistory,
+		sweepInterval: 15 * time.Second,
+		seqNums:       make(map[string]int64),
 	}
 	for _, opt := range opts {
 		opt(h)
 	}
 
-	pt.StartSweep(15*time.Second, func(sessionID, agentID string, capabilities []string) {
+	pt.StartSweep(h.sweepInterval, func(sessionID, agentID string, capabilities []string) {
 		h.onAgentExpired(sessionID, agentID, capabilities)
+	}, func(sessionID, agentID string) {
+		// The agent is being forgotten entirely (past the presence tracker's
+		// forget horizon); only now is its mailbox reclaimed.
+		h.mailboxes.DeleteBox(sessionID + "/" + agentID)
 	})
 
 	return h
 }
 
+// nextSeq returns the next sequence number for a session.
 func (h *Hub) nextSeq(sessionID string) int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.seqNums[sessionID]++
 	return h.seqNums[sessionID]
+}
+
+// recordEnvelope assigns the next sequence number and appends the envelope to
+// the session history atomically, so history order always matches sequence
+// order. seqNums and history share h.mu; the counter must never be bumped
+// without the lock (concurrent map writes are a fatal runtime error).
+func (h *Hub) recordEnvelope(sessionID string, env *protocol.Envelope) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.seqNums[sessionID]++
+	env.Sequence = h.seqNums[sessionID]
+	h.history[sessionID] = append(h.history[sessionID], *env)
+	if len(h.history[sessionID]) > h.maxHistory {
+		h.history[sessionID] = h.history[sessionID][len(h.history[sessionID])-h.maxHistory:]
+	}
 }
 
 func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
@@ -79,7 +110,7 @@ func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
 			Type:      protocol.TypeAgentJoined,
 			SessionID: sessionID,
 			From:      "server",
-			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities}),
+			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: true}),
 			Timestamp: time.Now().UTC(),
 		}, agentID)
 
@@ -102,14 +133,23 @@ func (h *Hub) onAgentExpired(sessionID, agentID string, capabilities []string) {
 		Type:      protocol.TypeAgentLeft,
 		SessionID: sessionID,
 		From:      "server",
-		Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities}),
+		Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: false}),
 		Timestamp: time.Now().UTC(),
 	}, "")
 
+	// The agent's mailbox is intentionally kept: messages sent while it is
+	// offline must still be there when it returns. The mailbox is only
+	// reclaimed when the agent is forgotten entirely (see the onForget hook).
+
 	if leaderID, ok := h.leader.GetLeader(sessionID); ok && leaderID == agentID {
-		agents := h.presence.GetAgents(sessionID)
-		if len(agents) > 0 {
-			newLeader := agents[0].AgentID
+		newLeader := ""
+		for _, a := range h.presence.GetAgents(sessionID) {
+			if a.Online {
+				newLeader = a.AgentID
+				break
+			}
+		}
+		if newLeader != "" {
 			h.leader.Transfer(sessionID, agentID, newLeader)
 			slog.Info("leader auto-transferred", "session", sessionID, "old_leader", agentID, "new_leader", newLeader)
 			h.deliverToSessionMailboxes(sessionID, protocol.Envelope{
@@ -119,10 +159,11 @@ func (h *Hub) onAgentExpired(sessionID, agentID string, capabilities []string) {
 				Payload:   mustMarshal(map[string]string{"leader_id": newLeader}),
 				Timestamp: time.Now().UTC(),
 			}, "")
+		} else {
+			// Nobody online to lead; clear so the next agent to join leads.
+			h.leader.ClearSession(sessionID)
 		}
 	}
-
-	h.mailboxes.DeleteBox(sessionID + "/" + agentID)
 }
 
 func (h *Hub) DrainMailbox(sessionID, agentID string) []mailbox.Entry {
@@ -134,20 +175,17 @@ func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawM
 	if to == "" {
 		return fmt.Errorf("'to' is required")
 	}
-	// Check that the target agent exists in the session
-	if !h.presence.IsPresent(sessionID, to) {
-		return fmt.Errorf("agent not found in session: %s", to)
-	}
+	// Delivery does not depend on presence: an offline target's mailbox
+	// accepts the message and it will be there when the target returns.
 	env := protocol.Envelope{
 		Type:      msgType,
 		SessionID: sessionID,
 		From:      from,
 		To:        to,
 		Payload:   payload,
-		Sequence:  h.nextSeq(sessionID),
 		Timestamp: time.Now().UTC(),
 	}
-	h.addToHistory(sessionID, env)
+	h.recordEnvelope(sessionID, &env)
 	h.deliverToAgentMailbox(sessionID, to, env)
 	return nil
 }
@@ -159,10 +197,9 @@ func (h *Hub) Broadcast(sessionID, from, msgType string, payload json.RawMessage
 		From:      from,
 		To:        "",
 		Payload:   payload,
-		Sequence:  h.nextSeq(sessionID),
 		Timestamp: time.Now().UTC(),
 	}
-	h.addToHistory(sessionID, env)
+	h.recordEnvelope(sessionID, &env)
 	h.deliverToSessionMailboxes(sessionID, env, from)
 }
 
@@ -264,10 +301,9 @@ func (h *Hub) ShareFile(sessionID, from, to, fileID, fileName, contentType, desc
 		From:      from,
 		To:        to,
 		Payload:   payload,
-		Sequence:  h.nextSeq(sessionID),
 		Timestamp: time.Now().UTC(),
 	}
-	h.addToHistory(sessionID, env)
+	h.recordEnvelope(sessionID, &env)
 	h.deliverToAgentMailbox(sessionID, to, env)
 	slog.Info("file shared", "session", sessionID, "from", from, "to", to, "file", fileName, "file_id", fileID)
 	return nil
@@ -303,27 +339,24 @@ func (h *Hub) GetHistory(sessionID string) []protocol.Envelope {
 }
 
 func (h *Hub) GetHistoryAfter(sessionID string, afterSeq int64, limit int) []protocol.Envelope {
-	h.mu.RLock()
-	history := h.history[sessionID]
-	h.mu.RUnlock()
-
 	if limit <= 0 {
 		limit = h.maxHistory
 	}
 
-	var filtered []protocol.Envelope
-	for _, e := range history {
+	// Copy the matching slice under the lock: iterating the live slice after
+	// releasing it races with concurrent appends into the same backing array.
+	h.mu.RLock()
+	out := make([]protocol.Envelope, 0, limit)
+	for _, e := range h.history[sessionID] {
 		if e.Sequence > afterSeq {
-			filtered = append(filtered, e)
+			out = append(out, e)
 		}
-		if len(filtered) >= limit {
+		if len(out) >= limit {
 			break
 		}
 	}
-	if filtered == nil {
-		filtered = []protocol.Envelope{}
-	}
-	return filtered
+	h.mu.RUnlock()
+	return out
 }
 
 func (h *Hub) GetScratchpad(sessionID string) []protocol.ScratchpadEntry {
@@ -345,16 +378,6 @@ func (h *Hub) CloseSession(sessionID string) {
 	h.leader.ClearSession(sessionID)
 	h.scratchpad.ClearSession(sessionID)
 	h.files.ClearSession(sessionID)
-}
-
-func (h *Hub) addToHistory(sessionID string, env protocol.Envelope) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.history[sessionID] = append(h.history[sessionID], env)
-	if len(h.history[sessionID]) > h.maxHistory {
-		h.history[sessionID] = h.history[sessionID][len(h.history[sessionID])-h.maxHistory:]
-	}
 }
 
 func mustMarshal(v any) json.RawMessage {

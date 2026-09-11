@@ -99,6 +99,9 @@ type AuthPayload struct {
 type AgentInfo struct {
 	AgentID      string   `json:"agent_id"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	// Online is false once the agent has been inactive past the presence TTL.
+	// Offline agents stay listed and keep receiving mail.
+	Online bool `json:"online"`
 }
 
 type ScratchpadSetPayload struct {

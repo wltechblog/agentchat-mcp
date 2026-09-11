@@ -1,0 +1,209 @@
+package hub
+
+import (
+	"encoding/json"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/wltechblog/agentchat-mcp/internal/filestore"
+	"github.com/wltechblog/agentchat-mcp/internal/leader"
+	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
+	"github.com/wltechblog/agentchat-mcp/internal/presence"
+	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
+	"github.com/wltechblog/agentchat-mcp/internal/session"
+)
+
+// newTestHub wires a Hub over fresh stores with a short presence TTL and
+// sweep interval so expiry behavior can be tested quickly.
+func newTestHub(t *testing.T, ttl, sweepInterval time.Duration) (*Hub, *session.Store, *presence.Tracker) {
+	t.Helper()
+	store := session.NewStore()
+	pt := presence.NewTracker(ttl)
+	h := New(store,
+		leader.NewTracker(),
+		scratchpad.NewStore(),
+		filestore.NewStore(1<<20),
+		pt,
+		mailbox.NewStore(1000),
+		WithSweepInterval(sweepInterval),
+	)
+	t.Cleanup(pt.Stop)
+	return h, store, pt
+}
+
+// TestConcurrentSendNoRace hammers SendMessage/Broadcast/scratchpad writes
+// from many goroutines while readers walk the history. Before the seqNums
+// and history locking fixes this died with concurrent-map-write fatals and
+// tripped the race detector in GetHistoryAfter.
+func TestConcurrentSendNoRace(t *testing.T) {
+	h, store, _ := newTestHub(t, 60*time.Second, 15*time.Second)
+	sess := store.Create("race")
+
+	for _, id := range []string{"agent-a", "agent-b", "agent-c"} {
+		h.Register(sess.ID, id, nil)
+	}
+
+	payload, _ := json.Marshal(map[string]string{"x": "y"})
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				switch n % 3 {
+				case 0:
+					_ = h.SendMessage(sess.ID, "agent-a", "agent-b", "message", payload)
+				case 1:
+					h.Broadcast(sess.ID, "agent-b", "broadcast", payload)
+				case 2:
+					_, _ = h.ScratchpadSet(sess.ID, "agent-c", "key", payload)
+				}
+			}
+		}(i)
+	}
+
+	// Concurrent history readers: previously a data race with writers.
+	stop := make(chan struct{})
+	var readerWG sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		readerWG.Add(1)
+		go func() {
+			defer readerWG.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = h.GetHistory(sess.ID)
+					_ = h.GetHistoryAfter(sess.ID, 0, 50)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(stop)
+	readerWG.Wait()
+
+	// History order must match sequence order: strictly increasing sequences.
+	history := h.GetHistory(sess.ID)
+	for i := 1; i < len(history); i++ {
+		if history[i].Sequence <= history[i-1].Sequence {
+			t.Fatalf("history out of sequence order at %d: seq %d after %d",
+				i, history[i].Sequence, history[i-1].Sequence)
+		}
+	}
+}
+
+// TestMailboxSurvivesPresenceExpiry verifies the core delivery guarantee:
+// an agent that goes idle past the TTL still has its mailbox intact, still
+// receives direct messages and broadcasts, and shows as online=false.
+func TestMailboxSurvivesPresenceExpiry(t *testing.T) {
+	h, store, _ := newTestHub(t, 50*time.Millisecond, 10*time.Millisecond)
+	sess := store.Create("survive")
+
+	h.Register(sess.ID, "agent-a", []string{"search"})
+	if agents := h.GetSessionAgents(sess.ID); !agents[0].Online {
+		t.Fatal("expected freshly registered agent to be online")
+	}
+
+	if err := h.SendMessage(sess.ID, "agent-b", "agent-a", "message", payload("before")); err != nil {
+		t.Fatalf("send before expiry: %v", err)
+	}
+
+	// Let the agent lapse past the TTL and let the sweep run.
+	time.Sleep(200 * time.Millisecond)
+
+	agents := h.GetSessionAgents(sess.ID)
+	if len(agents) != 1 {
+		t.Fatalf("expected expired agent to stay listed, got %d agents", len(agents))
+	}
+	if agents[0].Online {
+		t.Fatal("expected expired agent to show online=false")
+	}
+	if len(agents[0].Capabilities) != 1 || agents[0].Capabilities[0] != "search" {
+		t.Fatalf("expected capabilities to survive expiry, got %v", agents[0].Capabilities)
+	}
+
+	// Sends to the offline agent must succeed, not fail.
+	if err := h.SendMessage(sess.ID, "agent-b", "agent-a", "message", payload("after")); err != nil {
+		t.Fatalf("send to expired agent should succeed: %v", err)
+	}
+	h.Broadcast(sess.ID, "agent-b", "broadcast", payload("bcast"))
+
+	msgs := h.DrainMailbox(sess.ID, "agent-a")
+	// DM before expiry, agent_left at expiry, DM + broadcast after expiry.
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 queued entries, got %d", len(msgs))
+	}
+	gotTypes := map[string]bool{}
+	for _, m := range msgs {
+		gotTypes[m.Envelope.Type] = true
+	}
+	for _, want := range []string{"message", "agent_left", "broadcast"} {
+		if !gotTypes[want] {
+			t.Fatalf("expected %q in drained mailbox, got %v", want, gotTypes)
+		}
+	}
+
+	// Coming back online preserves identity and capabilities.
+	h.Register(sess.ID, "agent-a", nil)
+	agents = h.GetSessionAgents(sess.ID)
+	if len(agents) != 1 || !agents[0].Online {
+		t.Fatalf("expected returning agent online, got %+v", agents)
+	}
+	if len(agents[0].Capabilities) != 1 || agents[0].Capabilities[0] != "search" {
+		t.Fatalf("expected capabilities to survive the round trip, got %v", agents[0].Capabilities)
+	}
+}
+
+// TestLeaderClearsWhenNoOnlineAgents: when the leader expires and nobody is
+// online, leadership must be released so the next agent to join leads.
+func TestLeaderClearsWhenNoOnlineAgents(t *testing.T) {
+	h, store, _ := newTestHub(t, 50*time.Millisecond, 10*time.Millisecond)
+	sess := store.Create("leader-clear")
+
+	h.Register(sess.ID, "agent-a", nil)
+	if h.GetLeader(sess.ID) != "agent-a" {
+		t.Fatal("expected agent-a to lead")
+	}
+
+	time.Sleep(200 * time.Millisecond) // expire; no one else online
+
+	if got := h.GetLeader(sess.ID); got != "" {
+		t.Fatalf("expected leadership cleared after last agent expired, got %q", got)
+	}
+
+	// A new joiner becomes leader instead of inheriting a ghost.
+	h.Register(sess.ID, "agent-b", nil)
+	if got := h.GetLeader(sess.ID); got != "agent-b" {
+		t.Fatalf("expected new joiner to lead, got %q", got)
+	}
+}
+
+// TestLeaderTransfersToOnlineAgentOnExpiry: when the leader expires, an
+// online agent takes over — not another offline one.
+func TestLeaderTransfersToOnlineAgentOnExpiry(t *testing.T) {
+	h, store, _ := newTestHub(t, 50*time.Millisecond, 10*time.Millisecond)
+	sess := store.Create("leader-transfer")
+
+	h.Register(sess.ID, "agent-a", nil)
+	h.Register(sess.ID, "agent-b", nil)
+	h.Register(sess.ID, "agent-c", nil)
+
+	// Only agent-c stays online past the TTL (simulated by continued activity).
+	deadline := time.Now().Add(2 * time.Second)
+	for h.GetLeader(sess.ID) != "agent-c" {
+		h.RefreshPresence(sess.ID, "agent-c")
+		if time.Now().After(deadline) {
+			t.Fatalf("expected leadership to land on agent-c, got %q", h.GetLeader(sess.ID))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func payload(text string) json.RawMessage {
+	b, _ := json.Marshal(map[string]string{"text": text})
+	return b
+}

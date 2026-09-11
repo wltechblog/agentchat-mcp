@@ -5,8 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -30,27 +30,34 @@ type pendingSignalInfo struct {
 	Sequence    int64  `json:"sequence"`
 }
 
-// startWatcher connects to the server's SSE /watch endpoint and sends
-// a check_messages signal to picobot whenever a message arrives for this agent.
+// startWatcher runs the bridge's server-facing background loops.
+//
+// Two things happen for EVERY bridge, regardless of signal-socket config:
+//  1. Registration at startup, so the agent is visible to peers and its
+//     mailbox exists before anyone tries to message it.
+//  2. A presence heartbeat every 30s — without it the agent expires after
+//     the server's presence TTL (60s) and appears offline.
+//
+// The SSE watch loop (which triggers picobot signals on incoming messages)
+// only runs when a signal socket is configured.
 func (b *Bridge) startWatcher(ctx context.Context) {
-	if b.signalSocketPath == "" {
-		slog.Info("watcher: no signal socket configured, skipping SSE watch")
-		return
-	}
-
 	// Register with the server immediately so our mailbox exists
-	// before we start watching for incoming messages.
+	// before peers try to message us.
 	if err := b.ensureInit(); err != nil {
 		slog.Error("watcher: failed to register with server on startup", "error", err)
 		// Continue anyway — tools will retry registration on demand
 	}
 
+	// Start presence heartbeat to keep the agent visible in list_agents.
+	go b.presenceHeartbeat(ctx)
+
+	if b.signalSocketPath == "" {
+		slog.Info("watcher: no signal socket configured, skipping SSE watch")
+		return
+	}
+
 	// Initialize lastSeq from current history so we skip stale messages on startup.
 	b.initLastSeq(ctx)
-
-	// Start presence heartbeat to keep agent visible in list_agents.
-	// The server's presence tracker has a 60s TTL, so we refresh every 30s.
-	go b.presenceHeartbeat(ctx)
 
 	go func() {
 		for {

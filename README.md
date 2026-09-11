@@ -27,10 +27,10 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
 ## Features
 
 - **Session-based isolation** — Agents join named sessions, each with a unique PSK
-- **Server-side mailboxes** — Every message for an agent is queued in their mailbox regardless of connection state. Agents poll to drain messages (destructive read).
-- **Lazy connection** — The MCP bridge doesn't contact the server until a tool is actually invoked. Spawned-but-unused processes consume zero server resources.
+- **Server-side mailboxes** — Every message for an agent is queued in their mailbox regardless of connection state, including while the agent is offline. Agents poll to drain messages (destructive read).
+- **Reliable event stream** — The server's SSE `/watch` endpoint sends keepalive pings so idle streams survive proxies, and advises clients to reconnect quickly after a disconnect.
 - **Multiple process tolerant** — Multiple MCP bridge instances for the same agent work correctly. First poll wins (competing consumer semantics). No duplicate delivery.
-- **Activity-based presence** — Any authenticated request refreshes agent presence. Agents expire after 60s of inactivity, with configurable TTL.
+- **Offline-tolerant presence** — Any authenticated request refreshes agent presence. Agents that go idle past the TTL (60s) stay listed as `online: false` and keep receiving mail, so nothing is lost while they're away.
 - **Real-time messaging** — Direct messages (agent-to-agent) and broadcasts (to all session members)
 - **Shared scratchpad** — Key-value store per session for shared context, with real-time update broadcasts to mailboxes
 - **Leader election** — First agent in a session becomes leader; supports explicit transfer and auto-transfer on expiry
@@ -249,7 +249,7 @@ Each agent gets its own entry in the MCP host config, all pointing to the same s
 
 ### How it works
 
-The bridge exposes MCP tools over stdio and communicates with the server via REST. It does **not** connect to the server on startup — the first tool call triggers a registration request. Spawned-but-unused bridge processes consume zero server resources.
+The bridge exposes MCP tools over stdio and communicates with the server via REST. On startup it registers with the server and keeps its presence alive with a heartbeat every 30s, so the agent is visible and message-able even before its first tool call.
 
 ```
 ┌───────────────────┐   MCP (stdio)   ┌──────────────────────┐    HTTP/REST    ┌──────────┐
@@ -258,7 +258,7 @@ The bridge exposes MCP tools over stdio and communicates with the server via RES
 └───────────────────┘                 └──────────────────────┘                 └──────────┘
 ```
 
-Messages destined for the agent are queued in a server-side mailbox. `receive_messages` and `wait_for_message` drain the mailbox via `GET /sessions/{id}/mailbox`.
+Messages destined for the agent are queued in a server-side mailbox, including while the agent is offline. `receive_messages` and `wait_for_message` drain the mailbox via `GET /sessions/{id}/mailbox`.
 
 ### Using the tools
 

@@ -20,9 +20,9 @@ import (
 )
 
 const (
-	maxFileSize   = 50 << 20
-	presenceTTL   = 60 * time.Second
-	mailboxMax    = 1000
+	maxFileSize = 50 << 20
+	presenceTTL = 60 * time.Second
+	mailboxMax  = 1000
 )
 
 func main() {

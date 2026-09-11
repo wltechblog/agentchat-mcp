@@ -31,7 +31,9 @@ func (w *Watcher) Subscribe(sessionID string) chan protocol.Envelope {
 	return ch
 }
 
-// Unsubscribe removes a channel.
+// Unsubscribe removes a channel. The channel is deliberately not closed:
+// an unsubscribed channel simply becomes garbage once it is no longer
+// referenced, which makes send-on-closed-channel races impossible.
 func (w *Watcher) Unsubscribe(sessionID string, ch chan protocol.Envelope) {
 	w.mu.Lock()
 	if subs, ok := w.subs[sessionID]; ok {
@@ -39,18 +41,20 @@ func (w *Watcher) Unsubscribe(sessionID string, ch chan protocol.Envelope) {
 		if len(subs) == 0 {
 			delete(w.subs, sessionID)
 		}
-		close(ch)
 	}
 	w.mu.Unlock()
 }
 
 // Notify sends an envelope to all subscribers of a session.
+//
+// The read lock is held for the entire loop so Unsubscribe cannot remove a
+// channel mid-iteration. This is safe because sends are non-blocking — the
+// lock is never held on a slow subscriber.
 func (w *Watcher) Notify(sessionID string, env protocol.Envelope) {
 	w.mu.RLock()
-	subs := w.subs[sessionID]
-	w.mu.RUnlock()
+	defer w.mu.RUnlock()
 
-	for ch := range subs {
+	for ch := range w.subs[sessionID] {
 		select {
 		case ch <- env:
 		default:

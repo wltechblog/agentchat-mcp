@@ -28,10 +28,10 @@ type Bridge struct {
 	client       *http.Client
 	sseClient    *http.Client
 
-	mu                sync.Mutex
-	initialized       bool
-	debugLog          bool
-	signalSocketPath  string // path to picobot's Unix socket (local)
+	mu               sync.Mutex
+	initialized      bool
+	debugLog         bool
+	signalSocketPath string // path to picobot's Unix socket (local)
 }
 
 func main() {
@@ -79,7 +79,7 @@ func main() {
 		agentID:          agentID,
 		capabilities:     caps,
 		client:           &http.Client{Timeout: 30 * time.Second},
-	sseClient:        &http.Client{},
+		sseClient:        &http.Client{},
 		debugLog:         debugLog,
 		signalSocketPath: signalSocketPath,
 	}

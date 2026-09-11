@@ -89,8 +89,8 @@ func doAuthRequest(t *testing.T, server, method, path, sessionID, psk, agentID s
 func registerAgent(t *testing.T, server, sessionID, psk, agentID string, caps []string) {
 	t.Helper()
 	body := map[string]any{
-		"agent_name":    agentID,
-		"capabilities":  caps,
+		"agent_name":   agentID,
+		"capabilities": caps,
 	}
 	resp := doAuthRequest(t, server, "POST", "/sessions/"+sessionID+"/register", sessionID, psk, agentID, body)
 	defer resp.Body.Close()

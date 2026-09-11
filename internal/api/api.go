@@ -28,16 +28,18 @@ const (
 )
 
 type Handler struct {
-	hub          *hub.Hub
-	sessionStore *session.Store
-	watcher      *Watcher
+	hub             *hub.Hub
+	sessionStore    *session.Store
+	watcher         *Watcher
+	ssePingInterval time.Duration
 }
 
 func New(h *hub.Hub, store *session.Store) *Handler {
 	return &Handler{
-		hub:          h,
-		sessionStore: store,
-		watcher:      NewWatcher(),
+		hub:             h,
+		sessionStore:    store,
+		watcher:         NewWatcher(),
+		ssePingInterval: 15 * time.Second,
 	}
 }
 
@@ -573,17 +575,22 @@ func handleSSE(h *Handler) http.HandlerFunc {
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("X-Accel-Buffering", "no")
 
-		// Flush headers
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		flush := func() {
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
 		}
+
+		// Advise clients to reconnect quickly if the stream ends. Keepalive
+		// pings below keep intermediate proxies from reaping idle streams.
+		fmt.Fprint(w, "retry: 3000\n\n")
+		flush()
 
 		// Send initial connection event
 		fmt.Fprintf(w, "event: connected\ndata: {\"session\":\"%s\",\"time\":\"%s\"}\n\n", sessionID, time.Now().UTC().Format(time.RFC3339))
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
+		flush()
 
 		// Send recent history
 		history := h.hub.GetHistory(sessionID)
@@ -591,19 +598,27 @@ func handleSSE(h *Handler) http.HandlerFunc {
 			data, _ := json.Marshal(env)
 			fmt.Fprintf(w, "event: history\ndata: %s\n\n", data)
 		}
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
+		flush()
 
 		// Subscribe to live messages
 		ch := h.watcher.Subscribe(sessionID)
 		defer h.watcher.Unsubscribe(sessionID, ch)
+
+		// Keepalive: emit an SSE comment on a fixed interval so clients and
+		// proxies can tell a live-but-idle stream from a dead connection.
+		ping := time.NewTicker(h.ssePingInterval)
+		defer ping.Stop()
 
 		ctx := r.Context()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-ping.C:
+				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flush()
 			case env, ok := <-ch:
 				if !ok {
 					return
@@ -613,9 +628,7 @@ func handleSSE(h *Handler) http.HandlerFunc {
 					continue
 				}
 				fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
+				flush()
 			}
 		}
 	}
@@ -630,7 +643,8 @@ func (h *Handler) listWatchSessions(w http.ResponseWriter, r *http.Request) {
 		agentList := make([]map[string]any, 0, len(agents))
 		for _, a := range agents {
 			agentList = append(agentList, map[string]any{
-				"id": a.AgentID,
+				"id":     a.AgentID,
+				"online": a.Online,
 			})
 		}
 		out = append(out, map[string]any{
