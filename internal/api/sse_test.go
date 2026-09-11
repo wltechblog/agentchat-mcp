@@ -74,3 +74,54 @@ func TestSSEKeepaliveAndRetry(t *testing.T) {
 		}
 	}
 }
+
+// TestSSELiveDelivery verifies messages sent after a client connects arrive
+// as live events. Combined with subscribe-before-history in the handler,
+// there is no window between connect and subscription where events are lost.
+func TestSSELiveDelivery(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+
+	resp, err := http.Get(server.URL + "/watch?session=" + sessionID + "&psk=" + psk)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer resp.Body.Close()
+
+	lines := make(chan string, 256)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+	}()
+
+	waitForLine(t, lines, "event: connected")
+
+	// A broadcast sent after the client connected must arrive as a live event.
+	broadcast := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/broadcast", sessionID, psk, "agent-1", map[string]any{
+		"type":    "broadcast",
+		"payload": map[string]string{"text": "live one"},
+	})
+	broadcast.Body.Close()
+
+	waitForLine(t, lines, "event: message")
+	waitForLine(t, lines, `data: {"type":"broadcast","session_id":"`+sessionID+`","from":"agent-1"`)
+}
+
+// waitForLine reads lines until one has the given prefix, failing on timeout.
+func waitForLine(t *testing.T, lines <-chan string, prefix string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line := <-lines:
+			if strings.HasPrefix(line, prefix) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for line %q", prefix)
+		}
+	}
+}

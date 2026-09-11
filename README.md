@@ -29,6 +29,7 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
 - **Session-based isolation** — Agents join named sessions, each with a unique PSK
 - **Server-side mailboxes** — Every message for an agent is queued in their mailbox regardless of connection state, including while the agent is offline. Agents poll to drain messages (destructive read).
 - **Reliable event stream** — The server's SSE `/watch` endpoint sends keepalive pings so idle streams survive proxies, and advises clients to reconnect quickly after a disconnect.
+- **Retried wake-up signals** — When a message arrives for a picobot-backed agent, the bridge signals it via the local Unix socket; failed signal sends retry with capped exponential backoff and the agent is re-signalled on every stream reconnect, so a missed wake-up is never final.
 - **Multiple process tolerant** — Multiple MCP bridge instances for the same agent work correctly. First poll wins (competing consumer semantics). No duplicate delivery.
 - **Offline-tolerant presence** — Any authenticated request refreshes agent presence. Agents that go idle past the TTL (60s) stay listed as `online: false` and keep receiving mail, so nothing is lost while they're away.
 - **Real-time messaging** — Direct messages (agent-to-agent) and broadcasts (to all session members)
@@ -269,7 +270,7 @@ Once configured, agents can use these MCP tools to communicate:
 | `send_message` | Send a direct message to another agent (remote agent may take time to respond) |
 | `broadcast` | Broadcast a message to all agents in the session |
 | `receive_messages` | Drain mailbox — retrieve all queued incoming messages (returns immediately) |
-| `wait_for_message` | Poll mailbox until a matching message arrives, with optional filters (`type`, `from`) and timeout |
+| `wait_for_message` | Poll mailbox until a matching message arrives, with optional filters (`type`, `from`) and timeout. Messages that don't match are retained for the next drain, never discarded |
 | `send_and_wait` | Send a message and poll until a reply arrives from the target agent |
 | `list_agents` | List all active agents and their capabilities |
 | `get_leader` | Get the current session leader |

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -16,9 +17,12 @@ import (
 	"github.com/wltechblog/agentchat-mcp/internal/signal"
 )
 
-// lastSeq tracks the highest sequence number we've seen, to avoid
-// re-processing old messages on SSE reconnect.
+// lastSeq tracks the highest sequence number we've seen on the SSE stream, so
+// stale messages are skipped on reconnect.
 var lastSeq atomic.Int64
+
+// lastConnectSignal rate-limits the wake-up signal sent on every (re)connect.
+var lastConnectSignal atomic.Int64
 
 // pendingSignal holds metadata about the message(s) that triggered the last signal,
 // so we can include contextual info when the agent calls receive_messages or wait_for_message.
@@ -30,6 +34,31 @@ type pendingSignalInfo struct {
 	Sequence    int64  `json:"sequence"`
 }
 
+const (
+	// SSE reconnect backoff: starts at sseBaseBackoff and doubles (with
+	// jitter) up to sseMaxBackoff. A stream that stayed up sseHealthyUptime
+	// counts as healthy and resets the curve.
+	sseBaseBackoff   = 500 * time.Millisecond
+	sseMaxBackoff    = 30 * time.Second
+	sseHealthyUptime = 30 * time.Second
+
+	// The server pings idle SSE streams every 15s. If nothing at all arrives
+	// for sseWatchdogTimeout the connection is dead (a half-open TCP
+	// connection is indistinguishable from an idle one), so we force a
+	// reconnect instead of blocking on it forever.
+	sseWatchdogTimeout = 45 * time.Second
+	sseWatchdogTick    = 5 * time.Second
+
+	// Wake-up signal send retries use the same capped exponential backoff.
+	signalBaseBackoff = 500 * time.Millisecond
+	signalMaxBackoff  = 30 * time.Second
+
+	// Minimum gap between wake-up signals triggered by stream (re)connects,
+	// so a flapping stream can't spam picobot. Message-triggered signals are
+	// never rate-limited.
+	reconnectSignalMinGap = 10 * time.Second
+)
+
 // startWatcher runs the bridge's server-facing background loops.
 //
 // Two things happen for EVERY bridge, regardless of signal-socket config:
@@ -38,8 +67,8 @@ type pendingSignalInfo struct {
 //  2. A presence heartbeat every 30s — without it the agent expires after
 //     the server's presence TTL (60s) and appears offline.
 //
-// The SSE watch loop (which triggers picobot signals on incoming messages)
-// only runs when a signal socket is configured.
+// The SSE watch loop (which requests picobot signals on incoming messages)
+// and the signal delivery loop only run when a signal socket is configured.
 func (b *Bridge) startWatcher(ctx context.Context) {
 	// Register with the server immediately so our mailbox exists
 	// before peers try to message us.
@@ -56,28 +85,8 @@ func (b *Bridge) startWatcher(ctx context.Context) {
 		return
 	}
 
-	// Initialize lastSeq from current history so we skip stale messages on startup.
-	b.initLastSeq(ctx)
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			err := b.watchStream(ctx)
-			if err != nil {
-				slog.Error("watcher: SSE stream error, reconnecting in 5s", "error", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(5 * time.Second):
-				}
-			}
-		}
-	}()
+	go b.signalLoop(ctx)
+	go b.sseLoop(ctx)
 }
 
 // presenceHeartbeat periodically sends a registration request to keep
@@ -134,8 +143,9 @@ func (b *Bridge) touchPresence(ctx context.Context) error {
 }
 
 // initLastSeq fetches the current session history and sets lastSeq to the
-// highest sequence number found. This ensures that on startup/reconnect,
-// only genuinely new messages trigger signals.
+// highest sequence number found. Called on every (re)connect: after a server
+// restart a recreated session starts sequence numbers from 1 again, and
+// without this re-sync every live event would be skipped as stale.
 func (b *Bridge) initLastSeq(ctx context.Context) {
 	type histEntry struct {
 		Sequence int64 `json:"sequence"`
@@ -180,17 +190,60 @@ func (b *Bridge) initLastSeq(ctx context.Context) {
 	slog.Info("watcher: initialized lastSeq from history", "lastSeq", maxSeq)
 }
 
+// sseLoop keeps a watch connection alive for the lifetime of the bridge:
+// reconnects with capped exponential backoff plus jitter, and resets the
+// backoff after a stream that stayed up long enough to be considered healthy.
+func (b *Bridge) sseLoop(ctx context.Context) {
+	backoff := sseBaseBackoff
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		started := time.Now()
+		err := b.watchStream(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			slog.Error("watcher: SSE stream error", "error", err, "reconnect_in", backoff)
+		}
+
+		if time.Since(started) >= sseHealthyUptime {
+			backoff = sseBaseBackoff
+		} else {
+			backoff = backoffJitter(backoff*2, sseMaxBackoff)
+		}
+
+		if !sleepCtx(ctx, backoff) {
+			return
+		}
+	}
+}
+
+// watchStream connects to the server's SSE /watch endpoint and processes
+// events until the stream ends. A watchdog cancels the stream if no bytes
+// arrive for sseWatchdogTimeout, converting a silently-dead connection into
+// a reconnect instead of a forever-blocked read.
 func (b *Bridge) watchStream(ctx context.Context) error {
+	// Re-sync the stale-skip watermark before connecting.
+	b.initLastSeq(ctx)
+
+	// streamCtx is cancellable by the watchdog to force a reconnect.
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	url := fmt.Sprintf("%s/watch?session=%s&psk=%s", b.httpBase, b.sessionID, b.psk)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(streamCtx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 
-	// Use sseClient (no timeout) instead of b.client (30s timeout)
+	// sseClient has no timeout: the stream is long-lived. Dead connections
+	// are detected by the watchdog below, not by a request timeout.
 	resp, err := b.sseClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -203,7 +256,22 @@ func (b *Bridge) watchStream(ctx context.Context) error {
 
 	slog.Info("watcher: connected to SSE stream")
 
-	scanner := bufio.NewScanner(resp.Body)
+	// Wake the agent so anything queued while we were offline gets checked.
+	// Rate-limited so a flapping stream doesn't spam picobot.
+	if last := time.Unix(0, lastConnectSignal.Load()); time.Since(last) >= reconnectSignalMinGap {
+		lastConnectSignal.Store(time.Now().UnixNano())
+		b.requestSignal("connected")
+	}
+
+	lastRead := &atomic.Int64{}
+	lastRead.Store(time.Now().UnixNano())
+	body := &watchdogBody{ReadCloser: resp.Body, lastRead: lastRead}
+
+	stopWatchdog := make(chan struct{})
+	defer close(stopWatchdog)
+	go b.watchdog(streamCtx, cancel, lastRead, stopWatchdog)
+
+	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	var eventType, eventData string
@@ -234,6 +302,42 @@ func (b *Bridge) watchStream(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("stream ended")
+}
+
+// watchdogBody tracks the last time data arrived so the watchdog can tell a
+// live-but-idle stream from a dead connection.
+type watchdogBody struct {
+	io.ReadCloser
+	lastRead *atomic.Int64
+}
+
+func (w *watchdogBody) Read(p []byte) (int, error) {
+	n, err := w.ReadCloser.Read(p)
+	if n > 0 {
+		w.lastRead.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (b *Bridge) watchdog(streamCtx context.Context, cancel context.CancelFunc, lastRead *atomic.Int64, stop <-chan struct{}) {
+	ticker := time.NewTicker(sseWatchdogTick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-streamCtx.Done():
+			return
+		case <-ticker.C:
+			idle := time.Since(time.Unix(0, lastRead.Load()))
+			if idle > sseWatchdogTimeout {
+				slog.Warn("watcher: SSE stream idle past watchdog timeout, forcing reconnect", "idle", idle)
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 type sseEnvelope struct {
@@ -300,7 +404,7 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 		triggerType = "broadcast"
 	}
 
-	slog.Info("watcher: relevant message detected, sending check_messages signal",
+	slog.Info("watcher: relevant message detected, requesting check_messages signal",
 		"type", env.Type,
 		"from", env.From,
 		"to", env.To,
@@ -316,23 +420,89 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 		Sequence:    env.Sequence,
 	})
 
+	// Request a wake-up signal instead of sending synchronously: the signal
+	// loop coalesces requests and retries failed sends, and this read loop
+	// never blocks on a slow picobot socket.
+	b.requestSignal("message")
+}
+
+// requestSignal asks the signal loop to deliver a check_messages signal.
+// Requests are coalesced: a capacity-1 channel with non-blocking send means
+// any number of concurrent requests become at most one pending signal.
+func (b *Bridge) requestSignal(reason string) {
+	select {
+	case b.signalCh <- struct{}{}:
+	default:
+	}
+	slog.Debug("watcher: signal requested", "reason", reason)
+}
+
+// signalLoop delivers check_messages signals to the local picobot socket.
+// A failed send is retried with capped exponential backoff until it succeeds,
+// so a missed wake-up is never final (e.g. while picobot is restarting).
+func (b *Bridge) signalLoop(ctx context.Context) {
+	backoff := signalBaseBackoff
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-b.signalCh:
+		}
+
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+
+			err := b.sendCheckMessagesSignal()
+			if err == nil {
+				backoff = signalBaseBackoff
+				break
+			}
+
+			slog.Error("watcher: signal send failed, will retry", "error", err, "retry_in", backoff)
+			if !sleepCtx(ctx, backoffJitter(backoff, signalMaxBackoff)) {
+				return
+			}
+			backoff = min(backoff*2, signalMaxBackoff)
+		}
+	}
+}
+
+// sendCheckMessagesSignal sends the wake-up signal, attaching metadata about
+// the most recent triggering message for auditing.
+func (b *Bridge) sendCheckMessagesSignal() error {
 	sig := signal.Signal{
 		Source: "agentchat-mcp",
 		Action: "check_messages",
-		Metadata: map[string]interface{}{
-			"trigger_type": triggerType,
-			"from_agent":   env.From,
-			"sequence":     env.Sequence,
-		},
 	}
-
-	resp, err := signal.SendToSocket(b.signalSocketPath, sig)
-	if err != nil {
-		slog.Error("watcher: failed to send signal", "error", err)
-		return
+	if info := pendingSignal.Load(); info != nil {
+		sig.Metadata = map[string]interface{}{
+			"trigger_type": info.TriggerType,
+			"from_agent":   info.FromAgent,
+			"sequence":     info.Sequence,
+		}
 	}
+	_, err := signal.SendToSocket(b.signalSocketPath, sig)
+	return err
+}
 
-	slog.Info("watcher: signal sent", "response", resp)
+// backoffJitter returns a duration in [d/2, d], capped at max.
+func backoffJitter(d, max time.Duration) time.Duration {
+	if d > max {
+		d = max
+	}
+	half := d / 2
+	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 // getPendingSignalInfo returns and clears the pending signal metadata.

@@ -32,6 +32,13 @@ type Bridge struct {
 	initialized      bool
 	debugLog         bool
 	signalSocketPath string // path to picobot's Unix socket (local)
+
+	// signalCh coalesces wake-up requests for the signal loop (capacity 1,
+	// non-blocking sends). Only used when signalSocketPath is set.
+	signalCh chan struct{}
+	// holdback keeps messages drained from the server but not yet accepted
+	// by a filtered wait, so wait_for_message filters never destroy them.
+	holdback holdbackBuffer
 }
 
 func main() {
@@ -82,6 +89,7 @@ func main() {
 		sseClient:        &http.Client{},
 		debugLog:         debugLog,
 		signalSocketPath: signalSocketPath,
+		signalCh:         make(chan struct{}, 1),
 	}
 
 	server := mcp.NewServer("agentchat-mcp-bridge", "1.3.0")
@@ -188,14 +196,57 @@ func (b *Bridge) doJSON(method, path string, payload any) (any, error) {
 	return result, nil
 }
 
-// drainAll fetches messages from both the mailbox (direct messages) and
-// recent history (broadcasts and other messages not delivered to the mailbox),
-// merges them, deduplicates by sequence number, and tags each message with
-// _source ("mailbox" or "history") and _delivery ("direct" or "broadcast").
+// holdbackCap bounds the holdback buffer; beyond it the oldest held-back
+// messages are dropped (each one was already delivered to a filtered wait
+// that didn't want it, and receive_messages frees space).
+const holdbackCap = 1000
+
+// holdbackBuffer keeps messages that were drained from the server mailbox but
+// did not match a filtered wait_for_message, so filtered waits never destroy
+// them. The next drainAll returns them alongside fresh mail.
+type holdbackBuffer struct {
+	mu   sync.Mutex
+	msgs []map[string]any
+}
+
+func (h *holdbackBuffer) add(msgs []map[string]any) {
+	if len(msgs) == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, msgs...)
+	if len(h.msgs) > holdbackCap {
+		dropped := len(h.msgs) - holdbackCap
+		h.msgs = h.msgs[dropped:]
+		slog.Warn("holdback overflow, dropping oldest held-back messages", "dropped", dropped)
+	}
+}
+
+func (h *holdbackBuffer) take() []map[string]any {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	msgs := h.msgs
+	h.msgs = nil
+	return msgs
+}
+
+// drainAll returns everything currently waiting for the agent: messages held
+// back by earlier filtered waits, plus a fresh destructive drain of the
+// server-side mailbox.
+//
+// The mailbox is the single source of truth. The server delivers every
+// message addressed to this agent to the mailbox — including while the agent
+// is offline — so the old mailbox+history merge is unnecessary, and merging
+// history was actively harmful: it re-delivered stale copies of the session's
+// (other agents' private) traffic on every poll.
 func (b *Bridge) drainAll() ([]map[string]any, error) {
-	// Fetch mailbox (direct messages)
+	held := b.holdback.take()
+
 	mailboxResult, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/mailbox", nil)
 	if err != nil {
+		// Put held-back messages back so nothing is lost to a failed poll.
+		b.holdback.add(held)
 		return nil, fmt.Errorf("fetch mailbox: %w", err)
 	}
 
@@ -210,69 +261,42 @@ func (b *Bridge) drainAll() ([]map[string]any, error) {
 		}
 	}
 
-	// Fetch recent history for broadcasts and other messages not in mailbox
-	curSeq := lastSeq.Load()
-	histPath := fmt.Sprintf("/sessions/%s/history?after_sequence=%d&limit=50", b.sessionID, curSeq)
-	histResult, err := b.doJSON("GET", histPath, nil)
-	if err != nil {
-		// If history fails, still return mailbox messages
-		slog.Warn("drainAll: failed to fetch history, returning mailbox only", "error", err)
-		for _, m := range mailboxMsgs {
-			m["_source"] = "mailbox"
-			m["_delivery"] = "direct"
-		}
-		return mailboxMsgs, nil
-	}
-
-	// History is a flat JSON array of envelopes
-	var histMsgs []map[string]any
-	if rawArr, ok := histResult.([]any); ok {
-		for _, m := range rawArr {
-			if m, ok := m.(map[string]any); ok {
-				histMsgs = append(histMsgs, m)
-			}
-		}
-	}
-
-	// Build a dedup set from mailbox messages (by sequence number)
-	seen := make(map[int64]bool)
 	for _, m := range mailboxMsgs {
-		if seq, ok := m["sequence"].(float64); ok {
-			seen[int64(seq)] = true
-		}
 		m["_source"] = "mailbox"
 		m["_delivery"] = tagDelivery(m)
 	}
 
-	// Add history messages that aren't already in the mailbox
-	for _, m := range histMsgs {
-		seq := int64(0)
-		if s, ok := m["sequence"].(float64); ok {
-			seq = int64(s)
-		}
-		if seq == 0 || seen[seq] {
-			continue
-		}
-		seen[seq] = true
-		m["_source"] = "history"
-		m["_delivery"] = tagDelivery(m)
-		mailboxMsgs = append(mailboxMsgs, m)
-	}
-
-	return mailboxMsgs, nil
+	return append(held, mailboxMsgs...), nil
 }
 
-// tagDelivery determines if a message is a "direct" or "broadcast" delivery
-// based on the envelope's "to" field.
+// partitionMessages splits drained messages into those matching a
+// wait_for_message filter (matched on the inner envelope's from/type) and
+// the rest. The rest must be held back, not discarded.
+func partitionMessages(msgs []map[string]any, from, msgType string) (matched, rest []map[string]any) {
+	for _, m := range msgs {
+		env, _ := m["envelope"].(map[string]any)
+		envFrom, _ := env["from"].(string)
+		envType, _ := env["type"].(string)
+		if (from == "" || envFrom == from) && (msgType == "" || envType == msgType) {
+			matched = append(matched, m)
+		} else {
+			rest = append(rest, m)
+		}
+	}
+	return matched, rest
+}
+
+// tagDelivery determines if a message is a "direct" or "broadcast" delivery.
+// Broadcasts are sent to the whole session: the server leaves the envelope's
+// "to" empty, or sets it to "*" for broadcast-type messages.
 func tagDelivery(m map[string]any) string {
-	// Check if there's an inner envelope
+	isBroadcast := func(to string) bool { return to == "" || to == "*" }
 	if env, ok := m["envelope"].(map[string]any); ok {
-		if to, ok := env["to"].(string); ok && to == "*" {
+		if to, ok := env["to"].(string); ok && isBroadcast(to) {
 			return "broadcast"
 		}
 	}
-	// Check top-level "to" field
-	if to, ok := m["to"].(string); ok && to == "*" {
+	if to, ok := m["to"].(string); ok && isBroadcast(to) {
 		return "broadcast"
 	}
 	return "direct"
@@ -331,7 +355,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "receive_messages",
-		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call. Returns immediately with whatever is available. For blocking until a message arrives, use wait_for_message instead.",
+		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call, including any held back by earlier filtered wait_for_message calls. Returns immediately with whatever is available. For blocking until a message arrives, use wait_for_message instead.",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
 		msgs, err := b.drainAll()
@@ -347,7 +371,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "wait_for_message",
-		Description: "Block until one or more incoming messages arrive, then return them. This avoids repeated polling when waiting for a response from a remote agent which may take seconds or minutes to reply. Checks existing queued messages first, then polls up to the specified timeout.",
+		Description: "Block until one or more incoming messages arrive, then return them. This avoids repeated polling when waiting for a response from a remote agent which may take seconds or minutes to reply. Checks existing queued messages first, then polls up to the specified timeout. Messages that don't match the filters are retained and returned by the next receive_messages call — never discarded.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -378,35 +402,14 @@ func registerTools(s *mcp.Server, b *Bridge) {
 				return "", err
 			}
 
-			if filterFrom == "" && filterType == "" {
-				if len(msgs) > 0 {
-					data, _ := json.Marshal(msgs)
-					return string(data), nil
-				}
-			} else {
-				var matched, remaining []map[string]any
-				for _, m := range msgs {
-					env := m["envelope"]
-					if envMap, ok := env.(map[string]any); ok {
-						from, _ := envMap["from"].(string)
-						t, _ := envMap["type"].(string)
-						if (filterFrom == "" || from == filterFrom) && (filterType == "" || t == filterType) {
-							matched = append(matched, m)
-							continue
-						}
-					}
-					remaining = append(remaining, m)
-				}
-
-				if len(matched) > 0 {
-					data, _ := json.Marshal(matched)
-					return string(data), nil
-				}
-
-				if len(remaining) > 0 {
-					slog.Warn("wait_for_message: non-matching messages discarded by destructive read", "count", len(remaining))
-				}
+			matched, rest := partitionMessages(msgs, filterFrom, filterType)
+			if len(matched) > 0 {
+				// Keep everything that didn't match for the next drain.
+				b.holdback.add(rest)
+				data, _ := json.Marshal(matched)
+				return string(data), nil
 			}
+			b.holdback.add(rest)
 
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
@@ -466,19 +469,13 @@ func registerTools(s *mcp.Server, b *Bridge) {
 				return "", err
 			}
 
-			var matched []map[string]any
-			for _, m := range msgs {
-				if env, ok := m["envelope"].(map[string]any); ok {
-					if from, _ := env["from"].(string); from == to {
-						matched = append(matched, m)
-					}
-				}
-			}
-
+			matched, rest := partitionMessages(msgs, to, "")
 			if len(matched) > 0 {
+				b.holdback.add(rest)
 				data, _ := json.Marshal(matched)
 				return string(data), nil
 			}
+			b.holdback.add(rest)
 
 			remaining := time.Until(deadline)
 			if remaining <= 0 {

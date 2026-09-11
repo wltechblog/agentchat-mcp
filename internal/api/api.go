@@ -592,6 +592,13 @@ func handleSSE(h *Handler) http.HandlerFunc {
 		fmt.Fprintf(w, "event: connected\ndata: {\"session\":\"%s\",\"time\":\"%s\"}\n\n", sessionID, time.Now().UTC().Format(time.RFC3339))
 		flush()
 
+		// Subscribe BEFORE replaying history: events arriving while history
+		// is written are buffered in the subscriber channel and delivered as
+		// live events right after it. Subscribing after the replay would lose
+		// them instead.
+		ch := h.watcher.Subscribe(sessionID)
+		defer h.watcher.Unsubscribe(sessionID, ch)
+
 		// Send recent history
 		history := h.hub.GetHistory(sessionID)
 		for _, env := range history {
@@ -599,10 +606,6 @@ func handleSSE(h *Handler) http.HandlerFunc {
 			fmt.Fprintf(w, "event: history\ndata: %s\n\n", data)
 		}
 		flush()
-
-		// Subscribe to live messages
-		ch := h.watcher.Subscribe(sessionID)
-		defer h.watcher.Unsubscribe(sessionID, ch)
 
 		// Keepalive: emit an SSE comment on a fixed interval so clients and
 		// proxies can tell a live-but-idle stream from a dead connection.
