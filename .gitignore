@@ -14,3 +14,11 @@ bin/
 # OS
 .DS_Store
 Thumbs.db
+
+# Stray go build outputs at repo root
+/cli
+/main
+/agentchat-mcp-bridge
+
+# Persistence data dir (AGENTCHAT_DATA)
+/data/

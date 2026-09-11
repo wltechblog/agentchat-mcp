@@ -5,4 +5,10 @@ services:
       - "${PORT:-8080}:8080"
     environment:
       - PORT=8080
+      - AGENTCHAT_DATA=/data
+    volumes:
+      - agentchat-data:/data
     restart: unless-stopped
+
+volumes:
+  agentchat-data:

@@ -94,11 +94,24 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		slog.Info("shutting down...")
+	slog.Info("starting server", "port", port, "persistent", pstore != nil)
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ListenAndServe() }()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Shutdown is coordinated here, not in a signal goroutine: main must not
+	// exit before the final persistence flush has run.
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("server error", "error", err)
+			os.Exit(1)
+		}
+	case sig := <-sigCh:
+		slog.Info("shutting down...", "signal", sig.String())
 		pt.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -110,12 +123,6 @@ func main() {
 				slog.Warn("persist: final flush failed", "error", err)
 			}
 		}
-	}()
-
-	slog.Info("starting server", "port", port, "persistent", pstore != nil)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("server error", "error", err)
-		os.Exit(1)
 	}
 }
 

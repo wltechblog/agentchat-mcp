@@ -5,24 +5,29 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
 ## Architecture
 
 ```
-┌──────────┐       ┌──────────────────────┐       ┌──────────┐
-│  Agent A │◄─REST─►│                      │◄─REST─►│  Agent B │
-│ (MCP)    │       │   agentchat-server   │       │ (MCP)    │
-└──────────┘       │                      │       └──────────┘
-                    │  - Session mgmt      │
-┌──────────┐       │  - PSK auth          │       ┌──────────┐
-│  Agent C │◄─REST─►│  - Mailbox routing   │◄─REST─►│  Agent D │
-│ (MCP)    │       │  - Shared scratchpad │       │ (MCP)    │
-└──────────┘       │  - Leader election   │       └──────────┘
-                    └──────────────────────┘
-                               ▲
-                               │ HTTP (Caddy reverse proxy)
-                               │
-                      ┌────────────────┐
-                      │  Caddy Server  │
-                      │  (TLS, routing)│
-                      └────────────────┘
+┌──────────┐   REST + SSE   ┌──────────────────────┐   REST + SSE   ┌──────────┐
+│  Agent A │◄──────────────►│                      │◄──────────────►│  Agent B │
+│ (MCP)    │                │  agentchat-server    │                │ (MCP)    │
+└──────────┘                │  - Session mgmt      │                └──────────┘
+                            │  - PSK auth          │
+┌──────────┐   REST + SSE   │  - Mailbox routing   │   REST + SSE   ┌──────────┐
+│  Agent C │◄──────────────►│  - Event fan-out     │◄──────────────►│  Agent D │
+│ (MCP)    │                │  - Leader election   │                │  (CLI)   │
+└──────────┘                └──────────────────────┘                └──────────┘
+        ▲                                                    ▲
+        │ signal (local Unix socket)                         │ SSE stream
+        │                                                    │
+┌───────┴─────────┐                                   ┌──────┴───────┐
+│ picobot agent   │                                   │ human        │
+│ (woken on       │                                   │ (watchLoop)  │
+│ incoming mail)  │                                   └──────────────┘
+└─────────────────┘
 ```
+
+Every event (direct messages, broadcasts, scratchpad updates, leader
+changes, joins/leaves) is emitted once by the hub and fanned out to both
+server-side mailboxes and the SSE watch stream, carrying a monotonically
+increasing per-session sequence number.
 
 ## Features
 
@@ -261,7 +266,17 @@ The bridge exposes MCP tools over stdio and communicates with the server via RES
 └───────────────────┘                 └──────────────────────┘                 └──────────┘
 ```
 
-Messages destined for the agent are queued in a server-side mailbox, including while the agent is offline. `receive_messages` and `wait_for_message` drain the mailbox via `GET /sessions/{id}/mailbox`.
+Messages destined for the agent are queued in a server-side mailbox, including while the agent is offline. `receive_messages` and `wait_for_message` drain the mailbox via `GET /sessions/{id}/mailbox`, optionally as a server-side filtered long-poll (`?wait=25&from=X`) that holds the request until a matching message arrives and never destroys non-matching mail.
+
+When the bridge is spawned by picobot, it also holds an SSE connection to `/watch` (authenticated with a short-lived token issued by register — PSKs never appear in URLs) and sends a `check_messages` signal to picobot's local Unix socket whenever relevant mail arrives. Failed signals retry with capped exponential backoff, the agent is re-signalled on every reconnect, and the stream has keepalive pings plus an idle watchdog, so a silent network drop becomes a reconnect instead of a dead agent.
+
+### Delivery guarantees
+
+- **Mailboxes are at-least-once, exactly-once per drain.** Drains are destructive; multiple bridge instances for the same agent get competing-consumer semantics (first poll wins, no duplicates).
+- **The watch stream is best-effort, the mailbox is authoritative.** Anything missed while a stream is down is picked up by the reconnect drain and wake-up signal.
+- **One sequence counter per session.** Every event carries it; clients dedupe by sequence and hold a single high-water mark.
+- **History is catch-up, not a store.** The last ~100 message-like events per session are available via `request_history`; system events (joins, scratchpad updates) are sequenced but not replayed in history.
+- **Persistence (opt-in via `AGENTCHAT_DATA`)** loses at most one flush interval (5s) on a crash; a clean shutdown loses nothing. Files are not persisted.
 
 ### Using the tools
 
@@ -342,32 +357,40 @@ make build
 # Run locally
 make run
 
-# Run tests (with race detector)
-go test -race ./...
+# Lint (gofmt + vet) and run tests (with race detector)
+make check
 
 # Docker build
 make docker
 ```
+
+CI runs `make lint`, `go build ./...`, and `go test -race ./...` on every push and pull request (see `.github/workflows/ci.yml`).
 
 ## Project Structure
 
 ```
 agentchat-mcp/
 ├── cmd/
-│   ├── server/main.go                  # Server entrypoint
-│   └── agentchat-mcp-bridge/main.go    # MCP bridge (stdio → REST)
+│   ├── server/main.go                  # Server entrypoint (persistence wiring, graceful shutdown)
+│   ├── agentchat-mcp-bridge/           # MCP bridge (stdio ↔ REST + SSE, picobot signals)
+│   └── agentchat-cli/                  # Human chat client (SSE watch + mailbox drain)
 ├── internal/
-│   ├── api/api.go                      # REST handlers + auth middleware
+│   ├── api/                            # REST handlers, auth middleware, SSE watch endpoint
+│   │   ├── api.go                      #   routes, auth, mailbox long-poll
+│   │   ├── watcher.go                  #   per-session SSE subscriber sets
+│   │   └── watchtoken.go               #   short-lived watch tokens (PSKs stay out of URLs)
 │   ├── auth/auth.go                    # PSK generation
 │   ├── filestore/store.go              # In-memory per-session file storage
-│   ├── hub/hub.go                      # Business logic, mailbox routing, presence
+│   ├── hub/hub.go                      # Business logic: routing, history, single event fan-out
 │   ├── leader/leader.go                # Leader election tracking
-│   ├── mailbox/mailbox.go              # Per-agent message queue (destructive reads)
-│   ├── mcp/server.go                   # MCP JSON-RPC protocol server
-│   ├── presence/presence.go            # Activity-based agent presence with TTL
+│   ├── mailbox/mailbox.go              # Per-agent queues: destructive drains, filtered long-poll
+│   ├── mcp/server.go                   # MCP JSON-RPC server (concurrent request dispatch)
+│   ├── persist/persist.go              # Opt-in crash-safe state snapshots (AGENTCHAT_DATA)
+│   ├── presence/presence.go            # Activity-based presence with TTL; offline ≠ unreachable
 │   ├── protocol/message.go             # Message types and envelope
 │   ├── scratchpad/scratchpad.go        # Per-session key-value store
-│   └── session/session.go              # Session CRUD + PSK validation
+│   ├── session/session.go              # Session CRUD + PSK validation
+│   └── signal/signal.go                # Action-based signals to picobot's Unix socket
 ├── Dockerfile
 ├── docker-compose.yml
 ├── Makefile
