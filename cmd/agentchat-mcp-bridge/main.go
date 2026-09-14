@@ -307,6 +307,22 @@ func (b *Bridge) pollMailbox(wait time.Duration, from, msgType string) ([]map[st
 	return msgs, nil
 }
 
+// peekMailbox asks the server how many messages are queued for this agent
+// WITHOUT consuming them. Used by the watcher to decide whether a
+// reconnect wake-up is warranted.
+func (b *Bridge) peekMailbox() (int, error) {
+	result, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/mailbox/peek", nil)
+	if err != nil {
+		return 0, err
+	}
+	m, ok := result.(map[string]any)
+	if !ok {
+		return 0, fmt.Errorf("unexpected peek response shape")
+	}
+	count, _ := m["count"].(float64)
+	return int(count), nil
+}
+
 // drainAll returns everything currently waiting for the agent: a full,
 // immediate drain of the server-side mailbox. The mailbox is the single
 // source of truth; history catch-up is the explicit request_history tool.

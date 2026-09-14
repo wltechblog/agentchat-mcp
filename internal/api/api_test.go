@@ -250,6 +250,53 @@ func TestBroadcastViaMailbox(t *testing.T) {
 	}
 }
 
+func TestPeekMailboxNonDestructive(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+
+	registerAgent(t, server.URL, sessionID, psk, "peek-a", nil)
+	registerAgent(t, server.URL, sessionID, psk, "peek-b", nil)
+
+	peek := func(agent string) int {
+		resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/mailbox/peek", sessionID, psk, agent, nil)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("peek: expected 200, got %d", resp.StatusCode)
+		}
+		var out struct {
+			Count int `json:"count"`
+		}
+		json.NewDecoder(resp.Body).Decode(&out)
+		return out.Count
+	}
+
+	// Empty mailbox peeks zero.
+	if n := peek("peek-b"); n != 0 {
+		t.Fatalf("expected 0 queued, got %d", n)
+	}
+
+	// Direct message lands for peek-b.
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/messages", sessionID, psk, "peek-a", map[string]any{
+		"to":      "peek-b",
+		"type":    "message",
+		"payload": map[string]string{"text": "hi"},
+	})
+	resp.Body.Close()
+
+	if n := peek("peek-b"); n != 1 {
+		t.Fatalf("expected 1 queued, got %d", n)
+	}
+	// Peek must not consume.
+	if n := peek("peek-b"); n != 1 {
+		t.Fatalf("peek must be non-destructive, second peek got %d", n)
+	}
+	// And the real drain still delivers everything.
+	msgs := drainMailbox(t, server.URL, sessionID, psk, "peek-b")
+	if len(msgs) != 1 {
+		t.Fatalf("drain after peek returned %d messages, expected 1", len(msgs))
+	}
+}
+
 func TestMailboxDestructiveRead(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)

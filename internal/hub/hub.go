@@ -207,6 +207,13 @@ func (h *Hub) onAgentExpired(sessionID, agentID string, capabilities []string) {
 	}
 }
 
+// PeekMailbox returns the number of queued entries for an agent WITHOUT
+// consuming them — a non-destructive count for wake-up decisions.
+func (h *Hub) PeekMailbox(sessionID, agentID string) int {
+	h.presence.Touch(sessionID, agentID, nil)
+	return h.mailboxes.Len(sessionID + "/" + agentID)
+}
+
 func (h *Hub) DrainMailbox(sessionID, agentID string) []mailbox.Entry {
 	h.presence.Touch(sessionID, agentID, nil)
 	return h.mailboxes.Drain(sessionID + "/" + agentID)

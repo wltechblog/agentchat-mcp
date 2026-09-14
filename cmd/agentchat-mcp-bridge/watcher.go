@@ -282,11 +282,12 @@ func (b *Bridge) watchStream(ctx context.Context) error {
 
 	slog.Info("watcher: connected to SSE stream")
 
-	// Wake the agent so anything queued while we were offline gets checked.
-	// Rate-limited so a flapping stream doesn't spam picobot.
+	// Wake the agent only if mail actually queued while we were offline
+	// (rate-limited so a flapping stream doesn't spam the host).
 	if last := time.Unix(0, lastConnectSignal.Load()); time.Since(last) >= reconnectSignalMinGap {
-		lastConnectSignal.Store(time.Now().UnixNano())
-		b.requestSignal("connected")
+		if fired, err := b.maybeWakeOnConnect(); err == nil && fired {
+			lastConnectSignal.Store(time.Now().UnixNano())
+		}
 	}
 
 	lastRead := &atomic.Int64{}
@@ -456,6 +457,27 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 	// loop coalesces requests and retries failed sends, and this read loop
 	// never blocks on a slow picobot socket.
 	b.requestSignal("message")
+}
+
+// maybeWakeOnConnect decides whether a reconnect warrants waking the
+// agent: peek the mailbox first. An unconditional wake-up would ask the
+// agent to check messages only to find an empty mailbox (a "why was I
+// woken?" turn). The peek is non-destructive — receive_messages still
+// delivers everything. Peek failure fails OPEN (wake anyway): missing a
+// real message is worse than an occasional empty wake-up.
+func (b *Bridge) maybeWakeOnConnect() (bool, error) {
+	pending, err := b.peekMailbox()
+	if err != nil {
+		slog.Warn("watcher: mailbox peek failed, waking agent anyway", "error", err)
+		b.requestSignal("connected")
+		return true, nil
+	}
+	if pending > 0 {
+		b.requestSignal("connected")
+		return true, nil
+	}
+	slog.Info("watcher: mailbox empty after reconnect, skipping connect wake-up")
+	return false, nil
 }
 
 // requestSignal asks the signal loop to deliver a check_messages signal.

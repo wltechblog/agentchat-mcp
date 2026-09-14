@@ -102,6 +102,59 @@ func TestRequestSignalCoalesces(t *testing.T) {
 // TestSignalLoopRetriesUntilConnected: a signal send to a socket that isn't
 // up yet must keep retrying and deliver once the listener appears — a missed
 // wake-up is never final.
+// maybeWakeOnConnect exercises the connect-time wake-up decision: peek the
+// mailbox first; empty mailbox → no signal, pending mail → signal, peek
+// failure → wake anyway (fail open).
+func TestConnectWakeUpSkippedOnEmptyMailbox(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /sessions/s1/mailbox/peek", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"count": 0})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := testBridge(srv)
+	fired, err := b.maybeWakeOnConnect()
+	if err != nil {
+		t.Fatalf("maybeWakeOnConnect: %v", err)
+	}
+	if fired {
+		t.Fatal("expected NO wake-up on empty mailbox")
+	}
+}
+
+func TestConnectWakeUpFiresWhenMailPending(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /sessions/s1/mailbox/peek", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"count": 2})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := testBridge(srv)
+	fired, err := b.maybeWakeOnConnect()
+	if err != nil {
+		t.Fatalf("maybeWakeOnConnect: %v", err)
+	}
+	if !fired {
+		t.Fatal("expected wake-up when 2 messages pending")
+	}
+}
+
+func TestConnectWakeUpFailsOpenOnPeekError(t *testing.T) {
+	// No peek route → 404 → error → must still wake.
+	srv := httptest.NewServer(http.NewServeMux())
+	defer srv.Close()
+
+	b := testBridge(srv)
+	fired, _ := b.maybeWakeOnConnect()
+	if !fired {
+		t.Fatal("peek failure must fail open (wake anyway)")
+	}
+}
+
 func TestSignalLoopRetriesUntilConnected(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "sig.sock")
 

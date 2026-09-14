@@ -64,6 +64,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions/{id}/messages", h.auth(h.sendMessage))
 	mux.HandleFunc("POST /sessions/{id}/broadcast", h.auth(h.broadcastMessage))
 	mux.HandleFunc("GET /sessions/{id}/mailbox", h.auth(h.drainMailbox))
+	mux.HandleFunc("GET /sessions/{id}/mailbox/peek", h.auth(h.peekMailbox))
 	mux.HandleFunc("GET /sessions/{id}/agents", h.auth(h.listAgents))
 	mux.HandleFunc("GET /sessions/{id}/leader", h.auth(h.getLeader))
 	mux.HandleFunc("POST /sessions/{id}/leader/transfer", h.auth(h.transferLeader))
@@ -384,6 +385,18 @@ func (h *Handler) drainMailbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"messages": entries,
 		"count":    len(entries),
+	})
+}
+
+// peekMailbox is a non-destructive mailbox count: how many entries are
+// queued for the calling agent right now. Used by bridges to decide whether
+// a wake-up signal is worth sending (e.g. after an SSE reconnect) without
+// draining mail that a later receive_messages call should deliver.
+func (h *Handler) peekMailbox(w http.ResponseWriter, r *http.Request) {
+	sessionID := getSessionID(r)
+	agentID := getAgentID(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count": h.hub.PeekMailbox(sessionID, agentID),
 	})
 }
 
