@@ -42,6 +42,26 @@ type Tool struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
+// SignalAction describes a signal action this server can fire at its host
+// agent (joist / gino / picobot signal systems). Self-declared via the
+// initialize result so hosts auto-register the actions without config.
+// Wire format matches joist's mcp.SignalAction contract.
+type SignalAction struct {
+	// Name is the signal action name (e.g. "check_messages").
+	Name string `json:"name"`
+
+	// Description is a human-readable description of what the signal means.
+	Description string `json:"description,omitempty"`
+
+	// Response is the safe response template injected into the host agent
+	// when the signal fires. Supports {{.Source}}, {{.Action}},
+	// {{.Timestamp}}, {{.Time}}, {{.Channel}}, {{.ChatID}}.
+	Response string `json:"response,omitempty"`
+
+	// Silent suppresses the host's channel reply (agent still processes).
+	Silent bool `json:"silent,omitempty"`
+}
+
 type ToolHandler func(args map[string]any) (string, error)
 
 type Server struct {
@@ -49,8 +69,11 @@ type Server struct {
 	version  string
 	tools    []Tool
 	handlers map[string]ToolHandler
-	writer   *bufio.Writer
-	mu       sync.Mutex
+	// signals are self-declared signal actions surfaced in the initialize
+	// result so hosts (joist / gino) auto-register them.
+	signals []SignalAction
+	writer  *bufio.Writer
+	mu      sync.Mutex
 }
 
 func NewServer(name, version string) *Server {
@@ -58,6 +81,7 @@ func NewServer(name, version string) *Server {
 		name:     name,
 		version:  version,
 		tools:    []Tool{},
+		signals:  []SignalAction{},
 		handlers: make(map[string]ToolHandler),
 		writer:   bufio.NewWriter(os.Stdout),
 	}
@@ -139,10 +163,36 @@ func (s *Server) RunWith(ctx context.Context, in io.Reader, out io.Writer) error
 	return nil
 }
 
+// RegisterSignal declares a signal action this server fires at its host.
+// Declarations ride the initialize result (signals.actions) where joist /
+// gino auto-register them — no config needed on the host side.
+func (s *Server) RegisterSignal(sa SignalAction) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.signals = append(s.signals, sa)
+}
+
+// lastOrigin captures the most recent tools/call _meta origin
+// (channel/chat_id stamped by the host agent). It is how the bridge learns
+// which chat session invoked it, so wake-up signals can route back to that
+// exact session.
+var lastOrigin struct {
+	sync.Mutex
+	Channel string
+	ChatID  string
+}
+
+// Origin returns the most recent _meta origin seen on a tools/call.
+func Origin() (channel, chatID string) {
+	lastOrigin.Lock()
+	defer lastOrigin.Unlock()
+	return lastOrigin.Channel, lastOrigin.ChatID
+}
+
 func (s *Server) handleRequest(req jsonRPCRequest) {
 	switch req.Method {
 	case "initialize":
-		s.sendResult(req.ID, map[string]any{
+		result := map[string]any{
 			"protocolVersion": ProtocolVersion,
 			"capabilities": map[string]any{
 				"tools": map[string]any{},
@@ -151,7 +201,15 @@ func (s *Server) handleRequest(req jsonRPCRequest) {
 				"name":    s.name,
 				"version": s.version,
 			},
-		})
+		}
+		s.mu.Lock()
+		if len(s.signals) > 0 {
+			result["signals"] = map[string]any{
+				"actions": s.signals,
+			}
+		}
+		s.mu.Unlock()
+		s.sendResult(req.ID, result)
 
 	case "notifications/initialized":
 		// no-op
@@ -168,10 +226,23 @@ func (s *Server) handleRequest(req jsonRPCRequest) {
 		var params struct {
 			Name      string         `json:"name"`
 			Arguments map[string]any `json:"arguments"`
+			Meta      *struct {
+				Channel string `json:"channel"`
+				ChatID  string `json:"chat_id"`
+			} `json:"_meta"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			s.sendError(req.ID, -32602, "invalid params")
 			return
+		}
+
+		// Capture the calling session's origin so wake-up signals route to
+		// the chat that invoked us (multi-session agents).
+		if params.Meta != nil {
+			lastOrigin.Lock()
+			lastOrigin.Channel = params.Meta.Channel
+			lastOrigin.ChatID = params.Meta.ChatID
+			lastOrigin.Unlock()
 		}
 
 		handler, ok := s.handlers[params.Name]

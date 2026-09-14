@@ -502,11 +502,17 @@ func (b *Bridge) signalLoop(ctx context.Context) {
 }
 
 // sendCheckMessagesSignal sends the wake-up signal, attaching metadata about
-// the most recent triggering message for auditing.
+// the most recent triggering message for auditing. The signal targets the
+// chat session that most recently called a tool on this bridge (from
+// tools/call _meta), so an agent that is a member of several chats is woken
+// in the session the message belongs to — not a global default.
 func (b *Bridge) sendCheckMessagesSignal() error {
+	channel, chatID := b.originTarget()
 	sig := signal.Signal{
-		Source: "agentchat-mcp",
-		Action: "check_messages",
+		Source:  b.signalSource(),
+		Action:  "check_messages",
+		Channel: channel,
+		ChatID:  chatID,
 	}
 	if info := pendingSignal.Load(); info != nil {
 		sig.Metadata = map[string]interface{}{

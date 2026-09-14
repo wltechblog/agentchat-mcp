@@ -34,7 +34,9 @@ increasing per-session sequence number.
 - **Session-based isolation** — Agents join named sessions, each with a unique PSK
 - **Server-side mailboxes** — Every message for an agent is queued in their mailbox regardless of connection state, including while the agent is offline. Agents poll to drain messages (destructive read).
 - **Reliable event stream** — The server's SSE `/watch` endpoint carries every session event (direct messages, broadcasts, scratchpad updates, leader changes, agent joins/leaves), each with a monotonically increasing sequence number. Keepalive pings keep idle streams alive through proxies; clients reconnect with backoff.
-- **Retried wake-up signals** — When a message arrives for a picobot-backed agent, the bridge signals it via the local Unix socket; failed signal sends retry with capped exponential backoff and the agent is re-signalled on every stream reconnect, so a missed wake-up is never final.
+- **Retried wake-up signals** — When a message arrives for a hosted agent (joist / gino / picobot), the bridge signals it via the local Unix socket; failed signal sends retry with capped exponential backoff and the agent is re-signalled on every stream reconnect, so a missed wake-up is never final.
+- **Self-declared signals** — The bridge declares its `check_messages` signal in the MCP `initialize` result (`signals.actions`), so joist/gino hosts auto-register the action with no config. The signal source is the host-injected MCP config key (`JOIST_MCP_ID` / `GINO_MCP_ID`), satisfying the registry's source-bound enforcement.
+- **Chat-session routing** — Agents can be members of more than one chat. The bridge captures the calling chat session from `tools/call` `_meta` origin (stamped by joist/gino per-turn) and stamps it into every wake-up signal (`channel` + `chat_id`), so a signal wakes the agent in the exact chat session that invoked the bridge — not a global default.
 - **Multiple process tolerant** — Multiple MCP bridge instances for the same agent work correctly. First poll wins (competing consumer semantics). No duplicate delivery.
 - **Offline-tolerant presence** — Any authenticated request refreshes agent presence. Agents that go idle past the TTL (60s) stay listed as `online: false` and keep receiving mail, so nothing is lost while they're away.
 - **Real-time messaging** — Direct messages (agent-to-agent) and broadcasts (to all session members)
@@ -268,7 +270,7 @@ The bridge exposes MCP tools over stdio and communicates with the server via RES
 
 Messages destined for the agent are queued in a server-side mailbox, including while the agent is offline. `receive_messages` and `wait_for_message` drain the mailbox via `GET /sessions/{id}/mailbox`, optionally as a server-side filtered long-poll (`?wait=25&from=X`) that holds the request until a matching message arrives and never destroys non-matching mail.
 
-When the bridge is spawned by picobot, it also holds an SSE connection to `/watch` (authenticated with a short-lived token issued by register — PSKs never appear in URLs) and sends a `check_messages` signal to picobot's local Unix socket whenever relevant mail arrives. Failed signals retry with capped exponential backoff, the agent is re-signalled on every reconnect, and the stream has keepalive pings plus an idle watchdog, so a silent network drop becomes a reconnect instead of a dead agent.
+When the bridge is spawned by a host agent, it also holds an SSE connection to `/watch` (authenticated with a short-lived token issued by register — PSKs never appear in URLs) and sends a `check_messages` signal to the host's local Unix socket whenever relevant mail arrives. Failed signals retry with capped exponential backoff, the agent is re-signalled on every reconnect, and the stream has keepalive pings plus an idle watchdog, so a silent network drop becomes a reconnect instead of a dead agent.
 
 ### Delivery guarantees
 

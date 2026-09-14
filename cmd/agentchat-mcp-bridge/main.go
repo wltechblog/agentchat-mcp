@@ -32,7 +32,11 @@ type Bridge struct {
 	mu               sync.Mutex
 	initialized      bool
 	debugLog         bool
-	signalSocketPath string // path to picobot's Unix socket (local)
+	signalSocketPath string // path to the host agent's Unix socket (local)
+	// mcpID is the host-injected MCP config key — the signal source
+	// identity. Empty under hosts that don't inject one (manual setups);
+	// wake-up signals then fall back to "agentchat".
+	mcpID string
 
 	// signalCh coalesces wake-up requests for the signal loop (capacity 1,
 	// non-blocking sends). Only used when signalSocketPath is set.
@@ -56,9 +60,24 @@ func main() {
 		debugLog = true
 	}
 
-	// Signal socket path — prefer PICOBOT_SIGNAL_SOCKET (auto-injected by picobot),
-	// fall back to AGENTCHAT_SIGNAL_SOCKET for manual config
-	signalSocketPath := envOrDefault("PICOBOT_SIGNAL_SOCKET", envOrDefault("AGENTCHAT_SIGNAL_SOCKET", ""))
+	// Signal socket path — auto-injected by the host agent (joist, gino, or
+	// legacy picobot), falling back to AGENTCHAT_SIGNAL_SOCKET for manual
+	// config. The host's signal listener receives wake-up signals here.
+	signalSocketPath := firstNonEmpty(
+		envOrDefault("JOIST_SIGNAL_SOCKET", ""),
+		envOrDefault("GINO_SIGNAL_SOCKET", ""),
+		envOrDefault("PICOBOT_SIGNAL_SOCKET", ""),
+		envOrDefault("AGENTCHAT_SIGNAL_SOCKET", ""),
+	)
+
+	// Hosts inject their MCP config key (JOIST_MCP_ID / GINO_MCP_ID). The
+	// signal registry enforces source == config key: IsAllowed(action,
+	// source) rejects signals whose source doesn't match the declaring
+	// server, so the source MUST be this key — not a hardcoded name.
+	mcpID := firstNonEmpty(
+		envOrDefault("JOIST_MCP_ID", ""),
+		envOrDefault("GINO_MCP_ID", ""),
+	)
 
 	var caps []string
 	if capsStr != "" {
@@ -90,11 +109,13 @@ func main() {
 		sseClient:        &http.Client{},
 		debugLog:         debugLog,
 		signalSocketPath: signalSocketPath,
+		mcpID:            mcpID,
 		signalCh:         make(chan struct{}, 1),
 	}
 
-	server := mcp.NewServer("agentchat-mcp-bridge", "1.3.0")
+	server := mcp.NewServer("agentchat-mcp-bridge", "1.4.0")
 	registerTools(server, bridge)
+	registerSignals(server, bridge)
 
 	slog.Info("bridge started", "agent_id", agentID, "session_id", sessionID, "server", httpBase)
 
@@ -920,11 +941,25 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			return "", fmt.Errorf("trigger_agent not configured: PICOBOT_SIGNAL_SOCKET not set. Ensure picobot signal system is enabled and this bridge was spawned by picobot.")
 		}
 
+		// Route to the last tools/call origin when the caller didn't
+		// specify a target — the session that asked us to trigger.
+		channel := maybeString(args["channel"])
+		chatID := maybeString(args["chat_id"])
+		if channel == "" || chatID == "" {
+			och, oid := b.originTarget()
+			if channel == "" {
+				channel = och
+			}
+			if chatID == "" {
+				chatID = oid
+			}
+		}
+
 		sig := signal.Signal{
-			Source:  "agentchat-mcp",
+			Source:  b.signalSource(),
 			Action:  action,
-			Channel: maybeString(args["channel"]),
-			ChatID:  maybeString(args["chat_id"]),
+			Channel: channel,
+			ChatID:  chatID,
 			Metadata: map[string]interface{}{
 				"source_agent": b.agentID,
 			},
@@ -938,6 +973,37 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		data, _ := json.Marshal(resp)
 		return string(data), nil
 	})
+}
+
+// signalSource returns the source identity for signals this bridge fires:
+// the host-injected MCP config key when present (required by joist's
+// source-bound registry), else "agentchat" for manual/legacy setups.
+func (b *Bridge) signalSource() string {
+	if b.mcpID != "" {
+		return b.mcpID
+	}
+	return "agentchat"
+}
+
+// registerSignals declares the wake-up action in the initialize result so
+// hosts with self-declaration support (joist, gino) auto-register it.
+// The response template tells the agent which chat session the signal is
+// about, without exposing raw signal payloads.
+func registerSignals(s *mcp.Server, b *Bridge) {
+	s.RegisterSignal(mcp.SignalAction{
+		Name:        "check_messages",
+		Description: "A message arrived for this agent in its agentchat session (direct message, broadcast, task, scratchpad, or leader change)",
+		Response: "You have received new messages in your agentchat session ({{.Channel}}:{{.ChatID}}). " +
+			"Use your agentchat tools (receive_messages or wait_for_message) to read and handle them.",
+	})
+}
+
+// originTarget resolves the chat session a wake-up signal should target:
+// the most recent tools/call _meta origin (the session that invoked this
+// bridge), so an agent that is a member of several chats gets woken in the
+// right one. Empty when the host never stamped an origin.
+func (b *Bridge) originTarget() (channel, chatID string) {
+	return mcp.Origin()
 }
 
 func maybeString(v any) string {
@@ -967,6 +1033,15 @@ func requireEnv(key string) string {
 		os.Exit(1)
 	}
 	return v
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func envOrDefault(key, def string) string {
