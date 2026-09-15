@@ -1010,7 +1010,11 @@ func registerSignals(s *mcp.Server, b *Bridge) {
 		Name:        "check_messages",
 		Description: "A message arrived for this agent in its agentchat session (direct message, broadcast, task, scratchpad, or leader change)",
 		Response: "You have received new messages in your agentchat session ({{.Channel}}:{{.ChatID}}). " +
-			"Use your agentchat tools (receive_messages or wait_for_message) to read and handle them.",
+			"Use your agentchat tools (receive_messages or wait_for_message) to read and handle them. " +
+			"The conversation history above shows work you have already completed in this chat — before acting on any message, " +
+			"check whether it concerns a task you have already finished or a reply you have already sent. " +
+			"If the messages are confirmations, echoes, or results of actions you already took, do not repeat the work: " +
+			"acknowledge internally and reply only if the user genuinely needs new information.",
 	})
 }
 
