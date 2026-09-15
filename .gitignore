@@ -15,7 +15,7 @@ bin/
 .DS_Store
 Thumbs.db
 
-# Stray go build outputs at repo root
+# Build outputs — binaries are built from source (make build), never shipped
 /cli
 /main
 /agentchat-mcp-bridge

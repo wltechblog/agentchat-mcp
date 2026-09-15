@@ -1,0 +1,8 @@
+.git
+.github
+bin/
+data/
+cli
+main
+agentchat-mcp-bridge
+REVIEW-AND-PLAN.md
