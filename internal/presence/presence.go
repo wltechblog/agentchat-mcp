@@ -27,7 +27,7 @@ type AgentState struct {
 type ExpireFunc func(sessionID, agentID string, capabilities []string)
 
 // ForgetFunc is called when an expired agent's state is removed entirely.
-type ForgetFunc func(sessionID, agentID string)
+type ForgetFunc func(sessionID, agentID string, capabilities []string)
 
 type Tracker struct {
 	mu          sync.RWMutex
@@ -141,6 +141,14 @@ func (t *Tracker) Stop() {
 	close(t.stopCh)
 }
 
+// SetForgetAfter overrides the forget horizon (how long an expired agent's
+// state is kept before removal). Intended for tests and ops tuning.
+func (t *Tracker) SetForgetAfter(d time.Duration) {
+	t.mu.Lock()
+	t.forgetAfter = d
+	t.mu.Unlock()
+}
+
 func (t *Tracker) sweep(onExpire ExpireFunc, onForget ForgetFunc) {
 	t.mu.Lock()
 	var expired, forgotten []*AgentState
@@ -160,7 +168,7 @@ func (t *Tracker) sweep(onExpire ExpireFunc, onForget ForgetFunc) {
 		onExpire(state.SessionID, state.AgentID, state.Capabilities)
 	}
 	for _, state := range forgotten {
-		onForget(state.SessionID, state.AgentID)
+		onForget(state.SessionID, state.AgentID, state.Capabilities)
 	}
 }
 

@@ -35,7 +35,7 @@ func TestSweepFiresOnceAndKeepsState(t *testing.T) {
 	var expireCalls atomic.Int32
 	tr.StartSweep(5*time.Millisecond, func(sessionID, agentID string, capabilities []string) {
 		expireCalls.Add(1)
-	}, func(sessionID, agentID string) {
+	}, func(sessionID, agentID string, capabilities []string) {
 		t.Errorf("unexpected forget for %s", agentID)
 	})
 	defer tr.Stop()
@@ -80,11 +80,11 @@ func TestTouchRevivesExpiredAgent(t *testing.T) {
 
 func TestForgetRemovesState(t *testing.T) {
 	tr := NewTracker(10 * time.Millisecond)
-	tr.forgetAfter = 30 * time.Millisecond
+	tr.SetForgetAfter(30 * time.Millisecond)
 	var forgetCalls atomic.Int32
 	tr.StartSweep(5*time.Millisecond, func(sessionID, agentID string, capabilities []string) {
 		// expiry fires first; nothing to assert here
-	}, func(sessionID, agentID string) {
+	}, func(sessionID, agentID string, capabilities []string) {
 		forgetCalls.Add(1)
 	})
 	defer tr.Stop()

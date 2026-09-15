@@ -135,18 +135,22 @@ func TestMailboxSurvivesPresenceExpiry(t *testing.T) {
 	h.Broadcast(sess.ID, "agent-b", "broadcast", payload("bcast"))
 
 	msgs := h.DrainMailbox(sess.ID, "agent-a")
-	// DM before expiry, agent_left at expiry, DM + broadcast after expiry.
-	if len(msgs) != 4 {
-		t.Fatalf("expected 4 queued entries, got %d", len(msgs))
+	// DM before expiry, DM + broadcast after expiry. Going offline announces
+	// nothing: agent_left fires only on true departure (the forget horizon).
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 queued entries, got %d", len(msgs))
 	}
 	gotTypes := map[string]bool{}
 	for _, m := range msgs {
 		gotTypes[m.Envelope.Type] = true
 	}
-	for _, want := range []string{"message", "agent_left", "broadcast"} {
+	for _, want := range []string{"message", "broadcast"} {
 		if !gotTypes[want] {
 			t.Fatalf("expected %q in drained mailbox, got %v", want, gotTypes)
 		}
+	}
+	if gotTypes["agent_left"] {
+		t.Fatal("agent_left must never enter mailboxes")
 	}
 
 	// Coming back online preserves identity and capabilities.
@@ -273,11 +277,11 @@ func TestAllEventsSequencedAndFannedOut(t *testing.T) {
 	}
 
 	// Mailbox-side spot check: agent-b should hold the direct message, the
-	// broadcast, agent-a's scratchpad update, the leader info, and agent-c's
-	// join. (b's own scratchpad delete is excluded from b's mailbox.)
+	// broadcast, agent-a's scratchpad update, and the leader info. Joins are
+	// ambient (watch stream only) and b's own scratchpad delete excludes b.
 	msgs := h.DrainMailbox(sess.ID, "agent-b")
-	if len(msgs) != 5 {
-		t.Fatalf("expected 5 mailbox entries for agent-b, got %d", len(msgs))
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 mailbox entries for agent-b, got %d", len(msgs))
 	}
 	for _, m := range msgs {
 		if m.Envelope.Sequence == 0 {
@@ -355,5 +359,53 @@ func TestPersistenceRestartRoundTrip(t *testing.T) {
 	// Scratchpad survived.
 	if _, ok := sp2.Get(sess.ID, "plan"); !ok {
 		t.Fatal("scratchpad lost across restart")
+	}
+}
+
+// TestAgentLeftOnlyOnTrueDeparture: a TTL lapse is silent — no event, mailbox
+// kept. agent_left is announced (on the watch stream only) when the agent is
+// forgotten entirely, and that is also when the mailbox is reclaimed.
+func TestAgentLeftOnlyOnTrueDeparture(t *testing.T) {
+	var mu sync.Mutex
+	var sse []protocol.Envelope
+	h, store, pt := newTestHub(t, 40*time.Millisecond, 5*time.Millisecond)
+	h.SetNotifier(func(sessionID string, env protocol.Envelope) {
+		mu.Lock()
+		defer mu.Unlock()
+		sse = append(sse, env)
+	})
+	pt.SetForgetAfter(80 * time.Millisecond)
+	sess := store.Create("depart")
+	h.Register(sess.ID, "agent-a", nil)
+	if err := h.SendMessage(sess.ID, "peer", "agent-a", "message", payload("held")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	countLeft := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, env := range sse {
+			if env.Type == "agent_left" {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Past the TTL (40ms) but before the forget horizon (80ms): offline, but
+	// no departure announcement.
+	time.Sleep(60 * time.Millisecond)
+	if n := countLeft(); n != 0 {
+		t.Fatalf("TTL lapse must not announce agent_left, got %d", n)
+	}
+
+	// Past the forget horizon: exactly one agent_left, and the mailbox is gone.
+	time.Sleep(200 * time.Millisecond)
+	if n := countLeft(); n != 1 {
+		t.Fatalf("expected exactly one agent_left at forget, got %d", n)
+	}
+	if msgs := h.DrainMailbox(sess.ID, "agent-a"); len(msgs) != 0 {
+		t.Fatalf("expected mailbox reclaimed at forget, got %d entries", len(msgs))
 	}
 }

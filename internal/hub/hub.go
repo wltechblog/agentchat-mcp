@@ -94,10 +94,19 @@ func New(d Deps, opts ...Option) *Hub {
 	}
 
 	h.presence.StartSweep(h.sweepInterval, func(sessionID, agentID string, capabilities []string) {
-		h.onAgentExpired(sessionID, agentID, capabilities)
-	}, func(sessionID, agentID string) {
-		// The agent is being forgotten entirely (past the presence tracker's
-		// forget horizon); only now is its mailbox reclaimed.
+		h.onAgentWentOffline(sessionID, agentID, capabilities)
+	}, func(sessionID, agentID string, capabilities []string) {
+		// True departure: the agent has been offline past the presence
+		// tracker's forget horizon. Announce it on the watch stream — never
+		// in mailboxes — and reclaim its mailbox.
+		h.emitAmbientEvent(sessionID, protocol.Envelope{
+			Type:      protocol.TypeAgentLeft,
+			SessionID: sessionID,
+			From:      "server",
+			To:        "*",
+			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: false}),
+			Timestamp: time.Now().UTC(),
+		})
 		h.mailboxes.DeleteBox(sessionID + "/" + agentID)
 	})
 
@@ -132,10 +141,22 @@ func (h *Hub) sequenceEnvelope(sessionID string, env *protocol.Envelope) {
 }
 
 // emitSystemEvent sequences a system event, delivers it to session mailboxes,
-// and notifies real-time watchers — the single fan-out for server events.
+// and notifies real-time watchers — the single fan-out for actionable server
+// events (scratchpad and leader changes).
 func (h *Hub) emitSystemEvent(sessionID string, env protocol.Envelope, excludeAgent string) {
 	h.sequenceEnvelope(sessionID, &env)
 	h.deliverToSessionMailboxes(sessionID, env, excludeAgent)
+	h.notifyWatchers(sessionID, env)
+}
+
+// emitAmbientEvent sequences a purely observational event and notifies
+// real-time watchers — it never enters mailboxes. Presence is ephemeral
+// state, not mail: a durable copy in every agent's queue makes each agent
+// wake and report transitions nobody needs to act on. Peer awareness comes
+// from GetSessionAgents (list_agents); the watch stream carries live
+// transitions for anyone actively watching.
+func (h *Hub) emitAmbientEvent(sessionID string, env protocol.Envelope) {
+	h.sequenceEnvelope(sessionID, &env)
 	h.notifyWatchers(sessionID, env)
 }
 
@@ -144,14 +165,14 @@ func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
 
 	if isNew {
 		slog.Info("agent joined", "session", sessionID, "agent", agentID)
-		h.emitSystemEvent(sessionID, protocol.Envelope{
+		h.emitAmbientEvent(sessionID, protocol.Envelope{
 			Type:      protocol.TypeAgentJoined,
 			SessionID: sessionID,
 			From:      "server",
 			To:        "*",
 			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: true}),
 			Timestamp: time.Now().UTC(),
-		}, agentID)
+		})
 
 		if _, hasLeader := h.leader.GetLeader(sessionID); !hasLeader {
 			h.leader.SetInitialLeader(sessionID, agentID)
@@ -166,16 +187,14 @@ func (h *Hub) RefreshPresence(sessionID, agentID string) {
 	h.presence.Touch(sessionID, agentID, nil)
 }
 
-func (h *Hub) onAgentExpired(sessionID, agentID string, capabilities []string) {
-	slog.Info("agent expired", "session", sessionID, "agent", agentID)
-	h.emitSystemEvent(sessionID, protocol.Envelope{
-		Type:      protocol.TypeAgentLeft,
-		SessionID: sessionID,
-		From:      "server",
-		To:        "*",
-		Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: false}),
-		Timestamp: time.Now().UTC(),
-	}, "")
+// onAgentWentOffline runs when an agent lapses past the presence TTL. It is
+// deliberately silent: going quiet is not leaving, and announcing it made
+// every peer wake and report a transition that never mattered. The online
+// flag flips in GetSessionAgents; agent_left is announced only on true
+// departure (the forget horizon, see the onForget hook). Leadership is the
+// exception — it is actionable state, so it hands off immediately.
+func (h *Hub) onAgentWentOffline(sessionID, agentID string, capabilities []string) {
+	slog.Info("agent offline", "session", sessionID, "agent", agentID)
 
 	// The agent's mailbox is intentionally kept: messages sent while it is
 	// offline must still be there when it returns. The mailbox is only

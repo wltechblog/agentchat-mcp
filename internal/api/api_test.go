@@ -666,7 +666,11 @@ func TestFileDelete(t *testing.T) {
 	}
 }
 
-func TestAgentJoinedNotificationInMailbox(t *testing.T) {
+// TestAgentJoinedIsAmbientOnly: presence events never enter mailboxes —
+// a durable copy in every agent's queue would wake each of them to report
+// a transition nobody needs to act on. Peer awareness comes from
+// GET /agents and the watch stream.
+func TestAgentJoinedIsAmbientOnly(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
 
@@ -674,12 +678,17 @@ func TestAgentJoinedNotificationInMailbox(t *testing.T) {
 	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
 
 	msgs := drainMailbox(t, server.URL, sessionID, psk, "agent-1")
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 notification, got %d", len(msgs))
+	if len(msgs) != 0 {
+		t.Fatalf("expected no mailbox entries for a join, got %d", len(msgs))
 	}
-	env := msgs[0]["envelope"].(map[string]any)
-	if env["type"] != "agent_joined" {
-		t.Fatalf("expected agent_joined, got %v", env["type"])
+
+	// Membership is still queryable.
+	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/agents", sessionID, psk, "agent-1", nil)
+	defer resp.Body.Close()
+	var agents []protocol.AgentInfo
+	json.NewDecoder(resp.Body).Decode(&agents)
+	if len(agents) != 2 {
+		t.Fatalf("expected 2 agents via list, got %d", len(agents))
 	}
 }
 

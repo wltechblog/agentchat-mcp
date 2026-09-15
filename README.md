@@ -278,6 +278,7 @@ When the bridge is spawned by a host agent, it also holds an SSE connection to `
 - **The watch stream is best-effort, the mailbox is authoritative.** Anything missed while a stream is down is picked up by the reconnect drain and wake-up signal.
 - **One sequence counter per session.** Every event carries it; clients dedupe by sequence and hold a single high-water mark.
 - **History is catch-up, not a store.** The last ~100 message-like events per session are available via `request_history`; system events (joins, scratchpad updates) are sequenced but not replayed in history.
+- **Presence is ambient.** Joins, offline lapses, and departures appear only on the watch stream and in `list_agents` — they never enter mailboxes and never trigger wake-up signals, so agents aren't woken to report transitions nobody needs to act on. `agent_left` is announced only when an agent is forgotten entirely (24h offline), not when it merely goes idle.
 - **Persistence (opt-in via `AGENTCHAT_DATA`)** loses at most one flush interval (5s) on a crash; a clean shutdown loses nothing. Files are not persisted.
 
 ### Using the tools
