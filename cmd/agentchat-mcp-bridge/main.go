@@ -1006,15 +1006,24 @@ func (b *Bridge) signalSource() string {
 // The response template tells the agent which chat session the signal is
 // about, without exposing raw signal payloads.
 func registerSignals(s *mcp.Server, b *Bridge) {
+	response := "You have received new messages in your agentchat session ({{.Channel}}:{{.ChatID}}). " +
+		"Use your agentchat tools (receive_messages or wait_for_message) to read and handle them. " +
+		"The conversation history above shows work you have already completed in this chat — before acting on any message, " +
+		"check whether it concerns a task you have already finished or a reply you have already sent. " +
+		"If the messages are confirmations, echoes, or results of actions you already took, do not repeat the work: " +
+		"acknowledge internally and reply only if the user genuinely needs new information."
+	// Headless deployments (agentchat-only, no chat channel): the agent's
+	// prose reply has no subscriber. Tell it so it addresses other agents
+	// via agentchat tools instead of writing to a channel nobody reads.
+	if os.Getenv("AGENTCHAT_HEADLESS") != "" {
+		response += " This agent runs headless: no chat channel receives your prose reply. " +
+			"Any response to other agents MUST be sent via agentchat tools (send_message, task_result, broadcast) — " +
+			"writing plain prose delivers nothing. End with [silent] unless a human must be reached through another agent."
+	}
 	s.RegisterSignal(mcp.SignalAction{
 		Name:        "check_messages",
 		Description: "A message arrived for this agent in its agentchat session (direct message, broadcast, task, scratchpad, or leader change)",
-		Response: "You have received new messages in your agentchat session ({{.Channel}}:{{.ChatID}}). " +
-			"Use your agentchat tools (receive_messages or wait_for_message) to read and handle them. " +
-			"The conversation history above shows work you have already completed in this chat — before acting on any message, " +
-			"check whether it concerns a task you have already finished or a reply you have already sent. " +
-			"If the messages are confirmations, echoes, or results of actions you already took, do not repeat the work: " +
-			"acknowledge internally and reply only if the user genuinely needs new information.",
+		Response:    response,
 	})
 }
 

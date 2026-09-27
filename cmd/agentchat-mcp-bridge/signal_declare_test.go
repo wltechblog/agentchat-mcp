@@ -162,3 +162,51 @@ func TestWakeUpSignalCarriesOrigin(t *testing.T) {
 		t.Fatal("no signal received on socket")
 	}
 }
+
+
+// TestHeadlessModeTemplate: AGENTCHAT_HEADLESS=1 must extend the wake-up
+// template so headless agents know their prose reply has no subscriber and
+// must respond via agentchat tools.
+func TestHeadlessModeTemplate(t *testing.T) {
+	t.Setenv("AGENTCHAT_HEADLESS", "1")
+	s := mcp.NewServer("agentchat-mcp-bridge", "test-headless")
+	b := &Bridge{}
+	registerSignals(s, b)
+
+	result := jsonRPCLine(t, s, `{"jsonrpc":"2.0","id":"i1","method":"initialize","params":{}}`, "i1")
+	signals, _ := result["signals"].(map[string]any)
+	actions, _ := signals["actions"].([]any)
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 declared action, got %d", len(actions))
+	}
+	sa := actions[0].(map[string]any)
+	resp, _ := sa["response"].(string)
+	if !strings.Contains(resp, "headless") {
+		t.Fatalf("headless template missing headless guidance: %q", resp)
+	}
+	if !strings.Contains(resp, "send_message") {
+		t.Fatalf("headless template must point at agentchat tools: %q", resp)
+	}
+	if !strings.Contains(resp, "[silent]") {
+		t.Fatalf("headless template must reference the [silent] marker: %q", resp)
+	}
+}
+
+// TestNonHeadlessTemplate: without the env var the template stays unchanged.
+func TestNonHeadlessTemplate(t *testing.T) {
+	s := mcp.NewServer("agentchat-mcp-bridge", "test-nonheadless")
+	b := &Bridge{}
+	registerSignals(s, b)
+
+	result := jsonRPCLine(t, s, `{"jsonrpc":"2.0","id":"i1","method":"initialize","params":{}}`, "i1")
+	signals, _ := result["signals"].(map[string]any)
+	actions, _ := signals["actions"].([]any)
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 declared action, got %d", len(actions))
+	}
+	sa := actions[0].(map[string]any)
+	resp, _ := sa["response"].(string)
+	if strings.Contains(resp, "headless") {
+		t.Fatalf("non-headless template must not mention headless: %q", resp)
+	}
+}
