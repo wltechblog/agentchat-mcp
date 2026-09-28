@@ -14,6 +14,10 @@ type Session struct {
 	Name      string
 	PSK       string
 	CreatedAt time.Time
+	// LastActive is the last time any agent touched this session (register,
+	// any authenticated request). It drives the channel janitor: sessions
+	// with no activity past the retention horizon are reaped.
+	LastActive time.Time
 }
 
 type Store struct {
@@ -32,11 +36,13 @@ func (s *Store) Create(name string) *Session {
 	defer s.mu.Unlock()
 
 	id := generateID()
+	now := time.Now().UTC()
 	sess := &Session{
-		ID:        id,
-		Name:      name,
-		PSK:       auth.GeneratePSK(),
-		CreatedAt: time.Now().UTC(),
+		ID:         id,
+		Name:       name,
+		PSK:        auth.GeneratePSK(),
+		CreatedAt:  now,
+		LastActive: now,
 	}
 	s.sessions[id] = sess
 	return sess
@@ -100,6 +106,23 @@ func generateID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// TouchActivity advances the session's LastActive timestamp. It is
+// monotonic — an older timestamp never moves it backwards — so backfilled
+// or concurrent reports can't regress it. Returns false if the session
+// doesn't exist.
+func (s *Store) TouchActivity(sessionID string, at time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	if at.After(sess.LastActive) {
+		sess.LastActive = at
+	}
+	return true
 }
 
 // Snapshot copies all sessions for persistence.

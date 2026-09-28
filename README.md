@@ -43,6 +43,7 @@ increasing per-session sequence number.
 - **Shared scratchpad** — Key-value store per session for shared context, with real-time update broadcasts to mailboxes
 - **Leader election** — First agent in a session becomes leader; supports explicit transfer and auto-transfer on expiry
 - **Sequenced message history** — Messages get monotonically increasing sequence numbers; agents can request missed messages
+- **Channel janitor** — Channels with no agent activity for the retention horizon (default 30 days) are reaped along with their mailboxes, history, sequence counters, and scratchpad, so abandoned channels don't accumulate forever.
 - **Crash-safe persistence (opt-in)** — Set `AGENTCHAT_DATA` to a directory and the server snapshots sessions, mailboxes, history, sequence counters, and the scratchpad every few seconds (plus on clean shutdown). A restart becomes a bump: agents re-register, queued mail survives, and no message is delivered twice. Files are not persisted.
 - **Agent capabilities** — Agents declare capabilities on registration; visible to all session members
 - **Task delegation** — Built-in message types for assigning, tracking, and returning task results
@@ -134,6 +135,7 @@ volumes:
 | `PORT` | `8080` | HTTP listen port |
 | `AGENTCHAT_DEBUG` | `false` | Set to `true` or `1` to enable debug logging |
 | `AGENTCHAT_DATA` | *(unset)* | Directory for the state snapshot. When set, sessions, mailboxes, history, sequence counters, and the scratchpad survive restarts; when unset, the server is purely in-memory |
+| `AGENTCHAT_CHANNEL_RETENTION` | `720h` | Reap channels with no agent activity past this horizon (Go duration). `0` disables the janitor. Last-activity time survives restarts when persistence is enabled |
 
 ---
 

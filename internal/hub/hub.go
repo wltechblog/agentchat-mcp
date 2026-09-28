@@ -165,6 +165,7 @@ func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
 
 	if isNew {
 		slog.Info("agent joined", "session", sessionID, "agent", agentID)
+		h.sessionStore.TouchActivity(sessionID, time.Now())
 		h.emitAmbientEvent(sessionID, protocol.Envelope{
 			Type:      protocol.TypeAgentJoined,
 			SessionID: sessionID,
@@ -185,6 +186,9 @@ func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
 
 func (h *Hub) RefreshPresence(sessionID, agentID string) {
 	h.presence.Touch(sessionID, agentID, nil)
+	// Every authenticated request lands here via the auth middleware, so
+	// this is the channel-activity signal the janitor sweeps on.
+	h.sessionStore.TouchActivity(sessionID, time.Now())
 }
 
 // onAgentWentOffline runs when an agent lapses past the presence TTL. It is
@@ -508,6 +512,42 @@ func (h *Hub) CloseSession(sessionID string) {
 	h.leader.ClearSession(sessionID)
 	h.scratchpad.ClearSession(sessionID)
 	h.files.ClearSession(sessionID)
+	h.mailboxes.DeleteSession(sessionID)
+}
+
+// StartJanitor reaps channels that have had no agent activity for longer
+// than the retention horizon, on a fixed interval. Retention <= 0 disables
+// the janitor. It runs for the lifetime of the process.
+func (h *Hub) StartJanitor(retention, interval time.Duration) {
+	if retention <= 0 {
+		slog.Info("janitor: disabled (retention <= 0)")
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			h.reapStaleSessions(retention)
+		}
+	}()
+}
+
+// reapStaleSessions deletes sessions whose LastActive is older than the
+// retention horizon. Everything session-scoped goes with them: credentials,
+// mailboxes, history, scratchpad, files, presence, and leadership.
+func (h *Hub) reapStaleSessions(retention time.Duration) {
+	cutoff := time.Now().Add(-retention)
+	for _, sess := range h.sessionStore.Snapshot() {
+		if sess.LastActive.After(cutoff) {
+			continue
+		}
+		idle := time.Since(sess.LastActive).Round(time.Hour)
+		if !h.sessionStore.Delete(sess.ID) {
+			continue
+		}
+		h.CloseSession(sess.ID)
+		slog.Info("janitor: reaped idle session", "session", sess.ID, "name", sess.Name, "idle", idle.String())
+	}
 }
 
 func mustMarshal(v any) json.RawMessage {

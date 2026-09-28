@@ -409,3 +409,59 @@ func TestAgentLeftOnlyOnTrueDeparture(t *testing.T) {
 		t.Fatalf("expected mailbox reclaimed at forget, got %d entries", len(msgs))
 	}
 }
+
+// TestJanitorReapsIdleSessions: a channel whose LastActive is past the
+// retention horizon is deleted along with everything session-scoped —
+// credentials, mailboxes, history, scratchpad — while recently active
+// channels are untouched.
+func TestJanitorReapsIdleSessions(t *testing.T) {
+	store := session.NewStore()
+	pt := presence.NewTracker(time.Minute)
+	defer pt.Stop()
+	mb := mailbox.NewStore(100)
+	sp := scratchpad.NewStore()
+	h := New(Deps{
+		SessionStore: store,
+		Leader:       leader.NewTracker(),
+		Scratchpad:   sp,
+		Files:        filestore.NewStore(1 << 20),
+		Presence:     pt,
+		Mailboxes:    mb,
+	}, WithSweepInterval(time.Hour))
+
+	// An idle channel restored from a 40-day-old snapshot.
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	store.Restore([]session.Session{{
+		ID: "stale-session", Name: "stale", PSK: "psk-stale",
+		CreatedAt: old, LastActive: old,
+	}})
+	h.SendMessage("stale-session", "ghost", "agent-b", "message", payload("orphaned"))
+	sp.Set("stale-session", "plan", payload("v"), "ghost")
+
+	// A recently active channel.
+	live := store.Create("live")
+	h.Register(live.ID, "agent-a", nil)
+	h.SendMessage(live.ID, "agent-a", "agent-b", "message", payload("kept"))
+
+	h.reapStaleSessions(30 * 24 * time.Hour)
+
+	if _, ok := store.Get("stale-session"); ok {
+		t.Fatal("stale session survived the janitor")
+	}
+	if msgs := mb.Drain("stale-session/agent-b"); len(msgs) != 0 {
+		t.Fatalf("stale session's mailbox survived: %d entries", len(msgs))
+	}
+	if _, ok := sp.Get("stale-session", "plan"); ok {
+		t.Fatal("stale session's scratchpad survived")
+	}
+	if hist := h.GetHistory("stale-session"); len(hist) != 0 {
+		t.Fatalf("stale session's history survived: %d entries", len(hist))
+	}
+
+	if _, ok := store.Get(live.ID); !ok {
+		t.Fatal("live session was reaped")
+	}
+	if msgs := h.DrainMailbox(live.ID, "agent-b"); len(msgs) != 1 {
+		t.Fatalf("live session's mail was lost: %d entries", len(msgs))
+	}
+}

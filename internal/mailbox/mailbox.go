@@ -2,6 +2,7 @@ package mailbox
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -173,6 +174,19 @@ func (s *Store) DrainMatchingWait(key, from, msgType string, wait time.Duration)
 func (s *Store) DeleteBox(key string) {
 	s.mu.Lock()
 	delete(s.boxes, key)
+	s.mu.Unlock()
+}
+
+// DeleteSession removes every box belonging to a session (box keys are
+// "sessionID/agentID"). Used when a session is deleted or reaped.
+func (s *Store) DeleteSession(sessionID string) {
+	prefix := sessionID + "/"
+	s.mu.Lock()
+	for key := range s.boxes {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.boxes, key)
+		}
+	}
 	s.mu.Unlock()
 }
 

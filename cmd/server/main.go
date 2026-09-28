@@ -54,6 +54,21 @@ func main() {
 		Mailboxes:    mb,
 	}, hub.WithDebugLog(debugLog))
 
+	// Channel janitor: reap sessions no agent has touched for the retention
+	// horizon (default 30 days). AGENTCHAT_CHANNEL_RETENTION is a Go
+	// duration ("720h", "30d" is not valid — use "720h", "2160h", ...);
+	// "0" disables the janitor entirely.
+	retention := 30 * 24 * time.Hour
+	if v := os.Getenv("AGENTCHAT_CHANNEL_RETENTION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			slog.Warn("invalid AGENTCHAT_CHANNEL_RETENTION, using 720h", "value", v, "error", err)
+		} else {
+			retention = d
+		}
+	}
+	h.StartJanitor(retention, 6*time.Hour)
+
 	// Persistence is opt-in via AGENTCHAT_DATA; without it the server runs
 	// purely in memory, as before. Files are not persisted (they stay in
 	// memory and are lost on restart).

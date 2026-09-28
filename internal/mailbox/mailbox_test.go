@@ -81,3 +81,22 @@ func TestDrainMatchingWaitTimesOut(t *testing.T) {
 		t.Fatalf("timeout wait took %v, expected ~200ms", elapsed)
 	}
 }
+
+func TestDeleteSessionRemovesOnlyItsBoxes(t *testing.T) {
+	s := NewStore(100)
+	s.Deliver("s1/a", env("x", "message", 1))
+	s.Deliver("s1/b", env("x", "message", 2))
+	s.Deliver("s2/a", env("x", "message", 3))
+
+	s.DeleteSession("s1")
+
+	if got := s.Drain("s1/a"); len(got) != 0 {
+		t.Fatalf("expected s1/a reaped, got %d entries", len(got))
+	}
+	if got := s.Drain("s1/b"); len(got) != 0 {
+		t.Fatalf("expected s1/b reaped, got %d entries", len(got))
+	}
+	if got := s.Drain("s2/a"); len(got) != 1 {
+		t.Fatalf("expected s2/a untouched, got %d entries", len(got))
+	}
+}
