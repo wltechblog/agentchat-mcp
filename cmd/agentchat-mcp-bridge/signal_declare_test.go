@@ -209,3 +209,37 @@ func TestNonHeadlessTemplate(t *testing.T) {
 		t.Fatalf("non-headless template must not mention headless: %q", resp)
 	}
 }
+
+
+// TestSignalDeclarationNamesServerPrefix pins the multi-bridge fix: the
+// wake-up template must tell the agent WHICH server's tools to call via
+// the {{.Source}} host config key — without it, agents with two agentchat
+// bridges drained the wrong session's mailbox.
+func TestSignalDeclarationNamesServerPrefix(t *testing.T) {
+	s := mcp.NewServer("agentchat-mcp-bridge", "test")
+	registerSignals(s, &Bridge{})
+	result := jsonRPCLine(t, s, `{"jsonrpc":"2.0","id":"i1","method":"initialize","params":{}}`, "i1")
+	signals, ok := result["signals"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected signals block in initialize result, got %v", result)
+	}
+	actions, _ := signals["actions"].([]any)
+	var resp string
+	found := false
+	for _, a := range actions {
+		m, _ := a.(map[string]any)
+		if m["name"] == "check_messages" {
+			resp, _ = m["response"].(string)
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("check_messages not declared")
+	}
+	if !strings.Contains(resp, "{{.Source}}") {
+		t.Fatal("wake-up template must reference {{.Source}} so multi-bridge agents know which tool prefix to use")
+	}
+	if !strings.Contains(resp, "mcp_{{.Source}}_") {
+		t.Fatal("wake-up template must name the tool prefix explicitly")
+	}
+}

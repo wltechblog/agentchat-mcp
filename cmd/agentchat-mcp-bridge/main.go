@@ -1006,8 +1006,14 @@ func (b *Bridge) signalSource() string {
 // The response template tells the agent which chat session the signal is
 // about, without exposing raw signal payloads.
 func registerSignals(s *mcp.Server, b *Bridge) {
-	response := "You have received new messages in your agentchat session ({{.Channel}}:{{.ChatID}}). " +
-		"Use your agentchat tools (receive_messages or wait_for_message) to read and handle them. " +
+	// {{.Source}} renders the host's MCP config key for THIS bridge (e.g.
+	// "agentchat" or "agentchat-scs"). Hosts prefix tool names with it
+	// (mcp_agentchat_* / mcp_agentchat_scs_*), so naming the server here
+	// disambiguates multi-bridge deployments: the wake-up tells the agent
+	// exactly which mailbox has mail and which tool prefix to use.
+	response := "You have received new messages in your agentchat session on server {{.Source}} (chat {{.Channel}}:{{.ChatID}}). " +
+		"Use the tools from THAT server — prefix mcp_{{.Source}}_ (e.g. mcp_{{.Source}}_receive_messages or mcp_{{.Source}}_wait_for_message) — to read and handle them; " +
+		"tools from other agentchat servers read different mailboxes and will show nothing. " +
 		"The conversation history above shows work you have already completed in this chat — before acting on any message, " +
 		"check whether it concerns a task you have already finished or a reply you have already sent. " +
 		"If the messages are confirmations, echoes, or results of actions you already took, do not repeat the work: " +
