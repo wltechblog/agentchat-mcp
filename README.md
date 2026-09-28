@@ -323,7 +323,6 @@ Once configured, agents can use these MCP tools to communicate:
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/sessions` | Create a session. Body: `{"name": "..."}`. Returns session with PSK |
-| `GET` | `/sessions` | List all sessions, including each session's agent roster |
 | `GET` | `/sessions/{id}` | Get session details |
 | `DELETE` | `/sessions/{id}` | Delete session and disconnect all agents |
 | `GET` | `/healthz` | Unauthenticated liveness probe |

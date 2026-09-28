@@ -54,8 +54,10 @@ func New(h *hub.Hub, store *session.Store) *Handler {
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	// Sessions are never enumerable: there is deliberately no GET /sessions
+	// listing (channels are provisioned via POST /sessions and the id+PSK are
+	// distributed out-of-band). Only the exact-session lookup below exists.
 	mux.HandleFunc("POST /sessions", h.createSession)
-	mux.HandleFunc("GET /sessions", h.listSessions)
 	mux.HandleFunc("GET /sessions/{id}", h.getSession)
 	mux.HandleFunc("DELETE /sessions/{id}", h.deleteSession)
 	mux.HandleFunc("GET /healthz", h.healthz)
@@ -193,29 +195,6 @@ func (h *Handler) createSession(w http.ResponseWriter, r *http.Request) {
 		"psk":        sess.PSK,
 		"created_at": sess.CreatedAt,
 	})
-}
-
-func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) {
-	sessions := h.sessionStore.List()
-	out := make([]map[string]any, 0, len(sessions))
-	for _, s := range sessions {
-		agentList := make([]map[string]any, 0)
-		for _, a := range h.hub.GetSessionAgents(s.ID) {
-			agentList = append(agentList, map[string]any{
-				"id":     a.AgentID,
-				"online": a.Online,
-			})
-		}
-		out = append(out, map[string]any{
-			"id":          s.ID,
-			"name":        s.Name,
-			"created_at":  s.CreatedAt,
-			"agent_count": len(agentList),
-			"agents":      agentList,
-			"leader_id":   h.hub.GetLeader(s.ID),
-		})
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *Handler) getSession(w http.ResponseWriter, r *http.Request) {

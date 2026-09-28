@@ -163,7 +163,6 @@ func TestWakeUpSignalCarriesOrigin(t *testing.T) {
 	}
 }
 
-
 // TestHeadlessModeTemplate: AGENTCHAT_HEADLESS=1 must extend the wake-up
 // template so headless agents know their prose reply has no subscriber and
 // must respond via agentchat tools.

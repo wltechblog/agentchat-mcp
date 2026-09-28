@@ -242,3 +242,23 @@ func TestWatchSubscriberCap(t *testing.T) {
 	}
 	_ = store
 }
+
+// TestSessionsAreNotEnumerable: there is deliberately no GET /sessions
+// listing. Channels are provisioned via POST /sessions and their id+PSK are
+// distributed out-of-band; participating requires knowing both.
+func TestSessionsAreNotEnumerable(t *testing.T) {
+	server, _ := setupTestServer(t)
+	createTestSession(t, server) // a session exists, but must not be discoverable
+
+	resp, err := http.Get(server.URL + "/sessions")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	// 404 = no route; 405 = route exists but only for POST (provisioning).
+	// Either way, no session enumeration.
+	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected no session listing (404/405), got %d: %s", resp.StatusCode, body)
+	}
+}

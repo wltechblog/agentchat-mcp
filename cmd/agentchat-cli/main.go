@@ -79,7 +79,6 @@ func main() {
 	psk := flag.String("psk", "", "Session PSK")
 	agentID := flag.String("agent", "human", "Your agent ID (default: human)")
 	agentName := flag.String("name", "", "Your display name (default: agent ID)")
-	listSessions := flag.Bool("list", false, "List available sessions and exit")
 	showVersion := flag.Bool("version", false, "Show version")
 	flag.Parse()
 
@@ -114,11 +113,6 @@ func main() {
 		agentID:   *agentID,
 		agentName: *agentName,
 		client:    &http.Client{Timeout: 30 * time.Second},
-	}
-
-	if *listSessions {
-		cli.listSessions()
-		return
 	}
 
 	if *sessionID == "" || *psk == "" {
@@ -175,18 +169,6 @@ func (c *CLI) doJSON(method, path string, payload any) (any, error) {
 	var result any
 	json.Unmarshal(rbody, &result)
 	return result, nil
-}
-
-func (c *CLI) listSessions() {
-	// GET /sessions is public and includes the agent roster.
-	resp, err := c.doRequest("GET", "/sessions", nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Println(string(body))
 }
 
 func (c *CLI) run() {

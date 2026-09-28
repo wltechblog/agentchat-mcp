@@ -49,16 +49,6 @@ func (s *Store) Get(id string) (*Session, bool) {
 	return sess, ok
 }
 
-func (s *Store) List() []*Session {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		out = append(out, sess)
-	}
-	return out
-}
-
 func (s *Store) Delete(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
