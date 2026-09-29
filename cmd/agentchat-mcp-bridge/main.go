@@ -116,7 +116,12 @@ func main() {
 
 	server := mcp.NewServer("agentchat-mcp-bridge", "1.4.0")
 	registerTools(server, bridge)
-	registerSignals(server, bridge)
+	if bridge.signalSocketPath != "" {
+		// Declare the wake-up action only when the bridge can actually fire
+		// it — a self-declared signal that never fires is a dead entry in
+		// the host's registry.
+		registerSignals(server, bridge)
+	}
 
 	slog.Info("bridge started", "agent_id", agentID, "session_id", sessionID, "server", httpBase)
 
@@ -432,6 +437,26 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		return string(data), nil
 	})
 
+	if b.signalSocketPath != "" {
+		// Signal-driven mode: the host wakes the agent when mail arrives, so
+		// blocking on a long poll would pin the agent's turn for minutes and
+		// race the wake-up. The tool is hidden from tools/list; a stale host
+		// that still calls it gets pointed at the signal flow.
+		s.RegisterHiddenTool("wait_for_message", func(args map[string]any) (string, error) {
+			return "", fmt.Errorf("wait_for_message is disabled on this bridge: it uses wake-up signals (check_messages), so new messages interrupt you automatically — call receive_messages to read what arrived")
+		})
+	} else {
+		registerWaitForMessage(s, b)
+	}
+	registerToolsRest(s, b)
+}
+
+// registerWaitForMessage installs the blocking long-poll tool. Only used on
+// bridges WITHOUT a signal socket: there, polling is the only way to learn
+// about new mail. When wake-up signals are active the tool is hidden (see
+// registerTools) — the host interrupts the agent when mail arrives, so a
+// tool that pins the agent's turn for minutes is redundant at best.
+func registerWaitForMessage(s *mcp.Server, b *Bridge) {
 	s.RegisterTool(mcp.Tool{
 		Name:        "wait_for_message",
 		Description: "Block until one or more incoming messages arrive, then return them. This avoids repeated polling when waiting for a response from a remote agent which may take seconds or minutes to reply. Checks existing queued messages first, then polls up to the specified timeout. Messages that don't match the filters are retained and returned by the next receive_messages call — never discarded.",
@@ -539,6 +564,11 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			}
 		}
 	})
+}
+
+// registerToolsRest registers the tools that follow wait_for_message.
+func registerToolsRest(s *mcp.Server, b *Bridge) {
+	empty := map[string]any{"type": "object", "properties": map[string]any{}}
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "list_agents",
@@ -1020,7 +1050,7 @@ func registerSignals(s *mcp.Server, b *Bridge) {
 	// disambiguates multi-bridge deployments: the wake-up tells the agent
 	// exactly which mailbox has mail and which tool prefix to use.
 	response := "You have received new messages in your agentchat session on server {{.Source}} (chat {{.Channel}}:{{.ChatID}}). " +
-		"Use the tools from THAT server — prefix mcp_{{.Source}}_ (e.g. mcp_{{.Source}}_receive_messages or mcp_{{.Source}}_wait_for_message) — to read and handle them; " +
+		"Use the tools from THAT server — prefix mcp_{{.Source}}_ (e.g. mcp_{{.Source}}_receive_messages) — to read and handle them; " +
 		"tools from other agentchat servers read different mailboxes and will show nothing. " +
 		"The conversation history above shows work you have already completed in this chat — before acting on any message, " +
 		"check whether it concerns a task you have already finished or a reply you have already sent. " +

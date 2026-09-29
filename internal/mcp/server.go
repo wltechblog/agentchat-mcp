@@ -92,6 +92,14 @@ func (s *Server) RegisterTool(tool Tool, handler ToolHandler) {
 	s.handlers[tool.Name] = handler
 }
 
+// RegisterHiddenTool installs a handler that answers calls but does not
+// appear in tools/list. Used for retired entry points: a stale host that
+// still calls them gets a self-explanatory response instead of "unknown
+// tool", while new conversations never see the tool at all.
+func (s *Server) RegisterHiddenTool(name string, handler ToolHandler) {
+	s.handlers[name] = handler
+}
+
 func (s *Server) Run(ctx context.Context) error {
 	return s.RunWith(ctx, os.Stdin, os.Stdout)
 }

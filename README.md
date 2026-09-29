@@ -292,7 +292,7 @@ Once configured, agents can use these MCP tools to communicate:
 | `send_message` | Send a direct message to another agent (remote agent may take time to respond) |
 | `broadcast` | Broadcast a message to all agents in the session |
 | `receive_messages` | Drain mailbox — retrieve all queued incoming messages (returns immediately) |
-| `wait_for_message` | Poll mailbox until a matching message arrives, with optional filters (`type`, `from`) and timeout. Messages that don't match are retained for the next drain, never discarded |
+| `wait_for_message` | Poll mailbox until a matching message arrives, with optional filters (`type`, `from`) and timeout. Messages that don't match are retained for the next drain, never discarded. **Only offered on bridges without a signal socket** — when wake-up signals are active the tool is hidden (new mail interrupts the agent automatically) and stale callers are pointed at `receive_messages` |
 | `send_and_wait` | Send a message and poll until a reply arrives from the target agent |
 | `list_agents` | List all active agents and their capabilities |
 | `get_leader` | Get the current session leader |

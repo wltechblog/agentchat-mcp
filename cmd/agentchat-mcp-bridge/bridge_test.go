@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+
+	"github.com/wltechblog/agentchat-mcp/internal/mcp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,7 +20,6 @@ import (
 
 func testBridge(srv *httptest.Server) *Bridge {
 	b := &Bridge{
-		httpBase:  srv.URL,
 		sessionID: "s1",
 		psk:       "p",
 		agentID:   "a1",
@@ -27,6 +29,9 @@ func testBridge(srv *httptest.Server) *Bridge {
 	}
 	// Skip registration round-trips in doRequest.
 	b.initialized = true
+	if srv != nil {
+		b.httpBase = srv.URL
+	}
 	return b
 }
 
@@ -429,5 +434,83 @@ func TestRequireString(t *testing.T) {
 	_, err = requireString(map[string]any{"payload": "p"}, "to", "send_message")
 	if !strings.Contains(err.Error(), "payload") {
 		t.Fatalf("expected received arg keys in error, got %v", err)
+	}
+}
+
+// toolsList runs a tools/list request against the server and returns the
+// tool names exactly as an MCP host would see them.
+func toolsList(t *testing.T, s *mcp.Server) []string {
+	t.Helper()
+	var out bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.RunWith(ctx, strings.NewReader("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/list\"}\n"), &out); err != nil {
+		t.Fatalf("RunWith: %v", err)
+	}
+	var resp struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("decode tools/list: %v (%s)", err, out.String())
+	}
+	names := make([]string, 0, len(resp.Result.Tools))
+	for _, tl := range resp.Result.Tools {
+		names = append(names, tl.Name)
+	}
+	return names
+}
+
+func contains(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestWaitForMessageHiddenWhenSignalsActive: with a signal socket configured
+// the host wakes the agent when mail arrives, so the blocking long-poll tool
+// must not be offered — but a stale caller still gets a redirect.
+func TestWaitForMessageHiddenWhenSignalsActive(t *testing.T) {
+	b := testBridge(nil)
+	b.signalSocketPath = "/tmp/does-not-exist.sock"
+	s := mcp.NewServer("test", "1")
+	registerTools(s, b)
+
+	names := toolsList(t, s)
+	if contains(names, "wait_for_message") {
+		t.Fatalf("wait_for_message must be hidden in signal mode, got %v", names)
+	}
+	if !contains(names, "receive_messages") {
+		t.Fatalf("receive_messages missing from %v", names)
+	}
+
+	var out bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	call := `{"jsonrpc":"2.0","id":"9","method":"tools/call","params":{"name":"wait_for_message","arguments":{}}}` + "\n"
+	if err := s.RunWith(ctx, strings.NewReader(call), &out); err != nil {
+		t.Fatalf("RunWith call: %v", err)
+	}
+	if !strings.Contains(out.String(), "wait_for_message is disabled") ||
+		!strings.Contains(out.String(), "receive_messages") {
+		t.Fatalf("expected redirect error for stale caller, got %s", out.String())
+	}
+}
+
+// TestWaitForMessageAvailableWithoutSignals: polling-only bridges (no signal
+// socket) keep the blocking tool — polling is their only wake-up mechanism.
+func TestWaitForMessageAvailableWithoutSignals(t *testing.T) {
+	b := testBridge(nil)
+	s := mcp.NewServer("test", "1")
+	registerTools(s, b)
+
+	if !contains(toolsList(t, s), "wait_for_message") {
+		t.Fatal("wait_for_message must be offered in polling mode")
 	}
 }

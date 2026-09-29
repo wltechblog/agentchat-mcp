@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -292,5 +293,45 @@ func TestConcurrentDispatch(t *testing.T) {
 	}
 	if found != 2 {
 		t.Fatalf("expected both responses, got %d in: %s", found, out.String())
+	}
+}
+
+// TestHiddenToolNotListedButCallable: retired tools answer stale callers
+// with a self-explanatory error without appearing in tools/list.
+func TestHiddenToolNotListedButCallable(t *testing.T) {
+	s := NewServer("test", "1.0.0")
+	s.RegisterTool(Tool{
+		Name:        "visible",
+		Description: "current tool",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+	}, func(args map[string]any) (string, error) { return "ok", nil })
+	s.RegisterHiddenTool("legacy", func(args map[string]any) (string, error) {
+		return "", fmt.Errorf("legacy is disabled: use visible")
+	})
+
+	var buf bytes.Buffer
+	s.writer = bufio.NewWriter(&buf)
+	s.handleRequest(jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`"l1"`), Method: "tools/list"})
+
+	var resp struct {
+		Result *json.RawMessage `json:"result"`
+	}
+	json.Unmarshal(buf.Bytes(), &resp)
+	if resp.Result == nil {
+		t.Fatal("expected tools/list result")
+	}
+	toolsJSON := string(*resp.Result)
+	if !strings.Contains(toolsJSON, `"visible"`) {
+		t.Fatalf("expected visible tool, got %s", toolsJSON)
+	}
+	if strings.Contains(toolsJSON, "legacy") {
+		t.Fatalf("hidden tool must not be listed, got %s", toolsJSON)
+	}
+
+	buf.Reset()
+	s.handleRequest(jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`"l2"`), Method: "tools/call",
+		Params: json.RawMessage(`{"name":"legacy","arguments":{}}`)})
+	if !strings.Contains(buf.String(), "legacy is disabled") {
+		t.Fatalf("expected hidden tool's redirect error, got %s", buf.String())
 	}
 }

@@ -210,7 +210,6 @@ func TestNonHeadlessTemplate(t *testing.T) {
 	}
 }
 
-
 // TestSignalDeclarationNamesServerPrefix pins the multi-bridge fix: the
 // wake-up template must tell the agent WHICH server's tools to call via
 // the {{.Source}} host config key — without it, agents with two agentchat
