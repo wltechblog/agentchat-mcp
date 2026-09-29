@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -375,11 +376,11 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"to", "payload"},
 		},
 	}, func(args map[string]any) (string, error) {
-		to, _ := args["to"].(string)
-		if to == "" {
-			return "", fmt.Errorf("to is required")
+		to, err := requireString(args, "to", "send_message")
+		if err != nil {
+			return "", err
 		}
-		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
 			"to":      to,
 			"type":    "message",
 			"payload": args["payload"],
@@ -387,6 +388,10 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		if err != nil {
 			return "", err
 		}
+		// One INFO line per accepted send: lets host operators correlate
+		// every delivered message with server-side request logs when
+		// investigating duplicates.
+		slog.Info("message sent", "to", to)
 		return "sent", nil
 	})
 
@@ -488,9 +493,9 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"to", "payload"},
 		},
 	}, func(args map[string]any) (string, error) {
-		to, _ := args["to"].(string)
-		if to == "" {
-			return "", fmt.Errorf("to is required")
+		to, err := requireString(args, "to", "send_and_wait")
+		if err != nil {
+			return "", err
 		}
 
 		timeoutSec, _ := args["timeout"].(float64)
@@ -501,7 +506,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			timeoutSec = 600
 		}
 
-		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
 			"to":      to,
 			"type":    "message",
 			"payload": args["payload"],
@@ -572,8 +577,11 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"new_leader_id"},
 		},
 	}, func(args map[string]any) (string, error) {
-		newLeader, _ := args["new_leader_id"].(string)
-		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/leader/transfer", map[string]any{
+		newLeader, err := requireString(args, "new_leader_id", "transfer_leadership")
+		if err != nil {
+			return "", err
+		}
+		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/leader/transfer", map[string]any{
 			"new_leader_id": newLeader,
 		})
 		if err != nil {
@@ -686,16 +694,16 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"to", "task_id", "description"},
 		},
 	}, func(args map[string]any) (string, error) {
-		to, _ := args["to"].(string)
-		if to == "" {
-			return "", fmt.Errorf("to is required")
+		to, err := requireString(args, "to", "task_assign")
+		if err != nil {
+			return "", err
 		}
 		taskPayload, _ := json.Marshal(map[string]any{
 			"task_id":     args["task_id"],
 			"description": args["description"],
 			"parameters":  args["parameters"],
 		})
-		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
 			"to":      to,
 			"type":    "task_assign",
 			"payload": json.RawMessage(taskPayload),
@@ -720,16 +728,16 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"to", "task_id", "status"},
 		},
 	}, func(args map[string]any) (string, error) {
-		to, _ := args["to"].(string)
-		if to == "" {
-			return "", fmt.Errorf("to is required")
+		to, err := requireString(args, "to", "task_status")
+		if err != nil {
+			return "", err
 		}
 		taskPayload, _ := json.Marshal(map[string]any{
 			"task_id": args["task_id"],
 			"status":  args["status"],
 			"detail":  args["detail"],
 		})
-		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
 			"to":      to,
 			"type":    "task_status",
 			"payload": json.RawMessage(taskPayload),
@@ -753,15 +761,15 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"required": []string{"to", "task_id", "result"},
 		},
 	}, func(args map[string]any) (string, error) {
-		to, _ := args["to"].(string)
-		if to == "" {
-			return "", fmt.Errorf("to is required")
+		to, err := requireString(args, "to", "task_result")
+		if err != nil {
+			return "", err
 		}
 		taskPayload, _ := json.Marshal(map[string]any{
 			"task_id": args["task_id"],
 			"result":  args["result"],
 		})
-		_, err := b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
+		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
 			"to":      to,
 			"type":    "task_result",
 			"payload": json.RawMessage(taskPayload),
@@ -1039,6 +1047,36 @@ func registerSignals(s *mcp.Server, b *Bridge) {
 // right one. Empty when the host never stamped an origin.
 func (b *Bridge) originTarget() (channel, chatID string) {
 	return mcp.Origin()
+}
+
+// requireString extracts a required string tool argument. When it is
+// missing, empty, or not a string, it returns an error stating exactly what
+// WAS received and logs the shape of the call. Host-side callers of these
+// tools are LLMs, and argument malformation is intermittent by nature — a
+// bare "to is required" is indistinguishable from a schema bug and
+// unfalsifiable after the fact (see the joinery bug report on the
+// "to is required" flake). Only argument keys and the offending field's raw
+// JSON are logged, never message payload contents.
+func requireString(args map[string]any, key, tool string) (string, error) {
+	v, present := args[key]
+	s, isString := v.(string)
+	if isString && s != "" {
+		return s, nil
+	}
+	raw, _ := json.Marshal(v)
+	if v == nil {
+		raw = []byte("absent")
+	}
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	slog.Error("tool call missing required string argument",
+		"tool", tool, "arg", key, "present", present, "is_string", isString,
+		"raw_value", string(raw), "arg_keys", keys)
+	return "", fmt.Errorf("%s is required (tool %s received args %v with %s=%s) — the arguments structure was malformed in transit or at the caller",
+		key, tool, keys, key, string(raw))
 }
 
 func maybeString(v any) string {

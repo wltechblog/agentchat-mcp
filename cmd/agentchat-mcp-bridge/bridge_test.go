@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -388,5 +389,45 @@ func TestDrainAllStampsSignalTrigger(t *testing.T) {
 	}
 	if getPendingSignalInfo() != nil {
 		t.Fatal("pending signal info should be consumed by the drain")
+	}
+}
+
+// TestRequireString: the diagnostic error must state exactly what the tool
+// call received — bare "to is required" was unfalsifiable after the fact
+// (joinery bug report: send_message "to is required" flake).
+func TestRequireString(t *testing.T) {
+	v, err := requireString(map[string]any{"to": "agent-b"}, "to", "send_message")
+	if err != nil || v != "agent-b" {
+		t.Fatalf("valid arg rejected: %q %v", v, err)
+	}
+
+	cases := []struct {
+		name        string
+		args        map[string]any
+		wantInError string
+	}{
+		{"missing", map[string]any{"payload": map[string]any{"text": "hi"}}, "to=absent"},
+		{"empty", map[string]any{"to": "", "payload": "p"}, `to=""`},
+		{"non-string", map[string]any{"to": 42.0}, "to=42"},
+		{"null", map[string]any{"to": nil}, "to=absent"},
+	}
+	for _, tc := range cases {
+		_, err := requireString(tc.args, "to", "send_message")
+		if err == nil {
+			t.Fatalf("%s: expected error", tc.name)
+		}
+		msg := err.Error()
+		for _, want := range []string{"send_message", "to=", tc.wantInError} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("%s: error %q missing %q", tc.name, msg, want)
+			}
+		}
+	}
+
+	// Received keys are listed so a misnested argument (e.g. `to` at the top
+	// level of the call instead of inside arguments) is visible in the error.
+	_, err = requireString(map[string]any{"payload": "p"}, "to", "send_message")
+	if !strings.Contains(err.Error(), "payload") {
+		t.Fatalf("expected received arg keys in error, got %v", err)
 	}
 }
