@@ -262,3 +262,26 @@ func TestSessionsAreNotEnumerable(t *testing.T) {
 		t.Fatalf("expected no session listing (404/405), got %d: %s", resp.StatusCode, body)
 	}
 }
+
+// TestSendToUnknownAgentRejected: direct sends to an agent that isn't a
+// current member of the channel fail with an actionable error instead of
+// queueing into a black hole.
+func TestSendToUnknownAgentRejected(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+
+	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/messages", sessionID, psk, "agent-1", map[string]any{
+		"to": "agent-elsewhere", "type": "message", "payload": map[string]string{"text": "hello?"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown target, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	for _, want := range []string{"agent-elsewhere", "different channel"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("error %q missing %q", string(body), want)
+		}
+	}
+}

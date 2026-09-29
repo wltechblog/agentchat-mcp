@@ -259,8 +259,27 @@ func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawM
 	if to == "" {
 		return fmt.Errorf("'to' is required")
 	}
-	// Delivery does not depend on presence: an offline target's mailbox
-	// accepts the message and it will be there when the target returns.
+	// Direct sends require an online target. Silently queueing mail for an
+	// agent that isn't in the channel — or is merely known here but offline —
+	// turns a caller mistake into a black hole: the sender believes the
+	// message landed while the recipient may live in a different channel.
+	// Callers (LLMs) get an error they can act on: check list_agents.
+	var known protocol.AgentInfo
+	var found bool
+	for _, a := range h.presence.GetAgents(sessionID) {
+		if a.AgentID == to {
+			known = a
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("no agent %q in this channel — they may be in a different channel; call list_agents to see current members", to)
+	}
+	if !known.Online {
+		return fmt.Errorf("agent %q is currently offline in this channel — messages to offline agents are not accepted (they may be in a different channel); call list_agents to see who is online", to)
+	}
+
 	env := protocol.Envelope{
 		Type:      msgType,
 		SessionID: sessionID,

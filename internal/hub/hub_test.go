@@ -2,6 +2,7 @@ package hub
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -128,17 +129,22 @@ func TestMailboxSurvivesPresenceExpiry(t *testing.T) {
 		t.Fatalf("expected capabilities to survive expiry, got %v", agents[0].Capabilities)
 	}
 
-	// Sends to the offline agent must succeed, not fail.
-	if err := h.SendMessage(sess.ID, "agent-b", "agent-a", "message", payload("after")); err != nil {
-		t.Fatalf("send to expired agent should succeed: %v", err)
+	// Direct sends to the offline agent are rejected with an actionable
+	// error; broadcasts still reach every known member's mailbox.
+	err := h.SendMessage(sess.ID, "agent-b", "agent-a", "message", payload("after"))
+	if err == nil {
+		t.Fatal("send to offline agent should fail")
+	}
+	if !strings.Contains(err.Error(), "offline") {
+		t.Fatalf("expected offline-specific error, got %v", err)
 	}
 	h.Broadcast(sess.ID, "agent-b", "broadcast", payload("bcast"))
 
 	msgs := h.DrainMailbox(sess.ID, "agent-a")
-	// DM before expiry, DM + broadcast after expiry. Going offline announces
-	// nothing: agent_left fires only on true departure (the forget horizon).
-	if len(msgs) != 3 {
-		t.Fatalf("expected 3 queued entries, got %d", len(msgs))
+	// DM before expiry + broadcast after it. Going offline announces nothing
+	// (agent_left fires only on true departure) and accepts no new mail.
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 queued entries, got %d", len(msgs))
 	}
 	gotTypes := map[string]bool{}
 	for _, m := range msgs {
@@ -306,6 +312,7 @@ func TestPersistenceRestartRoundTrip(t *testing.T) {
 
 	sess := store.Create("persist")
 	h.Register(sess.ID, "agent-a", []string{"search"})
+	h.Register(sess.ID, "agent-b", nil)
 	if err := h.SendMessage(sess.ID, "agent-a", "agent-b", "message", payload("queued")); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -344,7 +351,10 @@ func TestPersistenceRestartRoundTrip(t *testing.T) {
 	}
 
 	// Sequence continuity: the next message must not reuse old numbers.
+	// Presence is deliberately not persisted — agents re-register after a
+	// restart before they can exchange mail again.
 	h2.Register(sess.ID, "agent-a", nil)
+	h2.Register(sess.ID, "agent-b", nil)
 	if err := h2.SendMessage(sess.ID, "agent-a", "agent-b", "message", payload("after")); err != nil {
 		t.Fatalf("send after restore: %v", err)
 	}
@@ -429,18 +439,31 @@ func TestJanitorReapsIdleSessions(t *testing.T) {
 		Mailboxes:    mb,
 	}, WithSweepInterval(time.Hour))
 
-	// An idle channel restored from a 40-day-old snapshot.
+	// An idle channel: agents exchange mail, then everyone goes quiet 40
+	// days ago. Activity tracking is monotonic, so the staleness is applied
+	// by restoring a snapshot with backdated timestamps.
 	old := time.Now().Add(-40 * 24 * time.Hour)
 	store.Restore([]session.Session{{
 		ID: "stale-session", Name: "stale", PSK: "psk-stale",
 		CreatedAt: old, LastActive: old,
 	}})
-	h.SendMessage("stale-session", "ghost", "agent-b", "message", payload("orphaned"))
+	h.Register("stale-session", "ghost", nil)
+	h.Register("stale-session", "agent-b", nil)
+	if err := h.SendMessage("stale-session", "ghost", "agent-b", "message", payload("orphaned")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
 	sp.Set("stale-session", "plan", payload("v"), "ghost")
+
+	snap := store.Snapshot()
+	for i := range snap {
+		snap[i].LastActive = old
+	}
+	store.Restore(snap)
 
 	// A recently active channel.
 	live := store.Create("live")
 	h.Register(live.ID, "agent-a", nil)
+	h.Register(live.ID, "agent-b", nil)
 	h.SendMessage(live.ID, "agent-a", "agent-b", "message", payload("kept"))
 
 	h.reapStaleSessions(30 * 24 * time.Hour)

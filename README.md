@@ -32,13 +32,13 @@ increasing per-session sequence number.
 ## Features
 
 - **Session-based isolation** — Agents join named sessions, each with a unique PSK
-- **Server-side mailboxes** — Every message for an agent is queued in their mailbox regardless of connection state, including while the agent is offline. Agents poll to drain messages (destructive read).
+- **Server-side mailboxes** — Messages are queued in each agent's mailbox and poll-drained (destructive read). Direct sends require the target to be a current member of the channel — sends to unknown or offline agents fail with an error (they may be in a different channel); broadcasts reach all known members.
 - **Reliable event stream** — The server's SSE `/watch` endpoint carries every session event (direct messages, broadcasts, scratchpad updates, leader changes, agent joins/leaves), each with a monotonically increasing sequence number. Keepalive pings keep idle streams alive through proxies; clients reconnect with backoff.
 - **Retried wake-up signals** — When a message arrives for a hosted agent (joist / gino / picobot), the bridge signals it via the local Unix socket; failed signal sends retry with capped exponential backoff and the agent is re-signalled on every stream reconnect, so a missed wake-up is never final.
 - **Self-declared signals** — The bridge declares its `check_messages` signal in the MCP `initialize` result (`signals.actions`), so joist/gino hosts auto-register the action with no config. The signal source is the host-injected MCP config key (`JOIST_MCP_ID` / `GINO_MCP_ID`), satisfying the registry's source-bound enforcement.
 - **Chat-session routing** — Agents can be members of more than one chat. The bridge captures the calling chat session from `tools/call` `_meta` origin (stamped by joist/gino per-turn) and stamps it into every wake-up signal (`channel` + `chat_id`), so a signal wakes the agent in the exact chat session that invoked the bridge — not a global default.
 - **Multiple process tolerant** — Multiple MCP bridge instances for the same agent work correctly. First poll wins (competing consumer semantics). No duplicate delivery.
-- **Offline-tolerant presence** — Any authenticated request refreshes agent presence. Agents that go idle past the TTL (60s) stay listed as `online: false` and keep receiving mail, so nothing is lost while they're away.
+- **Offline-tolerant presence** — Any authenticated request refreshes agent presence. Agents that go idle past the TTL (60s) stay listed as `online: false` and keep the mail they already had; new direct sends to them are rejected until they're active again.
 - **Real-time messaging** — Direct messages (agent-to-agent) and broadcasts (to all session members)
 - **Shared scratchpad** — Key-value store per session for shared context, with real-time update broadcasts to mailboxes
 - **Leader election** — First agent in a session becomes leader; supports explicit transfer and auto-transfer on expiry
@@ -276,7 +276,7 @@ When the bridge is spawned by a host agent, it also holds an SSE connection to `
 
 ### Delivery guarantees
 
-- **Mailboxes are at-least-once, exactly-once per drain.** Drains are destructive; multiple bridge instances for the same agent get competing-consumer semantics (first poll wins, no duplicates).
+- **Mailboxes are at-least-once, exactly-once per drain.** Drains are destructive; multiple bridge instances for the same agent get competing-consumer semantics (first poll wins, no duplicates). Direct sends require an online target — sends to unknown or offline agents fail with an error naming the agent, so a wrong-channel or typo'd recipient is caught at send time rather than silently swallowed.
 - **The watch stream is best-effort, the mailbox is authoritative.** Anything missed while a stream is down is picked up by the reconnect drain and wake-up signal.
 - **One sequence counter per session.** Every event carries it; clients dedupe by sequence and hold a single high-water mark.
 - **History is catch-up, not a store.** The last ~100 message-like events per session are available via `request_history`; system events (joins, scratchpad updates) are sequenced but not replayed in history.
