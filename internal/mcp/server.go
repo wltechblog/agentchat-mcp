@@ -139,7 +139,7 @@ func (s *Server) RunWith(ctx context.Context, in io.Reader, out io.Writer) error
 		}
 
 		// Dispatch each request in its own goroutine: a tool can block for
-		// minutes (wait_for_message long-polls server-side), and the host
+		// minutes (tools long-poll the server-side mailbox), and the host
 		// must still be able to call other tools and get ping responses.
 		// Responses are serialized by s.mu; JSON-RPC ids let the host match
 		// responses that arrive out of order.
