@@ -25,7 +25,7 @@ var lastSeq atomic.Int64
 var lastConnectSignal atomic.Int64
 
 // pendingSignal holds metadata about the message(s) that triggered the last signal,
-// so we can include contextual info when the agent calls receive_messages or wait_for_message.
+// so we can include contextual info when the agent calls receive_messages.
 var pendingSignal atomic.Pointer[pendingSignalInfo]
 
 type pendingSignalInfo struct {
@@ -445,7 +445,7 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 		"trigger_type", triggerType,
 	)
 
-	// Store pending signal info so receive_messages/wait_for_message can
+	// Store pending signal info so receive_messages can
 	// report what triggered the signal
 	pendingSignal.Store(&pendingSignalInfo{
 		TriggerType: triggerType,

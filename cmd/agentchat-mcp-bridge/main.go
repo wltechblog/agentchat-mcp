@@ -371,7 +371,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "send_message",
-		Description: "Send a direct message to another agent in the session. The remote agent may take time to process and respond; use wait_for_message to block until a reply arrives.",
+		Description: "Send a direct message to another agent in the session. The remote agent may take time to process and respond; when the reply arrives you will be woken via a check_messages signal — call receive_messages then.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -402,7 +402,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "broadcast",
-		Description: "Broadcast a message to all agents in the session. Remote agents may take time to respond; use wait_for_message or receive_messages to collect replies.",
+		Description: "Broadcast a message to all agents in the session. Remote agents may take time to respond; use receive_messages to collect replies.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -423,7 +423,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "receive_messages",
-		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call, including any held back by earlier filtered wait_for_message calls. Returns immediately with whatever is available. For blocking until a message arrives, use wait_for_message instead.",
+		Description: "Return all queued incoming messages (direct messages, broadcasts, task messages, notifications) since the last call. Returns immediately with whatever is available. New mail also triggers a check_messages signal when wake-up signals are active.",
 		InputSchema: empty,
 	}, func(args map[string]any) (string, error) {
 		msgs, err := b.drainAll()
@@ -436,139 +436,6 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		data, _ := json.Marshal(msgs)
 		return string(data), nil
 	})
-
-	if b.signalSocketPath != "" {
-		// Signal-driven mode: the host wakes the agent when mail arrives, so
-		// blocking on a long poll would pin the agent's turn for minutes and
-		// race the wake-up. The tool is hidden from tools/list; a stale host
-		// that still calls it gets pointed at the signal flow.
-		s.RegisterHiddenTool("wait_for_message", func(args map[string]any) (string, error) {
-			return "", fmt.Errorf("wait_for_message is disabled on this bridge: it uses wake-up signals (check_messages), so new messages interrupt you automatically — call receive_messages to read what arrived")
-		})
-	} else {
-		registerWaitForMessage(s, b)
-	}
-	registerToolsRest(s, b)
-}
-
-// registerWaitForMessage installs the blocking long-poll tool. Only used on
-// bridges WITHOUT a signal socket: there, polling is the only way to learn
-// about new mail. When wake-up signals are active the tool is hidden (see
-// registerTools) — the host interrupts the agent when mail arrives, so a
-// tool that pins the agent's turn for minutes is redundant at best.
-func registerWaitForMessage(s *mcp.Server, b *Bridge) {
-	s.RegisterTool(mcp.Tool{
-		Name:        "wait_for_message",
-		Description: "Block until one or more incoming messages arrive, then return them. This avoids repeated polling when waiting for a response from a remote agent which may take seconds or minutes to reply. Checks existing queued messages first, then polls up to the specified timeout. Messages that don't match the filters are retained and returned by the next receive_messages call — never discarded.",
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"timeout": map[string]any{"type": "number", "description": "Maximum seconds to wait (default 120, max 600)"},
-				"from":    map[string]any{"type": "string", "description": "Only return messages from this agent ID"},
-				"type":    map[string]any{"type": "string", "description": "Only return messages of this type (e.g. message, task_status, task_result, broadcast)"},
-			},
-		},
-	}, func(args map[string]any) (string, error) {
-		timeoutSec, _ := args["timeout"].(float64)
-		if timeoutSec <= 0 {
-			timeoutSec = 120
-		}
-		if timeoutSec > 600 {
-			timeoutSec = 600
-		}
-		deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
-
-		filterFrom, _ := args["from"].(string)
-		filterType, _ := args["type"].(string)
-
-		// Server-side long-poll: each request blocks up to 25s until a
-		// matching message arrives, so there is no client polling loop and
-		// no risk of destroying non-matching mail.
-		const pollWait = 25 * time.Second
-		for {
-			wait := pollWait
-			if remaining := time.Until(deadline); remaining < wait {
-				wait = remaining
-			}
-			if wait <= 0 {
-				return "[]", nil
-			}
-
-			msgs, err := b.pollMailbox(wait, filterFrom, filterType)
-			if err != nil {
-				return "", err
-			}
-			if len(msgs) > 0 {
-				data, _ := json.Marshal(msgs)
-				return string(data), nil
-			}
-		}
-	})
-
-	s.RegisterTool(mcp.Tool{
-		Name:        "send_and_wait",
-		Description: "Send a message to another agent and block until a reply arrives. Combines send_message + wait_for_message into a single synchronous call.",
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"to":      map[string]any{"type": "string", "description": "Target agent ID"},
-				"payload": map[string]any{"type": "object", "description": "Message payload"},
-				"timeout": map[string]any{"type": "number", "description": "Maximum seconds to wait for reply (default 120, max 600)"},
-			},
-			"required": []string{"to", "payload"},
-		},
-	}, func(args map[string]any) (string, error) {
-		to, err := requireString(args, "to", "send_and_wait")
-		if err != nil {
-			return "", err
-		}
-
-		timeoutSec, _ := args["timeout"].(float64)
-		if timeoutSec <= 0 {
-			timeoutSec = 120
-		}
-		if timeoutSec > 600 {
-			timeoutSec = 600
-		}
-
-		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
-			"to":      to,
-			"type":    "message",
-			"payload": args["payload"],
-		})
-		if err != nil {
-			return "", fmt.Errorf("send failed: %w", err)
-		}
-
-		deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
-
-		// Long-poll for a reply from the target agent; other messages stay
-		// queued server-side.
-		const pollWait = 25 * time.Second
-		for {
-			wait := pollWait
-			if remaining := time.Until(deadline); remaining < wait {
-				wait = remaining
-			}
-			if wait <= 0 {
-				return "[]", nil
-			}
-
-			msgs, err := b.pollMailbox(wait, to, "")
-			if err != nil {
-				return "", err
-			}
-			if len(msgs) > 0 {
-				data, _ := json.Marshal(msgs)
-				return string(data), nil
-			}
-		}
-	})
-}
-
-// registerToolsRest registers the tools that follow wait_for_message.
-func registerToolsRest(s *mcp.Server, b *Bridge) {
-	empty := map[string]any{"type": "object", "properties": map[string]any{}}
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "list_agents",
@@ -712,7 +579,7 @@ func registerToolsRest(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "task_assign",
-		Description: "Assign a task to another agent in the session. The remote agent may take minutes to complete the task; use wait_for_message to block until a task_status or task_result response arrives.",
+		Description: "Assign a task to another agent in the session. The remote agent may take minutes to complete the task; the reply arrives via a check_messages wake-up — call receive_messages then.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

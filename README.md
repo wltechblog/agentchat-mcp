@@ -270,7 +270,7 @@ The bridge exposes MCP tools over stdio and communicates with the server via RES
 └───────────────────┘                 └──────────────────────┘                 └──────────┘
 ```
 
-Messages destined for the agent are queued in a server-side mailbox, including while the agent is offline. `receive_messages` and `wait_for_message` drain the mailbox via `GET /sessions/{id}/mailbox`, optionally as a server-side filtered long-poll (`?wait=25&from=X`) that holds the request until a matching message arrives and never destroys non-matching mail.
+Messages destined for the agent are queued in a server-side mailbox, including while the agent is offline. `receive_messages` drains the mailbox via `GET /sessions/{id}/mailbox`, optionally as a server-side filtered long-poll (`?wait=25&from=X`) that holds the request until a matching message arrives and never destroys non-matching mail.
 
 When the bridge is spawned by a host agent, it also holds an SSE connection to `/watch` (authenticated with a short-lived token issued by register — PSKs never appear in URLs) and sends a `check_messages` signal to the host's local Unix socket whenever relevant mail arrives. Failed signals retry with capped exponential backoff, the agent is re-signalled on every reconnect, and the stream has keepalive pings plus an idle watchdog, so a silent network drop becomes a reconnect instead of a dead agent.
 
@@ -292,7 +292,6 @@ Once configured, agents can use these MCP tools to communicate:
 | `send_message` | Send a direct message to another agent (remote agent may take time to respond) |
 | `broadcast` | Broadcast a message to all agents in the session |
 | `receive_messages` | Drain mailbox — retrieve all queued incoming messages (returns immediately) |
-| `wait_for_message` | Poll mailbox until a matching message arrives, with optional filters (`type`, `from`) and timeout. Messages that don't match are retained for the next drain, never discarded. **Only offered on bridges without a signal socket** — when wake-up signals are active the tool is hidden (new mail interrupts the agent automatically) and stale callers are pointed at `receive_messages` |
 | `send_and_wait` | Send a message and poll until a reply arrives from the target agent |
 | `list_agents` | List all active agents and their capabilities |
 | `get_leader` | Get the current session leader |
@@ -312,7 +311,7 @@ Once configured, agents can use these MCP tools to communicate:
 
 1. Call `list_agents` to discover peers and their capabilities
 2. Call `task_assign` to delegate work to a specific agent
-3. Call `wait_for_message` to poll until a `task_result` or `task_status` response arrives (remote agents may take minutes)
+3. Wait for the `check_messages` wake-up when the remote agent's `task_result` or `task_status` arrives, then call `receive_messages` (remote agents may take minutes)
 4. Use the scratchpad to share intermediate state across all agents
 5. Use `send_file` / `download_file` to exchange files
 
