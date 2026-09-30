@@ -373,7 +373,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "send_message",
-		Description: "Send a direct message to another agent in the session. The remote agent may take time to process and respond; when the reply arrives you will be woken via a check_messages signal — call receive_messages then.",
+		Description: "Send a direct message to another agent in the session. Arguments: 'to' is a TOP-LEVEL argument (sibling of payload, never inside it); 'payload' is the message object. The remote agent may take time to process and respond; when the reply arrives you will be woken via a check_messages signal — call receive_messages then.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -1009,6 +1009,21 @@ func requireString(args map[string]any, key, tool string) (string, error) {
 	if isString && s != "" {
 		return s, nil
 	}
+
+	// Recovery: LLM callers intermittently misnest required arguments inside
+	// the message payload (field evidence: {"payload":{"message":...,
+	// "to":"x"}} with top-level to absent). When the payload map carries the
+	// key as a string, adopt it: it was addressing, not content, so strip it
+	// from the payload and proceed. The malformation is logged for visibility.
+	if pm, ok := args["payload"].(map[string]any); ok {
+		if pv, ok := pm[key].(string); ok && pv != "" {
+			delete(pm, key)
+			slog.Warn("tool call argument misnested in payload; recovered",
+				"tool", tool, "arg", key)
+			return pv, nil
+		}
+	}
+
 	raw, _ := json.Marshal(v)
 	if v == nil {
 		raw = []byte("absent")
@@ -1021,7 +1036,7 @@ func requireString(args map[string]any, key, tool string) (string, error) {
 	slog.Error("tool call missing required string argument",
 		"tool", tool, "arg", key, "present", present, "is_string", isString,
 		"raw_value", string(raw), "arg_keys", keys)
-	return "", fmt.Errorf("%s is required (tool %s received args %v with %s=%s) — the arguments structure was malformed in transit or at the caller",
+	return "", fmt.Errorf("%s is required (tool %s received args %v with %s=%s) — 'to' and similar addresses are top-level arguments, not fields inside payload",
 		key, tool, keys, key, string(raw))
 }
 

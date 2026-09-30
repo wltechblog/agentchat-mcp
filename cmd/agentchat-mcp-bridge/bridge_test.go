@@ -433,6 +433,26 @@ func TestRequireString(t *testing.T) {
 	if !strings.Contains(err.Error(), "payload") {
 		t.Fatalf("expected received arg keys in error, got %v", err)
 	}
+
+	// Misnested recovery: the exact field-report shape — to inside payload,
+	// absent at the top level — is adopted, stripped from the payload, and
+	// the send proceeds.
+	payload := map[string]any{"message": "hello", "to": "hypecast-core"}
+	v, err = requireString(map[string]any{"payload": payload}, "to", "send_message")
+	if err != nil || v != "hypecast-core" {
+		t.Fatalf("expected misnested to recovered as hypecast-core, got %q %v", v, err)
+	}
+	if _, still := payload["to"]; still {
+		t.Fatal("recovered to must be stripped from the payload")
+	}
+	if _, has := payload["message"]; !has {
+		t.Fatal("payload content must survive recovery")
+	}
+
+	// A non-string payload value is not recovery material.
+	if _, err := requireString(map[string]any{"payload": map[string]any{"to": 42.0}}, "to", "send_message"); err == nil {
+		t.Fatal("non-string misnested value must not be recovered")
+	}
 }
 
 // TestVerifyContent: the send_file guard against silent base64 truncation
