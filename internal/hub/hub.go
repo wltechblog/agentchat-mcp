@@ -398,32 +398,6 @@ func (h *Hub) LeaderTransfer(sessionID, fromAgent, newLeaderID string) error {
 	return nil
 }
 
-func (h *Hub) ShareFile(sessionID, from, to, fileID, fileName, contentType, description string, size int64) error {
-	if to == "" {
-		return fmt.Errorf("'to' is required")
-	}
-	if _, ok := h.files.Get(sessionID, fileID); !ok {
-		return fmt.Errorf("file not found: %s", fileID)
-	}
-
-	payload, _ := json.Marshal(protocol.FileSharePayload{
-		FileID: fileID, FileName: fileName, ContentType: contentType, Size: size, Description: description,
-	})
-	env := protocol.Envelope{
-		Type:      protocol.TypeFileShare,
-		SessionID: sessionID,
-		From:      from,
-		To:        to,
-		Payload:   payload,
-		Timestamp: time.Now().UTC(),
-	}
-	h.recordEnvelope(sessionID, &env)
-	h.deliverToAgentMailbox(sessionID, to, env)
-	h.notifyWatchers(sessionID, env)
-	slog.Info("file shared", "session", sessionID, "from", from, "to", to, "file", fileName, "file_id", fileID)
-	return nil
-}
-
 func (h *Hub) GetFiles(sessionID string) []*filestore.File {
 	return h.files.List(sessionID)
 }

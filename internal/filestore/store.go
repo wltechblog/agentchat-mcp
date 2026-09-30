@@ -2,19 +2,29 @@ package filestore
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"sync"
 	"time"
 )
+
+// sha256Hex is the integrity fingerprint stored with every file, so
+// receivers can verify a transfer end-to-end.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
 
 type File struct {
 	ID          string
 	Name        string
 	ContentType string
 	Size        int64
-	Data        []byte
-	UploadedBy  string
-	UploadedAt  time.Time
+	// Sha256 is the hex digest of Data, computed once at upload.
+	Sha256     string
+	Data       []byte
+	UploadedBy string
+	UploadedAt time.Time
 }
 
 type Store struct {
@@ -52,6 +62,7 @@ func (s *Store) Store(sessionID, filename, contentType, uploadedBy string, data 
 		Name:        filename,
 		ContentType: contentType,
 		Size:        int64(len(data)),
+		Sha256:      sha256Hex(data),
 		Data:        data,
 		UploadedBy:  uploadedBy,
 		UploadedAt:  time.Now().UTC(),

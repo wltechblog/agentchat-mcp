@@ -151,5 +151,9 @@ type FileSharePayload struct {
 	FileName    string `json:"file_name"`
 	ContentType string `json:"content_type"`
 	Size        int64  `json:"size"`
+	// Sha256 is the digest of the stored bytes — receivers should verify
+	// after download. Base64 routed through LLM tool calls can be silently
+	// truncated at a quantum boundary; the digest makes that detectable.
+	Sha256      string `json:"sha256,omitempty"`
 	Description string `json:"description,omitempty"`
 }

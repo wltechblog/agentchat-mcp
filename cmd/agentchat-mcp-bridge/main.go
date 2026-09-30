@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -719,24 +721,37 @@ func registerTools(s *mcp.Server, b *Bridge) {
 				"content_base64": map[string]any{"type": "string", "description": "Base64-encoded file content"},
 				"content_type":   map[string]any{"type": "string", "description": "MIME type (default application/octet-stream)"},
 				"description":    map[string]any{"type": "string", "description": "Optional description of the file"},
+				"expected_size":  map[string]any{"type": "number", "description": "Raw byte length of the file before base64 encoding. Strongly recommended: if the decoded content doesn't match, the send fails instead of storing a silently truncated file"},
+				"content_sha256": map[string]any{"type": "string", "description": "SHA-256 hex of the raw file bytes. When provided, a mismatch fails the send — the strongest protection against truncated base64"},
 			},
 			"required": []string{"to", "filename", "content_base64"},
 		},
 	}, func(args map[string]any) (string, error) {
-		to, _ := args["to"].(string)
-		filename, _ := args["filename"].(string)
-		contentB64, _ := args["content_base64"].(string)
+		to, err := requireString(args, "to", "send_file")
+		if err != nil {
+			return "", err
+		}
+		filename, err := requireString(args, "filename", "send_file")
+		if err != nil {
+			return "", err
+		}
+		contentB64, err := requireString(args, "content_base64", "send_file")
+		if err != nil {
+			return "", err
+		}
 		contentType, _ := args["content_type"].(string)
 		description, _ := args["description"].(string)
-
-		if to == "" || filename == "" || contentB64 == "" {
-			return "", fmt.Errorf("to, filename, and content_base64 are required")
-		}
+		expectedSize, _ := args["expected_size"].(float64)
+		expectedSha, _ := args["content_sha256"].(string)
 
 		data, err := base64.StdEncoding.DecodeString(contentB64)
 		if err != nil {
 			return "", fmt.Errorf("invalid base64: %w", err)
 		}
+		if err := verifyContent(data, int64(expectedSize), expectedSha); err != nil {
+			return "", err
+		}
+		contentSha := sha256Hex(data)
 
 		if contentType == "" {
 			contentType = "application/octet-stream"
@@ -746,7 +761,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			return "", err
 		}
 
-		uploadURL := fmt.Sprintf("%s/sessions/%s/files?filename=%s", b.httpBase, b.sessionID, filename)
+		uploadURL := fmt.Sprintf("%s/sessions/%s/files?filename=%s", b.httpBase, b.sessionID, url.QueryEscape(filename))
 		req, _ := http.NewRequest("POST", uploadURL, bytes.NewReader(data))
 		req.Header.Set("Content-Type", contentType)
 		req.Header.Set("Authorization", "Bearer "+b.psk)
@@ -772,6 +787,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			FileName:    filename,
 			ContentType: contentType,
 			Size:        int64(size),
+			Sha256:      contentSha,
 			Description: description,
 		})
 		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
@@ -787,6 +803,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			"file_id":   fileID,
 			"file_name": filename,
 			"size":      int64(size),
+			"sha256":    contentSha,
 			"shared_to": to,
 		})
 		return string(result), nil
@@ -798,7 +815,8 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"file_id": map[string]any{"type": "string", "description": "File ID from the file_share message"},
+				"file_id":         map[string]any{"type": "string", "description": "File ID from the file_share message"},
+				"expected_sha256": map[string]any{"type": "string", "description": "SHA-256 hex from the file_share message. When provided, a mismatch fails the download — catches truncated or altered transfers before the content is used"},
 			},
 			"required": []string{"file_id"},
 		},
@@ -830,10 +848,18 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			return "", fmt.Errorf("read failed: %w", err)
 		}
 
+		storedSha := resp.Header.Get("X-Content-SHA256")
+		if expectedSha, _ := args["expected_sha256"].(string); expectedSha != "" {
+			if err := verifyContent(fdata, 0, expectedSha); err != nil {
+				return "", err
+			}
+		}
+
 		result, _ := json.Marshal(map[string]any{
 			"file_id":        fileID,
 			"content_type":   resp.Header.Get("Content-Type"),
 			"size":           len(fdata),
+			"sha256":         storedSha,
 			"content_base64": base64.StdEncoding.EncodeToString(fdata),
 		})
 		return string(result), nil
@@ -944,6 +970,29 @@ func registerSignals(s *mcp.Server, b *Bridge) {
 // right one. Empty when the host never stamped an origin.
 func (b *Bridge) originTarget() (channel, chatID string) {
 	return mcp.Origin()
+}
+
+// verifyContent guards file transfers against silent truncation: base64
+// routed through LLM tool calls can be cut at a clean quantum boundary,
+// which still decodes — into a corrupt prefix that "looks fine" until used
+// (field report: 810 bytes stored of 2,860 intended, sha mismatch). When the
+// caller knows the expected raw size or sha256, a mismatch is a hard error
+// at send time instead of a corrupt file at use time.
+func verifyContent(data []byte, expectedSize int64, expectedSha string) error {
+	if expectedSize > 0 && int64(len(data)) != expectedSize {
+		return fmt.Errorf("content appears truncated or padded: decoded %d bytes but expected_size is %d — re-send the complete content_base64", len(data), expectedSize)
+	}
+	if expectedSha != "" {
+		if got := sha256Hex(data); !strings.EqualFold(got, expectedSha) {
+			return fmt.Errorf("content_sha256 mismatch: decoded content hashes to %s, expected %s — the base64 was altered or truncated before reaching the bridge", got, expectedSha)
+		}
+	}
+	return nil
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // requireString extracts a required string tool argument. When it is

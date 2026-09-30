@@ -542,6 +542,7 @@ func (h *Handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 		"file_name":    f.Name,
 		"content_type": f.ContentType,
 		"size":         f.Size,
+		"sha256":       f.Sha256,
 		"uploaded_by":  f.UploadedBy,
 		"uploaded_at":  f.UploadedAt,
 	})
@@ -564,6 +565,7 @@ func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", f.ContentType)
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+f.Name+"\"")
 	w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
+	w.Header().Set("X-Content-SHA256", f.Sha256)
 	w.Write(f.Data)
 }
 

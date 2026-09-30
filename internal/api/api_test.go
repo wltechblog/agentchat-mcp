@@ -725,3 +725,52 @@ func TestScratchpadUpdateBroadcast(t *testing.T) {
 		t.Fatalf("expected scratchpad_update, got %v", env["type"])
 	}
 }
+
+// TestFileTransferIntegrity: round-trips byte-for-byte at the size from the
+// field report (2,860 base64 chars = 2,145 raw bytes) and at 1MB. The
+// transport must never truncate — the reported corruption happened at the
+// caller boundary, and this pins that our path is clean.
+func TestFileTransferIntegrity(t *testing.T) {
+	server, _ := setupTestServer(t)
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+
+	for _, size := range []int{2145, 1 << 20} {
+		content := make([]byte, size)
+		for i := range content {
+			content[i] = byte(i % 251)
+		}
+
+		req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=integrity.bin", bytes.NewReader(content))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("Authorization", "Bearer "+psk)
+		req.Header.Set("X-Agent-ID", "agent-1")
+		up, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("upload %d: %v", size, err)
+		}
+		var upload struct {
+			FileID string `json:"file_id"`
+			Size   int64  `json:"size"`
+			Sha256 string `json:"sha256"`
+		}
+		json.NewDecoder(up.Body).Decode(&upload)
+		up.Body.Close()
+		if up.StatusCode != http.StatusCreated || upload.Size != int64(size) {
+			t.Fatalf("upload %d: status %d size %d", size, up.StatusCode, upload.Size)
+		}
+
+		dl := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/files/"+upload.FileID, sessionID, psk, "agent-1", nil)
+		got, _ := io.ReadAll(dl.Body)
+		dl.Body.Close()
+		if len(got) != size {
+			t.Fatalf("download %d truncated to %d bytes", size, len(got))
+		}
+		if !bytes.Equal(got, content) {
+			t.Fatalf("download %d corrupted", size)
+		}
+		if dl.Header.Get("X-Content-SHA256") != upload.Sha256 {
+			t.Fatalf("sha header mismatch with upload response")
+		}
+	}
+}

@@ -434,3 +434,34 @@ func TestRequireString(t *testing.T) {
 		t.Fatalf("expected received arg keys in error, got %v", err)
 	}
 }
+
+// TestVerifyContent: the send_file guard against silent base64 truncation
+// (field report: 810 bytes stored of 2,860 intended, sha mismatch).
+func TestVerifyContent(t *testing.T) {
+	data := []byte("0123456789")
+
+	if err := verifyContent(data, 0, ""); err != nil {
+		t.Fatalf("no expectations should pass: %v", err)
+	}
+	if err := verifyContent(data, 10, ""); err != nil {
+		t.Fatalf("matching size should pass: %v", err)
+	}
+
+	err := verifyContent(data, 2860, "")
+	if err == nil {
+		t.Fatal("size mismatch must fail")
+	}
+	for _, want := range []string{"10 bytes", "2860", "truncated"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+
+	if err := verifyContent(data, 0, sha256Hex(data)); err != nil {
+		t.Fatalf("matching sha should pass: %v", err)
+	}
+	err = verifyContent(data, 0, "deadbeef")
+	if err == nil || !strings.Contains(err.Error(), "mismatch") {
+		t.Fatalf("sha mismatch must fail with mismatch error, got %v", err)
+	}
+}

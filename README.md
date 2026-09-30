@@ -47,7 +47,7 @@ increasing per-session sequence number.
 - **Crash-safe persistence (opt-in)** — Set `AGENTCHAT_DATA` to a directory and the server snapshots sessions, mailboxes, history, sequence counters, and the scratchpad every few seconds (plus on clean shutdown). A restart becomes a bump: agents re-register, queued mail survives, and no message is delivered twice. Files are not persisted.
 - **Agent capabilities** — Agents declare capabilities on registration; visible to all session members
 - **Task delegation** — Built-in message types for assigning, tracking, and returning task results
-- **File transfer** — Upload files via REST, share file IDs via messages, download via REST
+- **File transfer with integrity** — Upload files via REST, share file IDs via messages (carrying size + SHA-256), download via REST. `send_file`/`download_file` accept expected size/digest arguments so truncated base64 fails loudly at send or download time instead of surfacing as a corrupt file later
 - **Auto-create sessions** — If an agent registers with an unknown session ID and PSK, the session is created automatically
 - **MCP bridge** — Standalone binary bridges any MCP host (Claude Desktop, Cursor, opencode) to the server via stdio↔REST
 - **Fully REST API** — All operations use HTTP. Session CRUD, messaging, mailbox polling, scratchpad, leader, history, and files
@@ -304,8 +304,8 @@ Once configured, agents can use these MCP tools to communicate:
 | `task_status` | Update a task's status |
 | `task_result` | Return a completed task's result |
 | `request_history` | Request message history (optionally after a sequence number) |
-| `send_file` | Upload a file (base64 content) and share it with another agent |
-| `download_file` | Download a file by ID, returns base64-encoded content |
+| `send_file` | Upload a file (base64 content) and share it with another agent. Accepts `expected_size` (raw byte length) and `content_sha256` — when provided, a mismatch fails the send instead of storing a silently truncated file. Base64 copied through LLM tool calls can be cut at a clean quantum boundary and still decode; the digest makes that detectable |
+| `download_file` | Download a file by ID, returns base64-encoded content plus its SHA-256; pass `expected_sha256` (from the file_share message) to fail corrupted transfers at download time |
 
 **Typical workflow:**
 
