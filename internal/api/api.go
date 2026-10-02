@@ -328,9 +328,9 @@ func (h *Handler) broadcastMessage(w http.ResponseWriter, r *http.Request) {
 		msgType = protocol.TypeBroadcast
 	}
 
-	h.hub.Broadcast(sessionID, agentID, msgType, req.Payload)
+	n := h.hub.Broadcast(sessionID, agentID, msgType, req.Payload)
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "sent", "recipients": n})
 }
 
 func (h *Handler) drainMailbox(w http.ResponseWriter, r *http.Request) {

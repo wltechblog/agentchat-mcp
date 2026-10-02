@@ -161,7 +161,33 @@ func (h *Hub) emitAmbientEvent(sessionID string, env protocol.Envelope) {
 }
 
 func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
+	// Snapshot pre-Touch presence: known (in roster) but not live (past
+	// TTL) = lapsed member whose heartbeat just landed. Must read BEFORE
+	// Touch — Touch refreshes LastSeen, making IsPresent vacuously true.
+	known := h.presence.WasPresent(sessionID, agentID)
+	live := h.presence.IsPresent(sessionID, agentID)
 	isNew := h.presence.Touch(sessionID, agentID, capabilities)
+
+	// Re-announce: a known agent whose presence had lapsed past the TTL
+	// just came back. Broadcast through the normal event fan-out (watchers
+	// + mailboxes, sequenced) so peers see the roster heal immediately
+	// instead of waiting for the next list_agents call. Without this, the
+	// 30s/60s heartbeat-vs-TTL race makes every mid-turn agent look
+	// offline to its peers between heartbeats. Steady-state heartbeats
+	// (still live pre-Touch) and brand new joins announce via their own
+	// paths — never here.
+	if known && !live {
+		slog.Info("agent re-announced presence", "session", sessionID, "agent", agentID)
+		h.sessionStore.TouchActivity(sessionID, time.Now())
+		h.emitAmbientEvent(sessionID, protocol.Envelope{
+			Type:      protocol.TypeAgentReconnected,
+			SessionID: sessionID,
+			From:      "server",
+			To:        "*",
+			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: true}),
+			Timestamp: time.Now().UTC(),
+		})
+	}
 
 	if isNew {
 		slog.Info("agent joined", "session", sessionID, "agent", agentID)
@@ -259,11 +285,13 @@ func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawM
 	if to == "" {
 		return fmt.Errorf("'to' is required")
 	}
-	// Direct sends require an online target. Silently queueing mail for an
-	// agent that isn't in the channel — or is merely known here but offline —
-	// turns a caller mistake into a black hole: the sender believes the
-	// message landed while the recipient may live in a different channel.
-	// Callers (LLMs) get an error they can act on: check list_agents.
+	// Known members are deliverable, online or not: the presence tracker
+	// keeps an offline agent's mailbox (onAgentWentOffline's own comment
+	// promises "messages sent while it is offline must still be there when
+	// it returns"), so refusing the send contradicted the storage contract
+	// and created the fixqueue incident class — task_assigns/replies 400
+	// "offline" against a recipient that was alive and reachable. Only a
+	// genuinely unknown recipient errors (typo, wrong channel).
 	var known protocol.AgentInfo
 	var found bool
 	for _, a := range h.presence.GetAgents(sessionID) {
@@ -275,9 +303,6 @@ func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawM
 	}
 	if !found {
 		return fmt.Errorf("no agent %q in this channel — they may be in a different channel; call list_agents to see current members", to)
-	}
-	if !known.Online {
-		return fmt.Errorf("agent %q is currently offline in this channel — messages to offline agents are not accepted (they may be in a different channel); call list_agents to see who is online", to)
 	}
 
 	env := protocol.Envelope{
@@ -291,10 +316,23 @@ func (h *Hub) SendMessage(sessionID, from, to, msgType string, payload json.RawM
 	h.recordEnvelope(sessionID, &env)
 	h.deliverToAgentMailbox(sessionID, to, env)
 	h.notifyWatchers(sessionID, env)
+	// Delivery surfacing: one log line per direct delivery with the exact
+	// mailbox state the recipient will see — turns "did it land?" support
+	// questions into a log grep. Queue count is AFTER this delivery, so 1
+	// means this message is waiting for the recipient's next drain.
+	if known.Online {
+		slog.Info("direct message delivered", "session", sessionID, "from", from, "to", to,
+			"type", msgType, "recipient_online", true, "recipient_queue", h.mailboxes.Len(sessionID+"/"+to))
+	} else {
+		// Recipient offline (TTL lapsed, e.g. mid-turn): the mailbox holds
+		// the message until it returns. Surfaced, not silently queued.
+		slog.Warn("direct message queued for offline recipient", "session", sessionID, "from", from, "to", to,
+			"type", msgType, "recipient_queue", h.mailboxes.Len(sessionID+"/"+to))
+	}
 	return nil
 }
 
-func (h *Hub) Broadcast(sessionID, from, msgType string, payload json.RawMessage) {
+func (h *Hub) Broadcast(sessionID, from, msgType string, payload json.RawMessage) int {
 	env := protocol.Envelope{
 		Type:      msgType,
 		SessionID: sessionID,
@@ -304,8 +342,15 @@ func (h *Hub) Broadcast(sessionID, from, msgType string, payload json.RawMessage
 		Timestamp: time.Now().UTC(),
 	}
 	h.recordEnvelope(sessionID, &env)
-	h.deliverToSessionMailboxes(sessionID, env, from)
+	n := h.deliverToSessionMailboxes(sessionID, env, from)
 	h.notifyWatchers(sessionID, env)
+	// Delivery surfacing: "sent" for a broadcast only means "accepted";
+	// report how many mailboxes it actually landed in so a fan-out of 0
+	// (no known members, e.g. during a roster gap) is diagnosable from
+	// logs instead of being indistinguishable from success.
+	slog.Info("broadcast delivered", "session", sessionID, "from", from, "type", msgType,
+		"recipients", n)
+	return n
 }
 
 func (h *Hub) deliverToAgentMailbox(sessionID, agentID string, env protocol.Envelope) {
@@ -316,13 +361,18 @@ func (h *Hub) deliverToAgentMailbox(sessionID, agentID string, env protocol.Enve
 	}
 }
 
-func (h *Hub) deliverToSessionMailboxes(sessionID string, env protocol.Envelope, excludeAgent string) {
+// deliverToSessionMailboxes fans the envelope out to every known session
+// member's mailbox (except the sender) and returns the delivery count.
+func (h *Hub) deliverToSessionMailboxes(sessionID string, env protocol.Envelope, excludeAgent string) int {
 	agents := h.presence.GetAgents(sessionID)
+	delivered := 0
 	for _, a := range agents {
 		if a.AgentID != excludeAgent {
 			h.deliverToAgentMailbox(sessionID, a.AgentID, env)
+			delivered++
 		}
 	}
+	return delivered
 }
 
 func (h *Hub) ScratchpadSet(sessionID, agentID, key string, value json.RawMessage) (protocol.ScratchpadEntry, error) {

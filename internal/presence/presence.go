@@ -93,6 +93,21 @@ func (t *Tracker) IsPresent(sessionID, agentID string) bool {
 	return t.isLive(state)
 }
 
+// WasPresent reports whether the agent is known to the session at all —
+// including one currently past the TTL (online=false). Callers that
+// re-announce on reconnect need the distinction: a heartbeat from an
+// agent whose presence merely lapsed mid-turn must revive the roster
+// entry, not create a fresh one.
+func (t *Tracker) WasPresent(sessionID, agentID string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	state, ok := t.agents[agentKey(sessionID, agentID)]
+	if !ok {
+		return false
+	}
+	return state.SessionID == sessionID
+}
+
 // GetAgents returns every known agent in the session, including ones past the
 // TTL. Deliverability does not depend on presence; callers use the Online flag
 // to decide what to display or who is eligible for leadership.

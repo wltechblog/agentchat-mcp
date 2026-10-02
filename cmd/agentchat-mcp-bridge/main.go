@@ -261,8 +261,13 @@ func (b *Bridge) doJSON(method, path string, payload any) (any, error) {
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		// Server rejected our credentials (restart or replaced session):
-		// re-register on the next call.
+		// re-register on the next call. Surface it — a silent invalidation
+		// means an unrelated later failure (e.g. "no agent X in this
+		// channel" after a server restart wiped presence) has no visible
+		// cause. This log line pairs with it.
 		b.invalidateRegistration()
+		slog.Warn("server rejected credentials; registration invalidated and will re-register on next call",
+			"method", method, "path", path, "status", resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, string(rbody))

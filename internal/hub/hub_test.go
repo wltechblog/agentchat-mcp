@@ -2,7 +2,6 @@ package hub
 
 import (
 	"encoding/json"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -129,22 +128,21 @@ func TestMailboxSurvivesPresenceExpiry(t *testing.T) {
 		t.Fatalf("expected capabilities to survive expiry, got %v", agents[0].Capabilities)
 	}
 
-	// Direct sends to the offline agent are rejected with an actionable
-	// error; broadcasts still reach every known member's mailbox.
+	// Direct sends to the offline-but-known agent are ACCEPTED and queued
+	// (the mailbox is the delivery record; the process is alive and will
+	// drain on wake). Only genuinely unknown recipients are rejected.
+	// Broadcasts still reach every known member's mailbox.
 	err := h.SendMessage(sess.ID, "agent-b", "agent-a", "message", payload("after"))
-	if err == nil {
-		t.Fatal("send to offline agent should fail")
-	}
-	if !strings.Contains(err.Error(), "offline") {
-		t.Fatalf("expected offline-specific error, got %v", err)
+	if err != nil {
+		t.Fatalf("send to offline-but-known agent must be accepted, got: %v", err)
 	}
 	h.Broadcast(sess.ID, "agent-b", "broadcast", payload("bcast"))
 
 	msgs := h.DrainMailbox(sess.ID, "agent-a")
-	// DM before expiry + broadcast after it. Going offline announces nothing
-	// (agent_left fires only on true departure) and accepts no new mail.
-	if len(msgs) != 2 {
-		t.Fatalf("expected 2 queued entries, got %d", len(msgs))
+	// DM before expiry + DM + broadcast after it. Going offline announces
+	// nothing (agent_left fires only on true departure) and never drops mail.
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 queued entries, got %d", len(msgs))
 	}
 	gotTypes := map[string]bool{}
 	for _, m := range msgs {
