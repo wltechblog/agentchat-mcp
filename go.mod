@@ -1,3 +1,3 @@
 module github.com/wltechblog/agentchat-mcp
 
-go 1.22
+go 1.27.3
