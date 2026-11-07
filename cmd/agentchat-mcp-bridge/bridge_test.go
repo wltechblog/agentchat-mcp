@@ -1,29 +1,37 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/wltechblog/agentchat-mcp/internal/mcp"
 )
 
 func testBridge(srv *httptest.Server) *Bridge {
 	b := &Bridge{
-		sessionID: "s1",
-		psk:       "p",
-		agentID:   "a1",
-		client:    &http.Client{},
-		sseClient: &http.Client{},
-		signalCh:  make(chan struct{}, 1),
+		sessionID:  "s1",
+		psk:        "p",
+		agentID:    "a1",
+		client:     &http.Client{},
+		sseClient:  &http.Client{},
+		fileClient: &http.Client{},
+		signalCh:   make(chan struct{}, 1),
 	}
 	// Skip registration round-trips in doRequest.
 	b.initialized = true
@@ -455,33 +463,215 @@ func TestRequireString(t *testing.T) {
 	}
 }
 
-// TestVerifyContent: the send_file guard against silent base64 truncation
-// (field report: 810 bytes stored of 2,860 intended, sha mismatch).
-func TestVerifyContent(t *testing.T) {
-	data := []byte("0123456789")
+// runToolCall drives a single tools/call through the MCP dispatcher over
+// in-memory pipes, exactly as a host would, and returns the tool's result
+// text — or an error carrying the JSON-RPC error message for tool failures.
+func runToolCall(t *testing.T, b *Bridge, name string, args map[string]any) (string, error) {
+	t.Helper()
+	s := mcp.NewServer("test", "0.0")
+	registerTools(s, b)
+	req, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params":  map[string]any{"name": name, "arguments": args},
+	})
+	var out bytes.Buffer
+	if err := s.RunWith(context.Background(), bytes.NewReader(append(req, '\n')), &out); err != nil {
+		t.Fatalf("RunWith: %v", err)
+	}
+	var resp struct {
+		Result *struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response %q: %v", out.String(), err)
+	}
+	if resp.Error != nil {
+		return "", fmt.Errorf("%s", resp.Error.Message)
+	}
+	if resp.Result == nil || len(resp.Result.Content) == 0 {
+		t.Fatalf("no content in response: %s", out.String())
+	}
+	return resp.Result.Content[0].Text, nil
+}
 
-	if err := verifyContent(data, 0, ""); err != nil {
-		t.Fatalf("no expectations should pass: %v", err)
+// TestSendFileFromPath: the file's bytes are streamed verbatim from disk to
+// the upload endpoint — never through the tool arguments.
+func TestSendFileFromPath(t *testing.T) {
+	content := bytes.Repeat([]byte("agentchat file transfer "), 4000)
+	srcPath := filepath.Join(t.TempDir(), "report.bin")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if err := verifyContent(data, 10, ""); err != nil {
-		t.Fatalf("matching size should pass: %v", err)
-	}
+	sum := sha256.Sum256(content)
 
-	err := verifyContent(data, 2860, "")
-	if err == nil {
-		t.Fatal("size mismatch must fail")
-	}
-	for _, want := range []string{"10 bytes", "2860", "truncated"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error %q missing %q", err, want)
+	var gotUpload []byte
+	var gotFilename string
+	var shares int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sessions/s1/files", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
 		}
-	}
+		gotFilename = r.URL.Query().Get("filename")
+		gotUpload, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, `{"file_id":"f1","size":%d,"sha256":%q}`, len(gotUpload), hex.EncodeToString(sum[:]))
+	})
+	mux.HandleFunc("/sessions/s1/messages", func(w http.ResponseWriter, r *http.Request) {
+		shares++
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "{}")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
 
-	if err := verifyContent(data, 0, sha256Hex(data)); err != nil {
-		t.Fatalf("matching sha should pass: %v", err)
+	b := testBridge(srv)
+	result, err := runToolCall(t, b, "send_file", map[string]any{"to": "agent-b", "path": srcPath})
+	if err != nil {
+		t.Fatalf("send_file: %v", err)
 	}
-	err = verifyContent(data, 0, "deadbeef")
+	if !bytes.Equal(gotUpload, content) {
+		t.Fatalf("uploaded bytes differ from the source file (%d vs %d)", len(gotUpload), len(content))
+	}
+	if gotFilename != "report.bin" {
+		t.Fatalf("filename should default to the base name, got %q", gotFilename)
+	}
+	if shares != 1 {
+		t.Fatalf("expected exactly one file_share message, got %d", shares)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(result), &sent); err != nil {
+		t.Fatalf("decode result %q: %v", result, err)
+	}
+	if sent["file_id"] != "f1" || sent["size"] != float64(len(content)) || sent["sha256"] != hex.EncodeToString(sum[:]) {
+		t.Fatalf("unexpected result: %v", sent)
+	}
+}
+
+// TestSendFileIntegrityMismatchFails: a server-stored size/sha that differs
+// from the streamed file must fail the send and skip the share message.
+func TestSendFileIntegrityMismatchFails(t *testing.T) {
+	srcPath := filepath.Join(t.TempDir(), "data.bin")
+	if err := os.WriteFile(srcPath, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var shares int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sessions/s1/files", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"file_id":"f1","size":999,"sha256":"deadbeef"}`)
+	})
+	mux.HandleFunc("/sessions/s1/messages", func(w http.ResponseWriter, r *http.Request) {
+		shares++
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "{}")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	_, err := runToolCall(t, testBridge(srv), "send_file", map[string]any{"to": "agent-b", "path": srcPath})
+	if err == nil || !strings.Contains(err.Error(), "integrity check failed") {
+		t.Fatalf("expected integrity failure, got %v", err)
+	}
+	if shares != 0 {
+		t.Fatalf("corrupt upload must not be shared, got %d share messages", shares)
+	}
+}
+
+// TestSendFileMissingPath: content_base64 is gone — a local path is the only
+// way in, and a missing or unreadable one is a clear error.
+func TestSendFileMissingPath(t *testing.T) {
+	_, err := runToolCall(t, testBridge(nil), "send_file", map[string]any{"to": "agent-b"})
+	if err == nil || !strings.Contains(err.Error(), "path") {
+		t.Fatalf("expected path-required error, got %v", err)
+	}
+	_, err = runToolCall(t, testBridge(nil), "send_file", map[string]any{"to": "agent-b", "path": "/nonexistent/file.bin"})
+	if err == nil || !strings.Contains(err.Error(), "cannot open") {
+		t.Fatalf("expected open error for bad path, got %v", err)
+	}
+}
+
+// TestDownloadFileToPath: bytes stream to the destination file, integrity is
+// verified end-to-end against expected_sha256.
+func TestDownloadFileToPath(t *testing.T) {
+	content := bytes.Repeat([]byte("\x00\x01\xfe\xffbinary!"), 3000)
+	sum := sha256.Sum256(content)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sessions/s1/files/f9", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Content-SHA256", hex.EncodeToString(sum[:]))
+		w.Write(content)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "received.bin")
+	result, err := runToolCall(t, testBridge(srv), "download_file", map[string]any{
+		"file_id":         "f9",
+		"path":            dest,
+		"expected_sha256": hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		t.Fatalf("download_file: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("destination file not written: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("saved file corrupted (%d vs %d bytes)", len(got), len(content))
+	}
+	var saved map[string]any
+	if err := json.Unmarshal([]byte(result), &saved); err != nil {
+		t.Fatalf("decode result %q: %v", result, err)
+	}
+	if saved["path"] != dest || saved["size"] != float64(len(content)) {
+		t.Fatalf("unexpected result: %v", saved)
+	}
+}
+
+// TestDownloadShaMismatchSavesNothing: an end-to-end sha mismatch must fail
+// the download and leave nothing at the destination path.
+func TestDownloadShaMismatchSavesNothing(t *testing.T) {
+	content := []byte("actual bytes")
+	sum := sha256.Sum256(content)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sessions/s1/files/f9", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-SHA256", hex.EncodeToString(sum[:]))
+		w.Write(content)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "received.bin")
+	_, err := runToolCall(t, testBridge(srv), "download_file", map[string]any{
+		"file_id":         "f9",
+		"path":            dest,
+		"expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+	})
 	if err == nil || !strings.Contains(err.Error(), "mismatch") {
-		t.Fatalf("sha mismatch must fail with mismatch error, got %v", err)
+		t.Fatalf("expected sha mismatch error, got %v", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatal("failed download must not leave a file at the destination")
+	}
+}
+
+// TestDownloadRequiresPath: files are saved to disk — the base64-return
+// mode is gone, so a missing path is an error, not a content dump.
+func TestDownloadRequiresPath(t *testing.T) {
+	_, err := runToolCall(t, testBridge(nil), "download_file", map[string]any{"file_id": "f9"})
+	if err == nil || !strings.Contains(err.Error(), "path") {
+		t.Fatalf("expected path-required error, got %v", err)
 	}
 }

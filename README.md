@@ -44,10 +44,10 @@ increasing per-session sequence number.
 - **Leader election** — First agent in a session becomes leader; supports explicit transfer and auto-transfer on expiry
 - **Sequenced message history** — Messages get monotonically increasing sequence numbers; agents can request missed messages
 - **Channel janitor** — Channels with no agent activity for the retention horizon (default 30 days) are reaped along with their mailboxes, history, sequence counters, and scratchpad, so abandoned channels don't accumulate forever.
-- **Crash-safe persistence (opt-in)** — Set `AGENTCHAT_DATA` to a directory and the server snapshots sessions, mailboxes, history, sequence counters, and the scratchpad every few seconds (plus on clean shutdown). A restart becomes a bump: agents re-register, queued mail survives, and no message is delivered twice. Files are not persisted.
+- **Crash-safe persistence (opt-in)** — Set `AGENTCHAT_DATA` to a directory and the server snapshots sessions, mailboxes, history, sequence counters, and the scratchpad every few seconds (plus on clean shutdown). A restart becomes a bump: agents re-register, queued mail survives, and no message is delivered twice. Files are not persisted (they live under `<AGENTCHAT_DATA>/files` and are wiped at startup).
 - **Agent capabilities** — Agents declare capabilities on registration; visible to all session members
 - **Task delegation** — Built-in message types for assigning, tracking, and returning task results
-- **File transfer with integrity** — Upload files via REST, share file IDs via messages (carrying size + SHA-256), download via REST. `send_file`/`download_file` accept expected size/digest arguments so truncated base64 fails loudly at send or download time instead of surfacing as a corrupt file later
+- **File transfer of any size** — Files stream directly from disk to the server over HTTP and back down to the recipient's disk; only a small `file_share` notification (file ID + size + SHA-256) rides through messaging. The bridge verifies digests on both ends, so a corrupted or truncated transfer fails loudly instead of surfacing as a corrupt file later. Size is bounded only by server disk (`AGENTCHAT_MAX_FILE_SIZE` can impose a cap)
 - **Auto-create sessions** — If an agent registers with an unknown session ID and PSK, the session is created automatically
 - **MCP bridge** — Standalone binary bridges any MCP host (Claude Desktop, Cursor, opencode) to the server via stdio↔REST
 - **Fully REST API** — All operations use HTTP. Session CRUD, messaging, mailbox polling, scratchpad, leader, history, and files
@@ -134,7 +134,8 @@ volumes:
 |----------|---------|-------------|
 | `PORT` | `8080` | HTTP listen port |
 | `AGENTCHAT_DEBUG` | `false` | Set to `true` or `1` to enable debug logging |
-| `AGENTCHAT_DATA` | *(unset)* | Directory for the state snapshot. When set, sessions, mailboxes, history, sequence counters, and the scratchpad survive restarts; when unset, the server is purely in-memory |
+| `AGENTCHAT_DATA` | *(unset)* | Directory for the state snapshot. When set, sessions, mailboxes, history, sequence counters, and the scratchpad survive restarts; when unset, the server is purely in-memory. Uploaded files land under `<AGENTCHAT_DATA>/files` (default `./agentchat-files`) |
+| `AGENTCHAT_MAX_FILE_SIZE` | *(unlimited)* | Max upload size in bytes. Unset or `0` means unlimited — files stream straight to disk, so the practical bound is disk space |
 | `AGENTCHAT_CHANNEL_RETENTION` | `720h` | Reap channels with no agent activity past this horizon (Go duration). `0` disables the janitor. Last-activity time survives restarts when persistence is enabled |
 
 ---
@@ -281,7 +282,7 @@ When the bridge is spawned by a host agent, it also holds an SSE connection to `
 - **One sequence counter per session.** Every event carries it; clients dedupe by sequence and hold a single high-water mark.
 - **History is catch-up, not a store.** The last ~100 message-like events per session are available via `request_history`; system events (joins, scratchpad updates) are sequenced but not replayed in history.
 - **Presence is ambient.** Joins, offline lapses, and departures appear only on the watch stream and in `list_agents` — they never enter mailboxes and never trigger wake-up signals, so agents aren't woken to report transitions nobody needs to act on. `agent_left` is announced only when an agent is forgotten entirely (24h offline), not when it merely goes idle.
-- **Persistence (opt-in via `AGENTCHAT_DATA`)** loses at most one flush interval (5s) on a crash; a clean shutdown loses nothing. Files are not persisted.
+- **Persistence (opt-in via `AGENTCHAT_DATA`)** loses at most one flush interval (5s) on a crash; a clean shutdown loses nothing. Files are not persisted — wiped at startup.
 
 ### Using the tools
 
@@ -292,7 +293,6 @@ Once configured, agents can use these MCP tools to communicate:
 | `send_message` | Send a direct message to another agent (remote agent may take time to respond) |
 | `broadcast` | Broadcast a message to all agents in the session |
 | `receive_messages` | Drain mailbox — retrieve all queued incoming messages (returns immediately) |
-| `send_and_wait` | Send a message and poll until a reply arrives from the target agent |
 | `list_agents` | List all active agents and their capabilities |
 | `get_leader` | Get the current session leader |
 | `transfer_leadership` | Transfer leadership to another agent |
@@ -304,8 +304,9 @@ Once configured, agents can use these MCP tools to communicate:
 | `task_status` | Update a task's status |
 | `task_result` | Return a completed task's result |
 | `request_history` | Request message history (optionally after a sequence number) |
-| `send_file` | Upload a file (base64 content) and share it with another agent. Accepts `expected_size` (raw byte length) and `content_sha256` — when provided, a mismatch fails the send instead of storing a silently truncated file. Base64 copied through LLM tool calls can be cut at a clean quantum boundary and still decode; the digest makes that detectable |
-| `download_file` | Download a file by ID, returns base64-encoded content plus its SHA-256; pass `expected_sha256` (from the file_share message) to fail corrupted transfers at download time |
+| `send_file` | Send a local file of any size to another agent. Pass `path` (file on this machine) plus `to`; optional `filename`, `content_type`, `description`. Bytes stream straight from disk to the server — file contents never pass through the model. The stored copy's size and SHA-256 are cross-checked before the `file_share` message goes out |
+| `download_file` | Save a shared file to a local path: `file_id` + `path` (destination on this machine); optional `expected_sha256` (from the file_share message) fails altered transfers end-to-end. Returns metadata only — content never passes through the model. Verified against the server's SHA-256; nothing is written on mismatch |
+| `list_files` | List files shared in the session (available to `download_file`) |
 
 **Typical workflow:**
 
@@ -346,9 +347,9 @@ All require `Authorization: Bearer <psk>` and `X-Agent-ID: <agent_id>` headers.
 | `POST` | `/sessions/{id}/scratchpad/set` | Set a key. Body: `{"key": "...", "value": ...}` |
 | `POST` | `/sessions/{id}/scratchpad/get` | Get a key. Body: `{"key": "..."}` |
 | `POST` | `/sessions/{id}/scratchpad/delete` | Delete a key. Body: `{"key": "..."}` |
-| `POST` | `/sessions/{id}/files` | Upload a file. Query params: `filename`. Headers: `Content-Type`. Returns `{file_id, size}` |
-| `GET` | `/sessions/{id}/files` | List files |
-| `GET` | `/sessions/{id}/files/{fileID}` | Download a file by ID |
+| `POST` | `/sessions/{id}/files` | Upload a file (raw bytes streamed to disk, arbitrary size). Query params: `filename`. Headers: `Content-Type`. Returns `{file_id, size, sha256}` |
+| `GET` | `/sessions/{id}/files` | List files (`{id, file_name, size, sha256, ...}`) |
+| `GET` | `/sessions/{id}/files/{fileID}` | Download a file by ID (streams the bytes; `X-Content-SHA256` header carries the digest) |
 | `DELETE` | `/sessions/{id}/files/{fileID}` | Delete a file |
 
 ## Development
@@ -383,7 +384,7 @@ agentchat-mcp/
 │   │   ├── watcher.go                  #   per-session SSE subscriber sets
 │   │   └── watchtoken.go               #   short-lived watch tokens (PSKs stay out of URLs)
 │   ├── auth/auth.go                    # PSK generation
-│   ├── filestore/store.go              # In-memory per-session file storage
+│   ├── filestore/store.go              # Disk-backed per-session blob storage (streaming, SHA-256 at upload)
 │   ├── hub/hub.go                      # Business logic: routing, history, single event fan-out
 │   ├── leader/leader.go                # Leader election tracking
 │   ├── mailbox/mailbox.go              # Per-agent queues: destructive drains, filtered long-poll

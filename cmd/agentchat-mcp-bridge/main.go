@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +32,10 @@ type Bridge struct {
 	capabilities []string
 	client       *http.Client
 	sseClient    *http.Client
+	// fileClient has no overall timeout: file transfers stream for as long
+	// as the bytes keep moving, so a multi-GB send must not die at 30s.
+	// Connection-level timeouts still bound a dead server.
+	fileClient *http.Client
 
 	mu               sync.Mutex
 	initialized      bool
@@ -103,13 +108,23 @@ func main() {
 	defer cancel()
 
 	bridge := &Bridge{
-		httpBase:         httpBase,
-		sessionID:        sessionID,
-		psk:              psk,
-		agentID:          agentID,
-		capabilities:     caps,
-		client:           &http.Client{Timeout: 30 * time.Second},
-		sseClient:        &http.Client{},
+		httpBase:     httpBase,
+		sessionID:    sessionID,
+		psk:          psk,
+		agentID:      agentID,
+		capabilities: caps,
+		client:       &http.Client{Timeout: 30 * time.Second},
+		sseClient:    &http.Client{},
+		fileClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 5 * time.Minute,
+			},
+		},
 		debugLog:         debugLog,
 		signalSocketPath: signalSocketPath,
 		mcpID:            mcpID,
@@ -378,7 +393,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "send_message",
-		Description: "Send a direct message to another agent in the session. Arguments: 'to' is a TOP-LEVEL argument (sibling of payload, never inside it); 'payload' is the message object. The remote agent may take time to process and respond; when the reply arrives you will be woken via a check_messages signal — call receive_messages then.",
+		Description: "Send a direct message to another agent in the session. Arguments: 'to' is a TOP-LEVEL argument (sibling of payload, never inside it); 'payload' is the message object. The remote agent may take time to process and respond; when the reply arrives you will be woken via a check_messages signal — call receive_messages then. Never embed file contents (or base64) in messages or payloads — share files with send_file using a local path.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -409,7 +424,7 @@ func registerTools(s *mcp.Server, b *Bridge) {
 
 	s.RegisterTool(mcp.Tool{
 		Name:        "broadcast",
-		Description: "Broadcast a message to all agents in the session. Remote agents may take time to respond; use receive_messages to collect replies.",
+		Description: "Broadcast a message to all agents in the session. Remote agents may take time to respond; use receive_messages to collect replies. Never embed file contents (or base64) in messages or payloads — share files with send_file using a local path.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -716,62 +731,64 @@ func registerTools(s *mcp.Server, b *Bridge) {
 	})
 
 	s.RegisterTool(mcp.Tool{
-		Name:        "send_file",
-		Description: "Upload a file and share it with another agent. The file content is provided as base64. Returns file_id and shares it via the session.",
+		Name: "send_file",
+		Description: "Send a local file of any size to another agent. The bytes stream directly from disk to the server — file contents never pass through the model, so conversation size limits do not apply. " +
+			"Pass the file's path on this machine; NEVER read or encode file contents yourself, and never embed file contents (or base64) in messages.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"to":             map[string]any{"type": "string", "description": "Target agent ID"},
-				"filename":       map[string]any{"type": "string", "description": "Name for the file"},
-				"content_base64": map[string]any{"type": "string", "description": "Base64-encoded file content"},
-				"content_type":   map[string]any{"type": "string", "description": "MIME type (default application/octet-stream)"},
-				"description":    map[string]any{"type": "string", "description": "Optional description of the file"},
-				"expected_size":  map[string]any{"type": "number", "description": "Raw byte length of the file before base64 encoding. Strongly recommended: if the decoded content doesn't match, the send fails instead of storing a silently truncated file"},
-				"content_sha256": map[string]any{"type": "string", "description": "SHA-256 hex of the raw file bytes. When provided, a mismatch fails the send — the strongest protection against truncated base64"},
+				"to":           map[string]any{"type": "string", "description": "Target agent ID"},
+				"path":         map[string]any{"type": "string", "description": "Local path of the file to send (on this machine)"},
+				"filename":     map[string]any{"type": "string", "description": "Name the recipient sees (default: base name of path)"},
+				"content_type": map[string]any{"type": "string", "description": "MIME type (default application/octet-stream)"},
+				"description":  map[string]any{"type": "string", "description": "Optional description of the file"},
 			},
-			"required": []string{"to", "filename", "content_base64"},
+			"required": []string{"to", "path"},
 		},
 	}, func(args map[string]any) (string, error) {
 		to, err := requireString(args, "to", "send_file")
 		if err != nil {
 			return "", err
 		}
-		filename, err := requireString(args, "filename", "send_file")
+		path, err := requireString(args, "path", "send_file")
 		if err != nil {
 			return "", err
 		}
-		contentB64, err := requireString(args, "content_base64", "send_file")
-		if err != nil {
-			return "", err
+		filename, _ := args["filename"].(string)
+		if filename == "" {
+			filename = filepath.Base(path)
 		}
 		contentType, _ := args["content_type"].(string)
-		description, _ := args["description"].(string)
-		expectedSize, _ := args["expected_size"].(float64)
-		expectedSha, _ := args["content_sha256"].(string)
-
-		data, err := base64.StdEncoding.DecodeString(contentB64)
-		if err != nil {
-			return "", fmt.Errorf("invalid base64: %w", err)
-		}
-		if err := verifyContent(data, int64(expectedSize), expectedSha); err != nil {
-			return "", err
-		}
-		contentSha := sha256Hex(data)
-
 		if contentType == "" {
 			contentType = "application/octet-stream"
+		}
+		description, _ := args["description"].(string)
+
+		file, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("cannot open %q: %w", path, err)
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil {
+			return "", fmt.Errorf("cannot stat %q: %w", path, err)
 		}
 
 		if err := b.ensureInit(); err != nil {
 			return "", err
 		}
 
+		// Stream the file with a sha256 running alongside it: the body is
+		// never buffered, and the digest cross-checks what the server
+		// stored against what was read from disk.
+		hasher := sha256.New()
 		uploadURL := fmt.Sprintf("%s/sessions/%s/files?filename=%s", b.httpBase, b.sessionID, url.QueryEscape(filename))
-		req, _ := http.NewRequest("POST", uploadURL, bytes.NewReader(data))
+		req, _ := http.NewRequest("POST", uploadURL, io.TeeReader(file, hasher))
+		req.ContentLength = info.Size()
 		req.Header.Set("Content-Type", contentType)
 		req.Header.Set("Authorization", "Bearer "+b.psk)
 		req.Header.Set("X-Agent-ID", b.agentID)
-		resp, err := b.client.Do(req)
+		resp, err := b.fileClient.Do(req)
 		if err != nil {
 			return "", fmt.Errorf("upload failed: %w", err)
 		}
@@ -781,18 +798,32 @@ func registerTools(s *mcp.Server, b *Bridge) {
 			return "", fmt.Errorf("upload failed (%d): %s", resp.StatusCode, string(body))
 		}
 
-		var uploadResult map[string]any
-		json.NewDecoder(resp.Body).Decode(&uploadResult)
+		var uploadResult struct {
+			FileID string `json:"file_id"`
+			Size   int64  `json:"size"`
+			Sha256 string `json:"sha256"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&uploadResult); err != nil {
+			return "", fmt.Errorf("upload response decode failed: %w", err)
+		}
 
-		fileID, _ := uploadResult["file_id"].(string)
-		size, _ := uploadResult["size"].(float64)
+		// In-flight integrity check: the server hashed exactly what it
+		// received; both mismatches mean the transfer was altered or cut
+		// short and the stored copy must not be shared.
+		if uploadResult.Size != info.Size() {
+			return "", fmt.Errorf("upload integrity check failed: sent %d bytes but server stored %d", info.Size(), uploadResult.Size)
+		}
+		localSha := hex.EncodeToString(hasher.Sum(nil))
+		if !strings.EqualFold(uploadResult.Sha256, localSha) {
+			return "", fmt.Errorf("upload integrity check failed: local sha256 %s but server stored %s", localSha, uploadResult.Sha256)
+		}
 
 		sharePayload, _ := json.Marshal(protocol.FileSharePayload{
-			FileID:      fileID,
+			FileID:      uploadResult.FileID,
 			FileName:    filename,
 			ContentType: contentType,
-			Size:        int64(size),
-			Sha256:      contentSha,
+			Size:        uploadResult.Size,
+			Sha256:      uploadResult.Sha256,
 			Description: description,
 		})
 		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/messages", map[string]any{
@@ -805,31 +836,38 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		}
 
 		result, _ := json.Marshal(map[string]any{
-			"file_id":   fileID,
+			"file_id":   uploadResult.FileID,
 			"file_name": filename,
-			"size":      int64(size),
-			"sha256":    contentSha,
+			"size":      uploadResult.Size,
+			"sha256":    uploadResult.Sha256,
 			"shared_to": to,
 		})
 		return string(result), nil
 	})
 
 	s.RegisterTool(mcp.Tool{
-		Name:        "download_file",
-		Description: "Download a file by its file_id (obtained from a file_share message). Returns the file content as base64.",
+		Name: "download_file",
+		Description: "Download a shared file to a local path on this machine. The bytes stream directly to disk — contents are never returned through the model, so files of any size work. " +
+			"SHA-256 is verified against the server's copy (and against expected_sha256 when given); on mismatch nothing is written. Use the file_id from a file_share message.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"file_id":         map[string]any{"type": "string", "description": "File ID from the file_share message"},
-				"expected_sha256": map[string]any{"type": "string", "description": "SHA-256 hex from the file_share message. When provided, a mismatch fails the download — catches truncated or altered transfers before the content is used"},
+				"path":            map[string]any{"type": "string", "description": "Local destination path (on this machine) to save the file to"},
+				"expected_sha256": map[string]any{"type": "string", "description": "SHA-256 hex from the file_share message. When provided, a mismatch fails the download and nothing is saved — catches altered transfers end-to-end"},
 			},
-			"required": []string{"file_id"},
+			"required": []string{"file_id", "path"},
 		},
 	}, func(args map[string]any) (string, error) {
 		fileID, _ := args["file_id"].(string)
 		if fileID == "" {
 			return "", fmt.Errorf("file_id is required")
 		}
+		path, err := requireString(args, "path", "download_file")
+		if err != nil {
+			return "", err
+		}
+		expectedSha, _ := args["expected_sha256"].(string)
 
 		if err := b.ensureInit(); err != nil {
 			return "", err
@@ -839,35 +877,73 @@ func registerTools(s *mcp.Server, b *Bridge) {
 		req, _ := http.NewRequest("GET", dlURL, nil)
 		req.Header.Set("Authorization", "Bearer "+b.psk)
 		req.Header.Set("X-Agent-ID", b.agentID)
-		resp, err := b.client.Do(req)
+		resp, err := b.fileClient.Do(req)
 		if err != nil {
 			return "", fmt.Errorf("download failed: %w", err)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("download failed (%d)", resp.StatusCode)
+			body, _ := io.ReadAll(resp.Body)
+			return "", fmt.Errorf("download failed (%d): %s", resp.StatusCode, string(body))
 		}
 
-		fdata, err := io.ReadAll(resp.Body)
+		// Stream to a temp file beside the destination, verify, then move
+		// into place — a failed or corrupted transfer never leaves a file
+		// at the destination path.
+		tmp, err := os.CreateTemp(filepath.Dir(path), ".download-*")
 		if err != nil {
-			return "", fmt.Errorf("read failed: %w", err)
+			return "", fmt.Errorf("cannot write %q: %w", path, err)
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName) // no-op once renamed
+
+		hasher := sha256.New()
+		n, err := io.Copy(io.MultiWriter(tmp, hasher), resp.Body)
+		if cerr := tmp.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return "", fmt.Errorf("download interrupted: %w", err)
+		}
+		if resp.ContentLength >= 0 && n != resp.ContentLength {
+			return "", fmt.Errorf("download truncated: received %d bytes but Content-Length is %d", n, resp.ContentLength)
 		}
 
-		storedSha := resp.Header.Get("X-Content-SHA256")
-		if expectedSha, _ := args["expected_sha256"].(string); expectedSha != "" {
-			if err := verifyContent(fdata, 0, expectedSha); err != nil {
-				return "", err
-			}
+		gotSha := hex.EncodeToString(hasher.Sum(nil))
+		if storedSha := resp.Header.Get("X-Content-SHA256"); storedSha != "" && !strings.EqualFold(gotSha, storedSha) {
+			return "", fmt.Errorf("download corrupted: received content hashes to %s but the server's copy is %s — nothing saved", gotSha, storedSha)
+		}
+		if expectedSha != "" && !strings.EqualFold(gotSha, expectedSha) {
+			return "", fmt.Errorf("sha256 mismatch: received content hashes to %s, expected %s (from the file_share message) — the file was altered or is not the one you expected; nothing saved", gotSha, expectedSha)
+		}
+
+		if err := os.Rename(tmpName, path); err != nil {
+			return "", fmt.Errorf("cannot save to %q: %w", path, err)
 		}
 
 		result, _ := json.Marshal(map[string]any{
-			"file_id":        fileID,
-			"content_type":   resp.Header.Get("Content-Type"),
-			"size":           len(fdata),
-			"sha256":         storedSha,
-			"content_base64": base64.StdEncoding.EncodeToString(fdata),
+			"file_id":      fileID,
+			"path":         path,
+			"size":         n,
+			"sha256":       gotSha,
+			"content_type": resp.Header.Get("Content-Type"),
 		})
 		return string(result), nil
+	})
+
+	// list_files — discover what is available without pinging the sender
+	// for a re-share.
+	s.RegisterTool(mcp.Tool{
+		Name:        "list_files",
+		Description: "List files shared in this session (available to download_file).",
+		InputSchema: empty,
+	}, func(args map[string]any) (string, error) {
+		result, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/files", nil)
+		if err != nil {
+			return "", err
+		}
+		data, _ := json.Marshal(result)
+		return string(data), nil
 	})
 
 	// trigger_agent — send an action-based signal to picobot's local Unix socket
@@ -975,29 +1051,6 @@ func registerSignals(s *mcp.Server, b *Bridge) {
 // right one. Empty when the host never stamped an origin.
 func (b *Bridge) originTarget() (channel, chatID string) {
 	return mcp.Origin()
-}
-
-// verifyContent guards file transfers against silent truncation: base64
-// routed through LLM tool calls can be cut at a clean quantum boundary,
-// which still decodes — into a corrupt prefix that "looks fine" until used
-// (field report: 810 bytes stored of 2,860 intended, sha mismatch). When the
-// caller knows the expected raw size or sha256, a mismatch is a hard error
-// at send time instead of a corrupt file at use time.
-func verifyContent(data []byte, expectedSize int64, expectedSha string) error {
-	if expectedSize > 0 && int64(len(data)) != expectedSize {
-		return fmt.Errorf("content appears truncated or padded: decoded %d bytes but expected_size is %d — re-send the complete content_base64", len(data), expectedSize)
-	}
-	if expectedSha != "" {
-		if got := sha256Hex(data); !strings.EqualFold(got, expectedSha) {
-			return fmt.Errorf("content_sha256 mismatch: decoded content hashes to %s, expected %s — the base64 was altered or truncated before reaching the bridge", got, expectedSha)
-		}
-	}
-	return nil
-}
-
-func sha256Hex(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
 }
 
 // requireString extracts a required string tool argument. When it is

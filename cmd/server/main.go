@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -21,7 +23,6 @@ import (
 )
 
 const (
-	maxFileSize = 50 << 20
 	presenceTTL = 60 * time.Second
 	mailboxMax  = 1000
 	// stateFlushInterval is the worst-case loss window for persisted state.
@@ -39,10 +40,27 @@ func main() {
 	debugStr := os.Getenv("AGENTCHAT_DEBUG")
 	debugLog := debugStr == "true" || debugStr == "1"
 
+	// File transfers stream to disk under filesRoot, so there is no RAM
+	// bound on file size. AGENTCHAT_MAX_FILE_SIZE (bytes) optionally caps
+	// it; unset or 0 means unlimited (the only real bound is disk space).
+	maxFileSize := int64(0)
+	if v := os.Getenv("AGENTCHAT_MAX_FILE_SIZE"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			slog.Warn("invalid AGENTCHAT_MAX_FILE_SIZE, files unlimited", "value", v, "error", err)
+		} else {
+			maxFileSize = n
+		}
+	}
+	filesRoot := "agentchat-files"
+	if dataDir := os.Getenv("AGENTCHAT_DATA"); dataDir != "" {
+		filesRoot = filepath.Join(dataDir, "files")
+	}
+	fs := filestore.NewStore(filesRoot, maxFileSize)
+
 	store := session.NewStore()
 	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
-	fs := filestore.NewStore(maxFileSize)
 	pt := presence.NewTracker(presenceTTL)
 	mb := mailbox.NewStore(mailboxMax)
 	h := hub.New(hub.Deps{
@@ -70,8 +88,10 @@ func main() {
 	h.StartJanitor(retention, 6*time.Hour)
 
 	// Persistence is opt-in via AGENTCHAT_DATA; without it the server runs
-	// purely in memory, as before. Files are not persisted (they stay in
-	// memory and are lost on restart).
+	// purely in memory, as before. Files live on disk under
+	// <AGENTCHAT_DATA>/files but are NOT persisted across restarts — the
+	// file store is wiped at startup (blobs belong to session state that
+	// does not survive a restart either).
 	var pstore *persist.Store
 	var flusher *persist.Flusher
 	getSnapshot := func() persist.Snapshot {

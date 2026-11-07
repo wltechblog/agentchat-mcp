@@ -26,7 +26,7 @@ func newTestHub(t *testing.T, ttl, sweepInterval time.Duration) (*Hub, *session.
 		SessionStore: store,
 		Leader:       leader.NewTracker(),
 		Scratchpad:   scratchpad.NewStore(),
-		Files:        filestore.NewStore(1 << 20),
+		Files:        filestore.NewStore(t.TempDir(), 0),
 		Presence:     pt,
 		Mailboxes:    mailbox.NewStore(1000),
 	}, WithSweepInterval(sweepInterval))
@@ -306,7 +306,7 @@ func TestPersistenceRestartRoundTrip(t *testing.T) {
 	mb := mailbox.NewStore(100)
 	sp := scratchpad.NewStore()
 	h := New(Deps{SessionStore: store, Leader: leader.NewTracker(), Scratchpad: sp,
-		Files: filestore.NewStore(1 << 20), Presence: pt, Mailboxes: mb}, WithSweepInterval(time.Hour))
+		Files: filestore.NewStore(t.TempDir(), 0), Presence: pt, Mailboxes: mb}, WithSweepInterval(time.Hour))
 
 	sess := store.Create("persist")
 	h.Register(sess.ID, "agent-a", []string{"search"})
@@ -331,7 +331,7 @@ func TestPersistenceRestartRoundTrip(t *testing.T) {
 	mb2 := mailbox.NewStore(100)
 	sp2 := scratchpad.NewStore()
 	h2 := New(Deps{SessionStore: store2, Leader: leader.NewTracker(), Scratchpad: sp2,
-		Files: filestore.NewStore(1 << 20), Presence: pt2, Mailboxes: mb2}, WithSweepInterval(time.Hour))
+		Files: filestore.NewStore(t.TempDir(), 0), Presence: pt2, Mailboxes: mb2}, WithSweepInterval(time.Hour))
 	store2.Restore(snap.Sessions)
 	mb2.Restore(snap.Mailboxes)
 	h2.RestoreState(snap.History, snap.SeqNums)
@@ -432,7 +432,7 @@ func TestJanitorReapsIdleSessions(t *testing.T) {
 		SessionStore: store,
 		Leader:       leader.NewTracker(),
 		Scratchpad:   sp,
-		Files:        filestore.NewStore(1 << 20),
+		Files:        filestore.NewStore(t.TempDir(), 0),
 		Presence:     pt,
 		Mailboxes:    mb,
 	}, WithSweepInterval(time.Hour))

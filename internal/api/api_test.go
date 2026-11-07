@@ -2,6 +2,8 @@ package api
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -26,7 +28,7 @@ func setupTestServer(t *testing.T) (*httptest.Server, *session.Store) {
 	store := session.NewStore()
 	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
-	fs := filestore.NewStore(10 << 20)
+	fs := filestore.NewStore(t.TempDir(), 0)
 	pt := presence.NewTracker(60 * time.Second)
 	mb := mailbox.NewStore(1000)
 	h := hub.New(hub.Deps{SessionStore: store, Leader: lt, Scratchpad: sp, Files: fs, Presence: pt, Mailboxes: mb})
@@ -727,19 +729,20 @@ func TestScratchpadUpdateBroadcast(t *testing.T) {
 }
 
 // TestFileTransferIntegrity: round-trips byte-for-byte at the size from the
-// field report (2,860 base64 chars = 2,145 raw bytes) and at 1MB. The
-// transport must never truncate — the reported corruption happened at the
-// caller boundary, and this pins that our path is clean.
+// field report (2,860 base64 chars = 2,145 raw bytes), at 1MB, and at 64MB —
+// past the old 50MB in-RAM cap, proving arbitrary-size streaming. The
+// transport must never truncate.
 func TestFileTransferIntegrity(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
 	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
 
-	for _, size := range []int{2145, 1 << 20} {
+	for _, size := range []int{2145, 1 << 20, 64 << 20} {
 		content := make([]byte, size)
 		for i := range content {
 			content[i] = byte(i % 251)
 		}
+		contentSha := sha256.Sum256(content)
 
 		req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=integrity.bin", bytes.NewReader(content))
 		req.Header.Set("Content-Type", "application/octet-stream")
@@ -759,6 +762,9 @@ func TestFileTransferIntegrity(t *testing.T) {
 		if up.StatusCode != http.StatusCreated || upload.Size != int64(size) {
 			t.Fatalf("upload %d: status %d size %d", size, up.StatusCode, upload.Size)
 		}
+		if upload.Sha256 != hex.EncodeToString(contentSha[:]) {
+			t.Fatalf("upload %d: sha mismatch: %s", size, upload.Sha256)
+		}
 
 		dl := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/files/"+upload.FileID, sessionID, psk, "agent-1", nil)
 		got, _ := io.ReadAll(dl.Body)
@@ -772,5 +778,45 @@ func TestFileTransferIntegrity(t *testing.T) {
 		if dl.Header.Get("X-Content-SHA256") != upload.Sha256 {
 			t.Fatalf("sha header mismatch with upload response")
 		}
+	}
+}
+
+// TestUploadRejectsOverLimit: AGENTCHAT_MAX_FILE_SIZE streams the body to a
+// temp file and answers 413 once the cap is crossed — nothing is stored.
+func TestUploadRejectsOverLimit(t *testing.T) {
+	store := session.NewStore()
+	fs := filestore.NewStore(t.TempDir(), 1<<10)
+	h := hub.New(hub.Deps{
+		SessionStore: store,
+		Leader:       leader.NewTracker(),
+		Scratchpad:   scratchpad.NewStore(),
+		Files:        fs,
+		Presence:     presence.NewTracker(60 * time.Second),
+		Mailboxes:    mailbox.NewStore(100),
+	})
+	handler := New(h, store)
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	sessionID, psk := createTestSession(t, server)
+	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
+
+	body := bytes.Repeat([]byte{7}, 2<<10)
+	req, _ := http.NewRequest("POST", server.URL+"/sessions/"+sessionID+"/files?filename=big.bin", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Authorization", "Bearer "+psk)
+	req.Header.Set("X-Agent-ID", "agent-1")
+	up, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	up.Body.Close()
+	if up.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", up.StatusCode)
+	}
+	if files := fs.List(sessionID); len(files) != 0 {
+		t.Fatalf("rejected upload must not be stored, got %d files", len(files))
 	}
 }

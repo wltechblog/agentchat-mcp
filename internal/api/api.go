@@ -3,21 +3,20 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/session"
 )
-
-const maxUploadMemory = 50 << 20
 
 type contextKey string
 
@@ -511,13 +510,6 @@ func (h *Handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 	sessionID := getSessionID(r)
 	agentID := getAgentID(r)
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadMemory)
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "file too large or read error", http.StatusRequestEntityTooLarge)
-		return
-	}
-
 	filename := r.URL.Query().Get("filename")
 	if filename == "" {
 		filename = r.URL.Query().Get("name")
@@ -530,9 +522,15 @@ func (h *Handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 		contentType = "application/octet-stream"
 	}
 
-	f, err := h.hub.StoreFile(sessionID, filename, contentType, agentID, data)
+	// The body streams straight to disk — no size limit is imposed here,
+	// so files of arbitrary size transfer without buffering in memory.
+	f, err := h.hub.StoreFile(sessionID, filename, contentType, agentID, r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		if errors.Is(err, filestore.ErrFileTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "upload failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -557,16 +555,17 @@ func (h *Handler) listFiles(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("id")
 	fileID := r.PathValue("fileID")
-	f, ok := h.hub.GetFile(sessionID, fileID)
-	if !ok {
+	fh, f, err := h.hub.OpenFile(sessionID, fileID)
+	if err != nil {
 		http.Error(w, "file not found", http.StatusNotFound)
 		return
 	}
+	defer fh.Close()
 	w.Header().Set("Content-Type", f.ContentType)
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+f.Name+"\"")
-	w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
 	w.Header().Set("X-Content-SHA256", f.Sha256)
-	w.Write(f.Data)
+	// ServeContent sets Content-Length and supports range requests.
+	http.ServeContent(w, r, f.Name, f.UploadedAt, fh)
 }
 
 func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request) {

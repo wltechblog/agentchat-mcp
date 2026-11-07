@@ -3,7 +3,9 @@ package hub
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -452,12 +454,19 @@ func (h *Hub) GetFiles(sessionID string) []*filestore.File {
 	return h.files.List(sessionID)
 }
 
-func (h *Hub) StoreFile(sessionID, filename, contentType, uploadedBy string, data []byte) (*filestore.File, error) {
-	return h.files.Store(sessionID, filename, contentType, uploadedBy, data)
+// StoreFile streams the upload body straight to disk — the hub never holds
+// file bytes in memory.
+func (h *Hub) StoreFile(sessionID, filename, contentType, uploadedBy string, r io.Reader) (*filestore.File, error) {
+	return h.files.Store(sessionID, filename, contentType, uploadedBy, r)
 }
 
 func (h *Hub) GetFile(sessionID, fileID string) (*filestore.File, bool) {
 	return h.files.Get(sessionID, fileID)
+}
+
+// OpenFile returns an open handle on the stored blob for streaming downloads.
+func (h *Hub) OpenFile(sessionID, fileID string) (*os.File, *filestore.File, error) {
+	return h.files.Open(sessionID, fileID)
 }
 
 func (h *Hub) DeleteFile(sessionID, fileID string) bool {
