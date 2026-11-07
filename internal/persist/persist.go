@@ -22,10 +22,11 @@ import (
 //
 // Deliberately absent: presence (ephemeral — agents re-heartbeat, and since
 // presence no longer gates delivery, offline agents simply resume offline),
-// watch tokens (re-issued on the next register), the file store (still
-// in-memory; blobs are large), and the leader map (the first agent to
-// re-heartbeat after a restart becomes leader — restoring a leader with no
-// presence record would create a ghost that can never expire).
+// watch tokens (re-issued on the next register), the file store (blobs are
+// session-scoped and wiped at restart — restoring metadata for files the
+// wipe just deleted would only dangle), and the leader map (the first agent
+// to re-heartbeat after a restart becomes leader — restoring a leader with
+// no presence record would create a ghost that can never expire).
 type Snapshot struct {
 	Sessions   []session.Session                     `json:"sessions"`
 	Mailboxes  map[string][]mailbox.Entry            `json:"mailboxes"`
@@ -104,6 +105,7 @@ func (s *Store) Load() (Snapshot, bool) {
 // Flusher periodically persists snapshots until stopped.
 type Flusher struct {
 	stopCh  chan struct{}
+	done    chan struct{}
 	stopped sync.Once
 }
 
@@ -111,8 +113,9 @@ type Flusher struct {
 // interval is the worst-case loss window: a crash loses at most that much
 // mail.
 func (s *Store) StartFlusher(getSnapshot func() Snapshot, interval time.Duration) *Flusher {
-	f := &Flusher{stopCh: make(chan struct{})}
+	f := &Flusher{stopCh: make(chan struct{}), done: make(chan struct{})}
 	go func() {
+		defer close(f.done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -129,7 +132,11 @@ func (s *Store) StartFlusher(getSnapshot func() Snapshot, interval time.Duration
 	return f
 }
 
-// Stop halts the flusher. Safe to call multiple times.
+// Stop halts the flusher and waits for any in-flight flush to finish. A
+// tick that fires just before Stop would otherwise keep creating temp files
+// in the data dir while the caller (e.g. a test tearing down its TempDir)
+// is removing them. Safe to call multiple times.
 func (f *Flusher) Stop() {
 	f.stopped.Do(func() { close(f.stopCh) })
+	<-f.done
 }
