@@ -74,10 +74,10 @@ type CLI struct {
 	// watchToken is issued by register so /watch URLs don't carry the PSK.
 	watchToken string
 	// WatchdogTimeout force-reconnects the SSE stream after this long with
-	// no bytes at all. The server pings every 15s, so three missed pings
-	// mean the connection is dead — the usual state after a network change
-	// or wake-from-sleep, where a half-open TCP read would otherwise block
-	// forever. Zero means the 45s default.
+	// no bytes at all. The server pings every 5 minutes, so the default is
+	// twice that: a stream that misses two pings is dead — the usual state
+	// after a network change or wake-from-sleep, where a half-open TCP read
+	// would otherwise block forever. Zero means the 10-minute default.
 	WatchdogTimeout time.Duration
 }
 
@@ -121,7 +121,7 @@ func main() {
 		agentID:         *agentID,
 		agentName:       *agentName,
 		client:          &http.Client{Timeout: 30 * time.Second},
-		WatchdogTimeout: 45 * time.Second,
+		WatchdogTimeout: 10 * time.Minute,
 	}
 
 	if *sessionID == "" || *psk == "" {
@@ -459,7 +459,7 @@ func (c *CLI) watchSSE(quit <-chan struct{}) error {
 
 	watchdogTimeout := c.WatchdogTimeout
 	if watchdogTimeout <= 0 {
-		watchdogTimeout = 45 * time.Second
+		watchdogTimeout = 10 * time.Minute
 	}
 
 	// streamCtx is cancelable by the idle watchdog: after a network change
@@ -550,7 +550,8 @@ func (w *watchdogBody) Read(p []byte) (int, error) {
 
 // watchdog cancels the stream context when no bytes have arrived for
 // timeout — the same protection the bridge's watcher has. The server pings
-// idle streams every 15s, so a stream that is truly alive never trips it.
+// idle streams every 5 minutes, so a stream that is truly alive never trips
+// it (the timeout is twice the ping interval).
 func (c *CLI) watchdog(streamCtx context.Context, cancel context.CancelFunc, lastRead *atomic.Int64, timeout time.Duration, stop <-chan struct{}) {
 	tick := timeout / 4
 	if tick < 10*time.Millisecond {

@@ -43,11 +43,13 @@ func New(h *hub.Hub, store *session.Store) *Handler {
 	// API handlers never notify watchers directly.
 	h.SetNotifier(w.Notify)
 	return &Handler{
-		hub:                   h,
-		sessionStore:          store,
-		watcher:               w,
-		tokens:                newWatchTokenStore(time.Hour),
-		ssePingInterval:       15 * time.Second,
+		hub:          h,
+		sessionStore: store,
+		watcher:      w,
+		tokens:       newWatchTokenStore(time.Hour),
+		// Keepalives no more often than every 5 minutes — enough to hold
+		// streams through long-idle periods without chatty traffic.
+		ssePingInterval:       5 * time.Minute,
 		maxWatchersPerSession: 64,
 	}
 }

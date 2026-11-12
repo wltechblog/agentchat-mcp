@@ -42,11 +42,12 @@ const (
 	sseMaxBackoff    = 30 * time.Second
 	sseHealthyUptime = 30 * time.Second
 
-	// The server pings idle SSE streams every 15s. If nothing at all arrives
-	// for sseWatchdogTimeout the connection is dead (a half-open TCP
-	// connection is indistinguishable from an idle one), so we force a
-	// reconnect instead of blocking on it forever.
-	sseWatchdogTimeout = 45 * time.Second
+	// The server pings idle SSE streams every 5 minutes. If nothing at all
+	// arrives for sseWatchdogTimeout (twice that) the connection is dead (a
+	// half-open TCP connection is indistinguishable from an idle one), so we
+	// force a reconnect instead of blocking on it forever. The timeout must
+	// stay above the ping interval or healthy idle streams get reconnected.
+	sseWatchdogTimeout = 10 * time.Minute
 	sseWatchdogTick    = 5 * time.Second
 
 	// Wake-up signal send retries use the same capped exponential backoff.
