@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wltechblog/agentchat-mcp/internal/httpx"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 )
 
@@ -120,7 +121,7 @@ func main() {
 		psk:             *psk,
 		agentID:         *agentID,
 		agentName:       *agentName,
-		client:          &http.Client{Timeout: 30 * time.Second},
+		client:          httpx.New(30 * time.Second),
 		WatchdogTimeout: 10 * time.Minute,
 	}
 
@@ -475,7 +476,9 @@ func (c *CLI) watchSSE(quit <-chan struct{}) error {
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 
-	client := &http.Client{Timeout: 0} // no timeout: the stream is long-lived
+	// No client timeout: the stream is long-lived. The transport's h2
+	// health check still tears down dead connections after a network change.
+	client := httpx.New(0)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

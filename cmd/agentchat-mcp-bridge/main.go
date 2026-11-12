@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wltechblog/agentchat-mcp/internal/httpx"
 	"github.com/wltechblog/agentchat-mcp/internal/mcp"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
 	"github.com/wltechblog/agentchat-mcp/internal/signal"
@@ -113,8 +114,8 @@ func main() {
 		psk:          psk,
 		agentID:      agentID,
 		capabilities: caps,
-		client:       &http.Client{Timeout: 30 * time.Second},
-		sseClient:    &http.Client{},
+		client:       httpx.New(30 * time.Second),
+		sseClient:    httpx.New(0),
 		fileClient: &http.Client{
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
