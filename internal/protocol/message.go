@@ -27,10 +27,6 @@ const (
 	TypeScratchpadResult = "scratchpad_result"
 	TypeScratchpadUpdate = "scratchpad_update"
 
-	TypeLeaderQuery    = "leader_query"
-	TypeLeaderInfo     = "leader_info"
-	TypeLeaderTransfer = "leader_transfer"
-
 	TypeHistoryRequest = "history_request"
 	TypeHistoryResult  = "history_result"
 
@@ -118,10 +114,6 @@ type ScratchpadEntry struct {
 	Value     json.RawMessage `json:"value"`
 	UpdatedBy string          `json:"updated_by"`
 	UpdatedAt time.Time       `json:"updated_at"`
-}
-
-type LeaderTransferPayload struct {
-	NewLeaderID string `json:"new_leader_id"`
 }
 
 type HistoryRequestPayload struct {

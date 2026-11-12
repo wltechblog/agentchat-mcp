@@ -231,7 +231,7 @@ func TestBackoffJitterStaysBounded(t *testing.T) {
 }
 
 // TestHandleSSEEventSignalsOnSystemEvents: with the unified pipeline the
-// stream also carries scratchpad and leader events — the bridge should wake
+// stream also carries scratchpad events — the bridge should wake
 // the agent for those (unless it made the change itself).
 func TestHandleSSEEventSignalsOnSystemEvents(t *testing.T) {
 	lastSeq.Store(0) // shared global; isolate this test
@@ -261,9 +261,6 @@ func TestHandleSSEEventSignalsOnSystemEvents(t *testing.T) {
 
 	b.handleSSEEvent("message", envJSON("scratchpad_update", "a1", "*", 2))
 	expectQuiet("own scratchpad_update")
-
-	b.handleSSEEvent("message", envJSON("leader_info", "server", "*", 3))
-	expectSignal("leader_info")
 
 	b.handleSSEEvent("message", envJSON("agent_joined", "server", "*", 4))
 	expectQuiet("agent_joined")

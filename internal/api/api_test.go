@@ -15,7 +15,6 @@ import (
 
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
-	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/presence"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
@@ -26,12 +25,11 @@ import (
 func setupTestServer(t *testing.T) (*httptest.Server, *session.Store) {
 	t.Helper()
 	store := session.NewStore()
-	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
 	fs := filestore.NewStore(t.TempDir(), 0)
 	pt := presence.NewTracker(60 * time.Second)
 	mb := mailbox.NewStore(1000)
-	h := hub.New(hub.Deps{SessionStore: store, Leader: lt, Scratchpad: sp, Files: fs, Presence: pt, Mailboxes: mb})
+	h := hub.New(hub.Deps{SessionStore: store, Scratchpad: sp, Files: fs, Presence: pt, Mailboxes: mb})
 	handler := New(h, store)
 
 	mux := http.NewServeMux()
@@ -134,9 +132,6 @@ func TestRegisterAgent(t *testing.T) {
 
 	var result map[string]any
 	json.NewDecoder(resp.Body).Decode(&result)
-	if result["leader_id"] != "agent-1" {
-		t.Fatalf("expected leader_id agent-1, got %v", result["leader_id"])
-	}
 }
 
 func TestAuthBadPSK(t *testing.T) {
@@ -430,59 +425,6 @@ func TestScratchpadList(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&entries)
 	if len(entries) != 3 {
 		t.Fatalf("expected 3 entries, got %d", len(entries))
-	}
-}
-
-func TestLeaderInitialAndQuery(t *testing.T) {
-	server, _ := setupTestServer(t)
-	sessionID, psk := createTestSession(t, server)
-	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
-
-	resp := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/leader", sessionID, psk, "agent-1", nil)
-	defer resp.Body.Close()
-
-	var result map[string]string
-	json.NewDecoder(resp.Body).Decode(&result)
-	if result["leader_id"] != "agent-1" {
-		t.Fatalf("expected leader agent-1, got %s", result["leader_id"])
-	}
-}
-
-func TestLeaderTransfer(t *testing.T) {
-	server, _ := setupTestServer(t)
-	sessionID, psk := createTestSession(t, server)
-	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
-	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
-
-	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/leader/transfer", sessionID, psk, "agent-1", map[string]any{
-		"new_leader_id": "agent-2",
-	})
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
-
-	resp2 := doAuthRequest(t, server.URL, "GET", "/sessions/"+sessionID+"/leader", sessionID, psk, "agent-1", nil)
-	defer resp2.Body.Close()
-	var result map[string]string
-	json.NewDecoder(resp2.Body).Decode(&result)
-	if result["leader_id"] != "agent-2" {
-		t.Fatalf("expected leader agent-2, got %s", result["leader_id"])
-	}
-}
-
-func TestLeaderTransferUnauthorized(t *testing.T) {
-	server, _ := setupTestServer(t)
-	sessionID, psk := createTestSession(t, server)
-	registerAgent(t, server.URL, sessionID, psk, "agent-1", nil)
-	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
-
-	resp := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/leader/transfer", sessionID, psk, "agent-2", map[string]any{
-		"new_leader_id": "agent-2",
-	})
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 }
 
@@ -788,7 +730,6 @@ func TestUploadRejectsOverLimit(t *testing.T) {
 	fs := filestore.NewStore(t.TempDir(), 1<<10)
 	h := hub.New(hub.Deps{
 		SessionStore: store,
-		Leader:       leader.NewTracker(),
 		Scratchpad:   scratchpad.NewStore(),
 		Files:        fs,
 		Presence:     presence.NewTracker(60 * time.Second),

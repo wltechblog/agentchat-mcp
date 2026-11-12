@@ -584,10 +584,6 @@ func (c *CLI) displayEnvelope(eventType string, env protocol.Envelope) {
 			colorDim, timestamp, color, from, colorDim,
 			colorCyan, env.To, colorReset, string(env.Payload))
 
-	case protocol.TypeLeaderInfo:
-		fmt.Printf("\n%s%s ⭐ Leader: %s%s\n",
-			colorYellow, timestamp, string(env.Payload), colorReset)
-
 	default:
 		from := env.From
 		color := getAgentColor(from)

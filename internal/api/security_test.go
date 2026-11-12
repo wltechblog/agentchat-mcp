@@ -12,7 +12,6 @@ import (
 
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
-	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/presence"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
@@ -25,7 +24,7 @@ func setupWithHandler(t *testing.T) (*httptest.Server, *Handler, *session.Store)
 	t.Helper()
 	store := session.NewStore()
 	pt := presence.NewTracker(60 * time.Second)
-	h := hub.New(hub.Deps{SessionStore: store, Leader: leader.NewTracker(), Scratchpad: scratchpad.NewStore(),
+	h := hub.New(hub.Deps{SessionStore: store, Scratchpad: scratchpad.NewStore(),
 		Files: filestore.NewStore(t.TempDir(), 0), Presence: pt, Mailboxes: mailbox.NewStore(1000)})
 	handler := New(h, store)
 

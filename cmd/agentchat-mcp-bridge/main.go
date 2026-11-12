@@ -473,43 +473,6 @@ func registerTools(s *mcp.Server, b *Bridge) {
 	})
 
 	s.RegisterTool(mcp.Tool{
-		Name:        "get_leader",
-		Description: "Get the current leader agent ID for the session",
-		InputSchema: empty,
-	}, func(args map[string]any) (string, error) {
-		result, err := b.doJSON("GET", "/sessions/"+b.sessionID+"/leader", nil)
-		if err != nil {
-			return "", err
-		}
-		data, _ := json.Marshal(result)
-		return string(data), nil
-	})
-
-	s.RegisterTool(mcp.Tool{
-		Name:        "transfer_leadership",
-		Description: "Transfer session leadership to another agent (only current leader can do this)",
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"new_leader_id": map[string]any{"type": "string", "description": "Agent ID to transfer leadership to"},
-			},
-			"required": []string{"new_leader_id"},
-		},
-	}, func(args map[string]any) (string, error) {
-		newLeader, err := requireString(args, "new_leader_id", "transfer_leadership")
-		if err != nil {
-			return "", err
-		}
-		_, err = b.doJSON("POST", "/sessions/"+b.sessionID+"/leader/transfer", map[string]any{
-			"new_leader_id": newLeader,
-		})
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("leadership transferred to %s", newLeader), nil
-	})
-
-	s.RegisterTool(mcp.Tool{
 		Name:        "scratchpad_set",
 		Description: "Set a key-value pair in the shared session scratchpad. Other agents are notified of the change.",
 		InputSchema: map[string]any{
@@ -1040,7 +1003,7 @@ func registerSignals(s *mcp.Server, b *Bridge) {
 	}
 	s.RegisterSignal(mcp.SignalAction{
 		Name:        "check_messages",
-		Description: "A message arrived for this agent in its agentchat session (direct message, broadcast, task, scratchpad, or leader change)",
+		Description: "A message arrived for this agent in its agentchat session (direct message, broadcast, task, or scratchpad change)",
 		Response:    response,
 	})
 }

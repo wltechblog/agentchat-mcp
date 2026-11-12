@@ -67,8 +67,6 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/mailbox", h.auth(h.drainMailbox))
 	mux.HandleFunc("GET /sessions/{id}/mailbox/peek", h.auth(h.peekMailbox))
 	mux.HandleFunc("GET /sessions/{id}/agents", h.auth(h.listAgents))
-	mux.HandleFunc("GET /sessions/{id}/leader", h.auth(h.getLeader))
-	mux.HandleFunc("POST /sessions/{id}/leader/transfer", h.auth(h.transferLeader))
 	mux.HandleFunc("GET /sessions/{id}/history", h.auth(h.getHistory))
 	mux.HandleFunc("GET /sessions/{id}/scratchpad", h.auth(h.getScratchpad))
 	mux.HandleFunc("POST /sessions/{id}/scratchpad/set", h.auth(h.scratchpadSet))
@@ -208,7 +206,6 @@ func (h *Handler) getSession(w http.ResponseWriter, r *http.Request) {
 		"name":        sess.Name,
 		"created_at":  sess.CreatedAt,
 		"agent_count": len(h.hub.GetSessionAgents(sess.ID)),
-		"leader_id":   h.hub.GetLeader(sess.ID),
 	})
 }
 
@@ -271,7 +268,6 @@ func (h *Handler) registerAgent(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":      "registered",
-		"leader_id":   h.hub.GetLeader(sessionID),
 		"agents":      h.hub.GetSessionAgents(sessionID),
 		"watch_token": h.tokens.Issue(sessionID),
 	})
@@ -385,32 +381,6 @@ func (h *Handler) listAgents(w http.ResponseWriter, r *http.Request) {
 		agents = []protocol.AgentInfo{}
 	}
 	writeJSON(w, http.StatusOK, agents)
-}
-
-func (h *Handler) getLeader(w http.ResponseWriter, r *http.Request) {
-	sessionID := getSessionID(r)
-	leaderID := h.hub.GetLeader(sessionID)
-	writeJSON(w, http.StatusOK, map[string]string{"leader_id": leaderID})
-}
-
-func (h *Handler) transferLeader(w http.ResponseWriter, r *http.Request) {
-	sessionID := getSessionID(r)
-	agentID := getAgentID(r)
-
-	var req struct {
-		NewLeaderID string `json:"new_leader_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if err := h.hub.LeaderTransfer(sessionID, agentID, req.NewLeaderID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "transferred", "leader_id": req.NewLeaderID})
 }
 
 func (h *Handler) getHistory(w http.ResponseWriter, r *http.Request) {

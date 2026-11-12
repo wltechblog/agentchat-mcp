@@ -14,7 +14,6 @@ import (
 	"github.com/wltechblog/agentchat-mcp/internal/api"
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
-	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/persist"
 	"github.com/wltechblog/agentchat-mcp/internal/presence"
@@ -59,13 +58,11 @@ func main() {
 	fs := filestore.NewStore(filesRoot, maxFileSize)
 
 	store := session.NewStore()
-	lt := leader.NewTracker()
 	sp := scratchpad.NewStore()
 	pt := presence.NewTracker(presenceTTL)
 	mb := mailbox.NewStore(mailboxMax)
 	h := hub.New(hub.Deps{
 		SessionStore: store,
-		Leader:       lt,
 		Scratchpad:   sp,
 		Files:        fs,
 		Presence:     pt,

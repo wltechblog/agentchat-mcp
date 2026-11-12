@@ -1,6 +1,6 @@
 # agentchat-mcp
 
-A real-time communication server for multiple MCP-enabled agents to collaborate within authenticated sessions. Agents communicate via a REST API with server-side mailboxes, authenticate with a pre-shared key (PSK), and can exchange messages, share state, delegate tasks, and coordinate through a leader election system.
+A real-time communication server for multiple MCP-enabled agents to collaborate within authenticated sessions. Agents communicate via a REST API with server-side mailboxes, authenticate with a pre-shared key (PSK), and can exchange messages, share state, and delegate tasks.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
                             │  - PSK auth          │
 ┌──────────┐   REST + SSE   │  - Mailbox routing   │   REST + SSE   ┌──────────┐
 │  Agent C │◄──────────────►│  - Event fan-out     │◄──────────────►│  Agent D │
-│ (MCP)    │                │  - Leader election   │                │  (CLI)   │
+│ (MCP)    │                │  - File storage      │                │  (CLI)   │
 └──────────┘                └──────────────────────┘                └──────────┘
         ▲                                                    ▲
         │ signal (local Unix socket)                         │ SSE stream
@@ -24,8 +24,8 @@ A real-time communication server for multiple MCP-enabled agents to collaborate 
 └─────────────────┘
 ```
 
-Every event (direct messages, broadcasts, scratchpad updates, leader
-changes, joins/leaves) is emitted once by the hub and fanned out to both
+Every event (direct messages, broadcasts, scratchpad updates,
+joins/leaves) is emitted once by the hub and fanned out to both
 server-side mailboxes and the SSE watch stream, carrying a monotonically
 increasing per-session sequence number.
 
@@ -33,7 +33,7 @@ increasing per-session sequence number.
 
 - **Session-based isolation** — Agents join named sessions, each with a unique PSK
 - **Server-side mailboxes** — Messages are queued in each agent's mailbox and poll-drained (destructive read). Direct sends require the target to be a current member of the channel — sends to unknown or offline agents fail with an error (they may be in a different channel); broadcasts reach all known members.
-- **Reliable event stream** — The server's SSE `/watch` endpoint carries every session event (direct messages, broadcasts, scratchpad updates, leader changes, agent joins/leaves), each with a monotonically increasing sequence number. Keepalive pings keep idle streams alive through proxies; clients reconnect with backoff.
+- **Reliable event stream** — The server's SSE `/watch` endpoint carries every session event (direct messages, broadcasts, scratchpad updates, agent joins/leaves), each with a monotonically increasing sequence number. Keepalive pings keep idle streams alive through proxies; clients reconnect with backoff.
 - **Retried wake-up signals** — When a message arrives for a hosted agent (joist / gino / picobot), the bridge signals it via the local Unix socket; failed signal sends retry with capped exponential backoff and the agent is re-signalled on every stream reconnect, so a missed wake-up is never final.
 - **Self-declared signals** — The bridge declares its `check_messages` signal in the MCP `initialize` result (`signals.actions`), so joist/gino hosts auto-register the action with no config. The signal source is the host-injected MCP config key (`JOIST_MCP_ID` / `GINO_MCP_ID`), satisfying the registry's source-bound enforcement.
 - **Chat-session routing** — Agents can be members of more than one chat. The bridge captures the calling chat session from `tools/call` `_meta` origin (stamped by joist/gino per-turn) and stamps it into every wake-up signal (`channel` + `chat_id`), so a signal wakes the agent in the exact chat session that invoked the bridge — not a global default.
@@ -41,7 +41,6 @@ increasing per-session sequence number.
 - **Offline-tolerant presence** — Any authenticated request refreshes agent presence. Agents that go idle past the TTL (60s) stay listed as `online: false` and keep the mail they already had; new direct sends to them are rejected until they're active again.
 - **Real-time messaging** — Direct messages (agent-to-agent) and broadcasts (to all session members)
 - **Shared scratchpad** — Key-value store per session for shared context, with real-time update broadcasts to mailboxes
-- **Leader election** — First agent in a session becomes leader; supports explicit transfer and auto-transfer on expiry
 - **Sequenced message history** — Messages get monotonically increasing sequence numbers; agents can request missed messages
 - **Channel janitor** — Channels with no agent activity for the retention horizon (default 30 days) are reaped along with their mailboxes, history, sequence counters, and scratchpad, so abandoned channels don't accumulate forever.
 - **Crash-safe persistence (opt-in)** — Set `AGENTCHAT_DATA` to a directory and the server snapshots sessions, mailboxes, history, sequence counters, and the scratchpad every few seconds (plus on clean shutdown). A restart becomes a bump: agents re-register, queued mail survives, and no message is delivered twice. Files are not persisted (they live under `<AGENTCHAT_DATA>/files` and are wiped at startup).
@@ -50,7 +49,7 @@ increasing per-session sequence number.
 - **File transfer of any size** — Files stream directly from disk to the server over HTTP and back down to the recipient's disk; only a small `file_share` notification (file ID + size + SHA-256) rides through messaging. The bridge verifies digests on both ends, so a corrupted or truncated transfer fails loudly instead of surfacing as a corrupt file later. Size is bounded only by server disk (`AGENTCHAT_MAX_FILE_SIZE` can impose a cap)
 - **Auto-create sessions** — If an agent registers with an unknown session ID and PSK, the session is created automatically
 - **MCP bridge** — Standalone binary bridges any MCP host (Claude Desktop, Cursor, opencode) to the server via stdio↔REST
-- **Fully REST API** — All operations use HTTP. Session CRUD, messaging, mailbox polling, scratchpad, leader, history, and files
+- **Fully REST API** — All operations use HTTP. Session CRUD, messaging, mailbox polling, scratchpad, history, and files
 
 ---
 
@@ -294,8 +293,6 @@ Once configured, agents can use these MCP tools to communicate:
 | `broadcast` | Broadcast a message to all agents in the session |
 | `receive_messages` | Drain mailbox — retrieve all queued incoming messages (returns immediately) |
 | `list_agents` | List all active agents and their capabilities |
-| `get_leader` | Get the current session leader |
-| `transfer_leadership` | Transfer leadership to another agent |
 | `scratchpad_set` | Set a key in the shared scratchpad |
 | `scratchpad_get` | Get a value from the scratchpad |
 | `scratchpad_delete` | Delete a key from the scratchpad |
@@ -340,8 +337,6 @@ All require `Authorization: Bearer <psk>` and `X-Agent-ID: <agent_id>` headers.
 | `POST` | `/sessions/{id}/broadcast` | Broadcast to session. Body: `{"type": "broadcast", "payload": {...}}` |
 | `GET` | `/sessions/{id}/mailbox` | Drain mailbox — destructive read of all queued messages. Query params: `wait` (seconds, ≤30) holds the request until a match arrives; `from`/`type` filter the drain — non-matching messages stay queued |
 | `GET` | `/sessions/{id}/agents` | List active agents |
-| `GET` | `/sessions/{id}/leader` | Get current leader |
-| `POST` | `/sessions/{id}/leader/transfer` | Transfer leadership. Body: `{"new_leader_id": "..."}` |
 | `GET` | `/sessions/{id}/history` | Get message history. Query params: `after_sequence`, `limit` |
 | `GET` | `/sessions/{id}/scratchpad` | List all scratchpad entries |
 | `POST` | `/sessions/{id}/scratchpad/set` | Set a key. Body: `{"key": "...", "value": ...}` |
@@ -386,7 +381,6 @@ agentchat-mcp/
 │   ├── auth/auth.go                    # PSK generation
 │   ├── filestore/store.go              # Disk-backed per-session blob storage (streaming, SHA-256 at upload)
 │   ├── hub/hub.go                      # Business logic: routing, history, single event fan-out
-│   ├── leader/leader.go                # Leader election tracking
 │   ├── mailbox/mailbox.go              # Per-agent queues: destructive drains, filtered long-poll
 │   ├── mcp/server.go                   # MCP JSON-RPC server (concurrent request dispatch)
 │   ├── persist/persist.go              # Opt-in crash-safe state snapshots (AGENTCHAT_DATA)

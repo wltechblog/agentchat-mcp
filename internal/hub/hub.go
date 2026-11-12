@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
-	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/presence"
 	"github.com/wltechblog/agentchat-mcp/internal/protocol"
@@ -23,7 +22,6 @@ const maxHistory = 100
 type Hub struct {
 	mu            sync.RWMutex
 	sessionStore  *session.Store
-	leader        *leader.Tracker
 	scratchpad    *scratchpad.Store
 	files         *filestore.Store
 	presence      *presence.Tracker
@@ -71,7 +69,6 @@ func WithSweepInterval(d time.Duration) Option {
 // call sites.
 type Deps struct {
 	SessionStore *session.Store
-	Leader       *leader.Tracker
 	Scratchpad   *scratchpad.Store
 	Files        *filestore.Store
 	Presence     *presence.Tracker
@@ -81,7 +78,6 @@ type Deps struct {
 func New(d Deps, opts ...Option) *Hub {
 	h := &Hub{
 		sessionStore:  d.SessionStore,
-		leader:        d.Leader,
 		scratchpad:    d.Scratchpad,
 		files:         d.Files,
 		presence:      d.Presence,
@@ -132,7 +128,7 @@ func (h *Hub) recordEnvelope(sessionID string, env *protocol.Envelope) {
 }
 
 // sequenceEnvelope assigns the next sequence number without recording the
-// envelope in history. System events (joins, leaves, leader and scratchpad
+// envelope in history. System events (joins, leaves, and scratchpad
 // changes) share the message counter so clients can hold one high-water
 // mark, but history stays a message catch-up log.
 func (h *Hub) sequenceEnvelope(sessionID string, env *protocol.Envelope) {
@@ -144,7 +140,7 @@ func (h *Hub) sequenceEnvelope(sessionID string, env *protocol.Envelope) {
 
 // emitSystemEvent sequences a system event, delivers it to session mailboxes,
 // and notifies real-time watchers — the single fan-out for actionable server
-// events (scratchpad and leader changes).
+// events (scratchpad updates).
 func (h *Hub) emitSystemEvent(sessionID string, env protocol.Envelope, excludeAgent string) {
 	h.sequenceEnvelope(sessionID, &env)
 	h.deliverToSessionMailboxes(sessionID, env, excludeAgent)
@@ -202,11 +198,6 @@ func (h *Hub) Register(sessionID, agentID string, capabilities []string) bool {
 			Payload:   mustMarshal(protocol.AgentInfo{AgentID: agentID, Capabilities: capabilities, Online: true}),
 			Timestamp: time.Now().UTC(),
 		})
-
-		if _, hasLeader := h.leader.GetLeader(sessionID); !hasLeader {
-			h.leader.SetInitialLeader(sessionID, agentID)
-			slog.Info("initial leader set", "session", sessionID, "leader", agentID)
-		}
 	}
 
 	return isNew
@@ -223,39 +214,13 @@ func (h *Hub) RefreshPresence(sessionID, agentID string) {
 // deliberately silent: going quiet is not leaving, and announcing it made
 // every peer wake and report a transition that never mattered. The online
 // flag flips in GetSessionAgents; agent_left is announced only on true
-// departure (the forget horizon, see the onForget hook). Leadership is the
-// exception — it is actionable state, so it hands off immediately.
+// departure (the forget horizon, see the onForget hook).
 func (h *Hub) onAgentWentOffline(sessionID, agentID string, capabilities []string) {
 	slog.Info("agent offline", "session", sessionID, "agent", agentID)
 
 	// The agent's mailbox is intentionally kept: messages sent while it is
 	// offline must still be there when it returns. The mailbox is only
 	// reclaimed when the agent is forgotten entirely (see the onForget hook).
-
-	if leaderID, ok := h.leader.GetLeader(sessionID); ok && leaderID == agentID {
-		newLeader := ""
-		for _, a := range h.presence.GetAgents(sessionID) {
-			if a.Online {
-				newLeader = a.AgentID
-				break
-			}
-		}
-		if newLeader != "" {
-			h.leader.Transfer(sessionID, agentID, newLeader)
-			slog.Info("leader auto-transferred", "session", sessionID, "old_leader", agentID, "new_leader", newLeader)
-			h.emitSystemEvent(sessionID, protocol.Envelope{
-				Type:      protocol.TypeLeaderInfo,
-				SessionID: sessionID,
-				From:      "server",
-				To:        "*",
-				Payload:   mustMarshal(map[string]string{"leader_id": newLeader}),
-				Timestamp: time.Now().UTC(),
-			}, "")
-		} else {
-			// Nobody online to lead; clear so the next agent to join leads.
-			h.leader.ClearSession(sessionID)
-		}
-	}
 }
 
 // PeekMailbox returns the number of queued entries for an agent WITHOUT
@@ -422,34 +387,6 @@ func (h *Hub) ScratchpadList(sessionID string) []protocol.ScratchpadEntry {
 	return h.scratchpad.List(sessionID)
 }
 
-func (h *Hub) LeaderTransfer(sessionID, fromAgent, newLeaderID string) error {
-	currentLeader, _ := h.leader.GetLeader(sessionID)
-	if currentLeader != fromAgent {
-		return fmt.Errorf("only the current leader can transfer leadership")
-	}
-
-	if !h.presence.IsPresent(sessionID, newLeaderID) {
-		return fmt.Errorf("agent not found in session: %s", newLeaderID)
-	}
-
-	if !h.leader.Transfer(sessionID, fromAgent, newLeaderID) {
-		return fmt.Errorf("leadership transfer failed")
-	}
-
-	slog.Info("leader transferred", "session", sessionID, "from", fromAgent, "to", newLeaderID)
-
-	h.emitSystemEvent(sessionID, protocol.Envelope{
-		Type:      protocol.TypeLeaderInfo,
-		SessionID: sessionID,
-		From:      "server",
-		To:        "*",
-		Payload:   mustMarshal(map[string]string{"leader_id": newLeaderID, "transferred_by": fromAgent}),
-		Timestamp: time.Now().UTC(),
-	}, fromAgent)
-
-	return nil
-}
-
 func (h *Hub) GetFiles(sessionID string) []*filestore.File {
 	return h.files.List(sessionID)
 }
@@ -549,11 +486,6 @@ func (h *Hub) RestoreState(history map[string][]protocol.Envelope, seqNums map[s
 	}
 }
 
-func (h *Hub) GetLeader(sessionID string) string {
-	id, _ := h.leader.GetLeader(sessionID)
-	return id
-}
-
 func (h *Hub) CloseSession(sessionID string) {
 	h.mu.Lock()
 	delete(h.history, sessionID)
@@ -561,7 +493,6 @@ func (h *Hub) CloseSession(sessionID string) {
 	h.mu.Unlock()
 
 	h.presence.ClearSession(sessionID)
-	h.leader.ClearSession(sessionID)
 	h.scratchpad.ClearSession(sessionID)
 	h.files.ClearSession(sessionID)
 	h.mailboxes.DeleteSession(sessionID)
@@ -586,7 +517,7 @@ func (h *Hub) StartJanitor(retention, interval time.Duration) {
 
 // reapStaleSessions deletes sessions whose LastActive is older than the
 // retention horizon. Everything session-scoped goes with them: credentials,
-// mailboxes, history, scratchpad, files, presence, and leadership.
+// mailboxes, history, scratchpad, files, and presence.
 func (h *Hub) reapStaleSessions(retention time.Duration) {
 	cutoff := time.Now().Add(-retention)
 	for _, sess := range h.sessionStore.Snapshot() {

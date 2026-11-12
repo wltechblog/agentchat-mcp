@@ -10,7 +10,6 @@ import (
 
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
 	"github.com/wltechblog/agentchat-mcp/internal/hub"
-	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/presence"
 	"github.com/wltechblog/agentchat-mcp/internal/scratchpad"
@@ -24,7 +23,7 @@ func TestSSEKeepaliveAndRetry(t *testing.T) {
 	store := session.NewStore()
 	pt := presence.NewTracker(60 * time.Second)
 	defer pt.Stop()
-	h := hub.New(hub.Deps{SessionStore: store, Leader: leader.NewTracker(), Scratchpad: scratchpad.NewStore(),
+	h := hub.New(hub.Deps{SessionStore: store, Scratchpad: scratchpad.NewStore(),
 		Files: filestore.NewStore(t.TempDir(), 0), Presence: pt, Mailboxes: mailbox.NewStore(1000)})
 	handler := New(h, store)
 	handler.ssePingInterval = 20 * time.Millisecond // speed up for the test
@@ -127,8 +126,8 @@ func waitForLine(t *testing.T, lines <-chan string, prefix string) {
 }
 
 // TestWatchCarriesSystemEvents: after the pipeline unification, the watch
-// stream carries scratchpad updates, leader changes, and joins — not just
-// messages and broadcasts.
+// stream carries scratchpad updates and joins — not just messages and
+// broadcasts.
 func TestWatchCarriesSystemEvents(t *testing.T) {
 	server, _ := setupTestServer(t)
 	sessionID, psk := createTestSession(t, server)
@@ -159,11 +158,6 @@ func TestWatchCarriesSystemEvents(t *testing.T) {
 	registerAgent(t, server.URL, sessionID, psk, "agent-2", nil)
 	waitForDataLine(t, lines, `{"type":"agent_joined"`)
 
-	xfer := doAuthRequest(t, server.URL, "POST", "/sessions/"+sessionID+"/leader/transfer", sessionID, psk, "agent-1", map[string]any{
-		"new_leader_id": "agent-2",
-	})
-	xfer.Body.Close()
-	waitForDataLine(t, lines, `{"type":"leader_info"`)
 }
 
 // waitForDataLine reads lines until a data line's JSON payload starts with

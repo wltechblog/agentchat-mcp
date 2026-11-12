@@ -24,9 +24,7 @@ import (
 // presence no longer gates delivery, offline agents simply resume offline),
 // watch tokens (re-issued on the next register), the file store (blobs are
 // session-scoped and wiped at restart — restoring metadata for files the
-// wipe just deleted would only dangle), and the leader map (the first agent
-// to re-heartbeat after a restart becomes leader — restoring a leader with
-// no presence record would create a ghost that can never expire).
+// wipe just deleted would only dangle).
 type Snapshot struct {
 	Sessions   []session.Session                     `json:"sessions"`
 	Mailboxes  map[string][]mailbox.Entry            `json:"mailboxes"`

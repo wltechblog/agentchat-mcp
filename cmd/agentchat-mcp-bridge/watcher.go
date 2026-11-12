@@ -413,7 +413,7 @@ func (b *Bridge) handleSSEEvent(sseEventType, data string) {
 		if env.To != b.agentID {
 			return
 		}
-	case "scratchpad_update", "leader_info":
+	case "scratchpad_update":
 		// Session-wide state changes worth waking the agent for — unless it
 		// made the change itself and already knows.
 		if env.From == b.agentID {

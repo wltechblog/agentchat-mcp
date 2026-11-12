@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/wltechblog/agentchat-mcp/internal/filestore"
-	"github.com/wltechblog/agentchat-mcp/internal/leader"
 	"github.com/wltechblog/agentchat-mcp/internal/mailbox"
 	"github.com/wltechblog/agentchat-mcp/internal/persist"
 	"github.com/wltechblog/agentchat-mcp/internal/presence"
@@ -24,7 +23,6 @@ func newTestHub(t *testing.T, ttl, sweepInterval time.Duration) (*Hub, *session.
 	pt := presence.NewTracker(ttl)
 	h := New(Deps{
 		SessionStore: store,
-		Leader:       leader.NewTracker(),
 		Scratchpad:   scratchpad.NewStore(),
 		Files:        filestore.NewStore(t.TempDir(), 0),
 		Presence:     pt,
@@ -168,60 +166,15 @@ func TestMailboxSurvivesPresenceExpiry(t *testing.T) {
 	}
 }
 
-// TestLeaderClearsWhenNoOnlineAgents: when the leader expires and nobody is
-// online, leadership must be released so the next agent to join leads.
-func TestLeaderClearsWhenNoOnlineAgents(t *testing.T) {
-	h, store, _ := newTestHub(t, 50*time.Millisecond, 10*time.Millisecond)
-	sess := store.Create("leader-clear")
-
-	h.Register(sess.ID, "agent-a", nil)
-	if h.GetLeader(sess.ID) != "agent-a" {
-		t.Fatal("expected agent-a to lead")
-	}
-
-	time.Sleep(200 * time.Millisecond) // expire; no one else online
-
-	if got := h.GetLeader(sess.ID); got != "" {
-		t.Fatalf("expected leadership cleared after last agent expired, got %q", got)
-	}
-
-	// A new joiner becomes leader instead of inheriting a ghost.
-	h.Register(sess.ID, "agent-b", nil)
-	if got := h.GetLeader(sess.ID); got != "agent-b" {
-		t.Fatalf("expected new joiner to lead, got %q", got)
-	}
-}
-
-// TestLeaderTransfersToOnlineAgentOnExpiry: when the leader expires, an
-// online agent takes over — not another offline one.
-func TestLeaderTransfersToOnlineAgentOnExpiry(t *testing.T) {
-	h, store, _ := newTestHub(t, 50*time.Millisecond, 10*time.Millisecond)
-	sess := store.Create("leader-transfer")
-
-	h.Register(sess.ID, "agent-a", nil)
-	h.Register(sess.ID, "agent-b", nil)
-	h.Register(sess.ID, "agent-c", nil)
-
-	// Only agent-c stays online past the TTL (simulated by continued activity).
-	deadline := time.Now().Add(2 * time.Second)
-	for h.GetLeader(sess.ID) != "agent-c" {
-		h.RefreshPresence(sess.ID, "agent-c")
-		if time.Now().After(deadline) {
-			t.Fatalf("expected leadership to land on agent-c, got %q", h.GetLeader(sess.ID))
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 func payload(text string) json.RawMessage {
 	b, _ := json.Marshal(map[string]string{"text": text})
 	return b
 }
 
 // TestAllEventsSequencedAndFannedOut: every event — joins, messages,
-// broadcasts, scratchpad, leader — must carry a sequence from the session's
+// broadcasts, scratchpad — must carry a sequence from the session's
 // single counter and reach the SSE fan-out exactly once. Before the pipeline
-// unification, scratchpad/leader/left events never reached watchers at all.
+// unification, scratchpad/left events never reached watchers at all.
 func TestAllEventsSequencedAndFannedOut(t *testing.T) {
 	h, store, _ := newTestHub(t, 60*time.Second, 15*time.Second)
 	sess := store.Create("fanout")
@@ -246,9 +199,6 @@ func TestAllEventsSequencedAndFannedOut(t *testing.T) {
 	if _, err := h.ScratchpadSet(sess.ID, "agent-a", "plan", payload("v")); err != nil {
 		t.Fatalf("scratchpad set: %v", err)
 	}
-	if err := h.LeaderTransfer(sess.ID, "agent-a", "agent-b"); err != nil {
-		t.Fatalf("transfer: %v", err)
-	}
 	if err := h.ScratchpadDelete(sess.ID, "agent-b", "plan"); err != nil {
 		t.Fatalf("scratchpad delete: %v", err)
 	}
@@ -259,7 +209,7 @@ func TestAllEventsSequencedAndFannedOut(t *testing.T) {
 
 	wantTypes := []string{
 		"agent_joined", "agent_joined", "message", "broadcast",
-		"scratchpad_update", "leader_info", "scratchpad_update", "agent_joined",
+		"scratchpad_update", "scratchpad_update", "agent_joined",
 	}
 	if len(sse) != len(wantTypes) {
 		got := make([]string, len(sse))
@@ -281,11 +231,11 @@ func TestAllEventsSequencedAndFannedOut(t *testing.T) {
 	}
 
 	// Mailbox-side spot check: agent-b should hold the direct message, the
-	// broadcast, agent-a's scratchpad update, and the leader info. Joins are
-	// ambient (watch stream only) and b's own scratchpad delete excludes b.
+	// broadcast, and agent-a's scratchpad update. Joins are ambient (watch
+	// stream only) and b's own scratchpad delete excludes b.
 	msgs := h.DrainMailbox(sess.ID, "agent-b")
-	if len(msgs) != 4 {
-		t.Fatalf("expected 4 mailbox entries for agent-b, got %d", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 mailbox entries for agent-b, got %d", len(msgs))
 	}
 	for _, m := range msgs {
 		if m.Envelope.Sequence == 0 {
@@ -305,7 +255,7 @@ func TestPersistenceRestartRoundTrip(t *testing.T) {
 	defer pt.Stop()
 	mb := mailbox.NewStore(100)
 	sp := scratchpad.NewStore()
-	h := New(Deps{SessionStore: store, Leader: leader.NewTracker(), Scratchpad: sp,
+	h := New(Deps{SessionStore: store, Scratchpad: sp,
 		Files: filestore.NewStore(t.TempDir(), 0), Presence: pt, Mailboxes: mb}, WithSweepInterval(time.Hour))
 
 	sess := store.Create("persist")
@@ -330,7 +280,7 @@ func TestPersistenceRestartRoundTrip(t *testing.T) {
 	defer pt2.Stop()
 	mb2 := mailbox.NewStore(100)
 	sp2 := scratchpad.NewStore()
-	h2 := New(Deps{SessionStore: store2, Leader: leader.NewTracker(), Scratchpad: sp2,
+	h2 := New(Deps{SessionStore: store2, Scratchpad: sp2,
 		Files: filestore.NewStore(t.TempDir(), 0), Presence: pt2, Mailboxes: mb2}, WithSweepInterval(time.Hour))
 	store2.Restore(snap.Sessions)
 	mb2.Restore(snap.Mailboxes)
@@ -430,7 +380,6 @@ func TestJanitorReapsIdleSessions(t *testing.T) {
 	sp := scratchpad.NewStore()
 	h := New(Deps{
 		SessionStore: store,
-		Leader:       leader.NewTracker(),
 		Scratchpad:   sp,
 		Files:        filestore.NewStore(t.TempDir(), 0),
 		Presence:     pt,
