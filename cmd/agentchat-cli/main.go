@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -71,6 +73,12 @@ type CLI struct {
 	lastSeq int64
 	// watchToken is issued by register so /watch URLs don't carry the PSK.
 	watchToken string
+	// WatchdogTimeout force-reconnects the SSE stream after this long with
+	// no bytes at all. The server pings every 15s, so three missed pings
+	// mean the connection is dead — the usual state after a network change
+	// or wake-from-sleep, where a half-open TCP read would otherwise block
+	// forever. Zero means the 45s default.
+	WatchdogTimeout time.Duration
 }
 
 func main() {
@@ -107,12 +115,13 @@ func main() {
 	*serverURL = strings.TrimSuffix(*serverURL, "/")
 
 	cli := &CLI{
-		serverURL: *serverURL,
-		sessionID: *sessionID,
-		psk:       *psk,
-		agentID:   *agentID,
-		agentName: *agentName,
-		client:    &http.Client{Timeout: 30 * time.Second},
+		serverURL:       *serverURL,
+		sessionID:       *sessionID,
+		psk:             *psk,
+		agentID:         *agentID,
+		agentName:       *agentName,
+		client:          &http.Client{Timeout: 30 * time.Second},
+		WatchdogTimeout: 45 * time.Second,
 	}
 
 	if *sessionID == "" || *psk == "" {
@@ -448,7 +457,18 @@ func (c *CLI) watchSSE(quit <-chan struct{}) error {
 	}
 	url := fmt.Sprintf("%s/watch?session=%s&%s", c.serverURL, c.sessionID, auth)
 
-	req, err := http.NewRequest("GET", url, nil)
+	watchdogTimeout := c.WatchdogTimeout
+	if watchdogTimeout <= 0 {
+		watchdogTimeout = 45 * time.Second
+	}
+
+	// streamCtx is cancelable by the idle watchdog: after a network change
+	// or wake-from-sleep the old TCP connection dies silently and the read
+	// would block forever without it.
+	streamCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(streamCtx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
@@ -467,8 +487,16 @@ func (c *CLI) watchSSE(quit <-chan struct{}) error {
 		return fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
+	lastRead := &atomic.Int64{}
+	lastRead.Store(time.Now().UnixNano())
+	body := &watchdogBody{ReadCloser: resp.Body, lastRead: lastRead}
+
+	stopWatchdog := make(chan struct{})
+	defer close(stopWatchdog)
+	go c.watchdog(streamCtx, cancel, lastRead, watchdogTimeout, stopWatchdog)
+
 	var p sseParser
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(body)
 	for scanner.Scan() {
 		select {
 		case <-quit:
@@ -493,10 +521,60 @@ func (c *CLI) watchSSE(quit <-chan struct{}) error {
 			}
 		}
 	}
+
+	// Distinguish a watchdog-forced reconnect from a genuine stream error —
+	// the message doubles as a hint in the reconnect log line.
+	if streamCtx.Err() != nil {
+		return fmt.Errorf("no data for %v — forcing reconnect (network changed or machine slept?)", watchdogTimeout)
+	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
 	return fmt.Errorf("stream ended")
+}
+
+// watchdogBody tracks the last time data arrived so the watchdog can tell a
+// live-but-idle stream from a dead connection.
+type watchdogBody struct {
+	io.ReadCloser
+	lastRead *atomic.Int64
+}
+
+func (w *watchdogBody) Read(p []byte) (int, error) {
+	n, err := w.ReadCloser.Read(p)
+	if n > 0 {
+		w.lastRead.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+// watchdog cancels the stream context when no bytes have arrived for
+// timeout — the same protection the bridge's watcher has. The server pings
+// idle streams every 15s, so a stream that is truly alive never trips it.
+func (c *CLI) watchdog(streamCtx context.Context, cancel context.CancelFunc, lastRead *atomic.Int64, timeout time.Duration, stop <-chan struct{}) {
+	tick := timeout / 4
+	if tick < 10*time.Millisecond {
+		tick = 10 * time.Millisecond
+	}
+	if tick > time.Second {
+		tick = time.Second
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-streamCtx.Done():
+			return
+		case <-ticker.C:
+			if time.Since(time.Unix(0, lastRead.Load())) > timeout {
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 // showEnvelope displays an envelope, deduping by sequence number so the same
